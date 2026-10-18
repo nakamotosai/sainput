@@ -1,0 +1,10 @@
+# 默认按文本处理，仓库内统一 LF（Windows 检出也不会变成 CRLF）。
+* text=auto eol=lf
+
+# .bat 必须 CRLF：cmd.exe 对 LF 结尾的批处理容错很差（尤其是 goto/label）。
+*.bat text eol=crlf
+
+# 二进制资源：不做换行符转换，也不要尝试 diff。
+*.ico binary
+*.png binary
+*.onnx binary

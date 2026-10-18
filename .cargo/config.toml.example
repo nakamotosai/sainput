@@ -1,0 +1,43 @@
+# cargo 配置示例 —— 把本文件复制成 .cargo/config.toml（去掉 .example）才会生效。
+#
+# 三种情况，按你的机器选一种：
+#
+#   A. 有 MSVC（Visual Studio Build Tools + "C++ 生成工具"）
+#      → 什么都不用配。本文件留着全是注释即可，cargo 默认走 x86_64-pc-windows-msvc。
+#
+#   B. 没有 MSVC，用 GNU 工具链（w64devkit / MSYS2 / MinGW-w64）
+#      → 去掉下面 [build] 与 [target.x86_64-pc-windows-gnu] 的注释，
+#        并把路径改成你自己的 gcc / ar 绝对路径。
+#        再配合 rust-toolchain.example.toml 里 GNU 的 channel 写法。
+#
+#   C. 有 MSVC 但仍想交叉编译 GNU 产物
+#      → 只留 [build] target 那一行，然后加 --target 参数即可。
+#
+# 路径里的反斜杠在 TOML 字符串里要写成正斜杠或双反斜杠：C:/tools/... 或 C:\\tools\\...
+
+# [build]
+# target = "x86_64-pc-windows-gnu"
+#
+# [target.x86_64-pc-windows-gnu]
+# linker = "C:/tools/w64devkit/bin/gcc.exe"
+# ar = "C:/tools/w64devkit/bin/ar.exe"
+#
+# # ---------------------------------------------------------------
+# # 关于 .tools/libgcc_eh.a（GCC 16 的坑，只有走 GNU 才需要）
+# #
+# # GCC 16 起不再随发行版提供 libgcc_eh.a，而 rustc 的 windows-gnu target
+# # 在链接时固定会传 -lgcc_eh。结果是链接阶段报：
+# #     cannot find -lgcc_eh
+# #
+# # 仓库里 .tools/libgcc_eh.a 是一个**空归档**（8 字节），作用只是让
+# # 链接器能找到这个名字、满足那条 -lgcc_eh 参数。MinGW-w64 的异常处理
+# # 实际走 libgcc_s / libgcc.a，这个空归档不会被真正使用。
+# #
+# # 之所以要显式 -L 到 .tools：rustc 传给链接器的搜索路径里没有仓库目录。
+# rustflags = ["-L", "C:/path/to/sainput/.tools"]
+# # 相对路径也行（相对的是你执行 cargo 时的当前目录）：
+# # rustflags = ["-L", ".tools"]
+#
+# # 用 MSYS2 的 gcc 时同理：
+# # linker = "C:/msys64/mingw64/bin/gcc.exe"
+# # ar = "C:/msys64/mingw64/bin/ar.exe"

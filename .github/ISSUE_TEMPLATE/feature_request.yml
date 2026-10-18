@@ -1,0 +1,56 @@
+name: 功能建议
+description: 想要的新能力、体验改进或配置项
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        先说清「要解决什么问题」，再说「希望它长什么样」。
+        项目优先级固定为：不吞字 / 不卡键 > 跟手感 > 准确率 > 其它，所以请说明你的场景有多常见。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你遇到的问题
+      description: 现在是怎么用的、卡在哪一步、多久遇到一次
+      placeholder: |
+        我经常在 …… 的时候需要 ……，现在只能 ……，每次都要多花 …… 秒。
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望的做法
+      description: 具体到可验证的行为，例如「按住热键时，悬浮球显示当前麦克风电平」或新增某个配置键
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 你试过的替代方案
+      description: 现有配置能不能凑合？为什么不够
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 影响面
+      multiple: true
+      options:
+        - 热键 / 触发方式
+        - 上屏（SendInput / 文本整形）
+        - 识别（模型 / 断句 / 延迟）
+        - 悬浮显示
+        - 托盘 / 启停
+        - 配置项
+        - 构建 / 发布 / 文档
+        - 其它
+
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: 参与意愿
+      options:
+        - label: 我愿意提 PR 实现这个功能（可以先在 issue 里对一下方案）

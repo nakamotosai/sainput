@@ -1,0 +1,53 @@
+# ─────────────────────────────────────────────────────────────
+# sainput .gitignore
+# 原则：个人配置、运行时产物、模型、内部文档都不进仓库；
+#      可公开的模板以同名 *.example 提交（见 CONTRIBUTING.md）。
+# ─────────────────────────────────────────────────────────────
+
+# ── Rust 构建产物 ──
+/target
+
+# ── 个人配置与运行时状态（提交同名 .example，不提交真实文件）──
+/sainput.conf
+/hotwords.txt
+/.ctx_hotwords.txt
+/@AutomationLog.txt
+/latency.txt
+
+# ── 模型与日志 ──
+# models 下的模型文件是大体积二进制；但 models/README.md 要提交，
+# 所以先放行目录本身，再排除内容，最后放行 README。
+/models
+!/models/
+/models/*
+!/models/README.md
+# 会话日志逐条记录了用户说出的原文，绝不入库。
+/logs
+
+# ── 本机工具链覆盖（因机器而异，提交 .example）──
+/.cargo/config.toml
+/rust-toolchain.toml
+
+# ── 内部文档（本地保留，不公开）──
+/HANDOFF.md
+/PLAN.md
+/FROZEN.md
+/FROZEN-v0.2.1.md
+/FROZEN-v0.2.2.md
+
+# ── 本地工作目录 ──
+/archive/
+/.tools/
+/tmp/
+
+# ── Python ──
+**/__pycache__/
+*.pyc
+
+# ── 音频与临时文件 ──
+*.wav
+*.pcm
+*.tar.bz2
+*.bak
+*.bak-*
+*~

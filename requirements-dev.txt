@@ -1,0 +1,8 @@
+# 只有跑 tools/bench_*.py 之类离线打表/推理脚本时才需要。
+# 运行 sainput 本身不需要这些额外的包。
+#   安装：python -m pip install -r requirements.txt -r requirements-dev.txt
+
+-r requirements.txt
+
+# tools/bench_models.py、tools/bench_stream.py 读 WAV 用
+soundfile

@@ -1,0 +1,97 @@
+name: Bug 报告
+description: 可复现的异常行为：崩溃、热键失灵、上屏错误、吞字、延迟异常等
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请先搜索现有 issue。
+        **安全相关问题**（按键被吃掉/卡住、注入到非目标窗口、日志外泄等）请走仓库根目录
+        `SECURITY.md` 里的私密渠道，不要在这里公开细节。
+
+        贴日志前请先删掉与问题无关的识别原文。
+
+  - type: input
+    id: version
+    attributes:
+      label: sainput 版本
+      description: 控制台标题里的 `sainput vX.Y.Z`（托盘提示里也有），或根 `Cargo.toml` 的 `version`
+      placeholder: "0.2.2"
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 版本
+      description: 用 `winver` 查看完整版本号，并注明是 Win10 还是 Win11
+      placeholder: "Windows 11 23H2 (22631.4317)"
+    validations:
+      required: true
+
+  - type: input
+    id: hotkey
+    attributes:
+      label: 热键配置
+      description: 贴 `sainput.conf` 里的 `hotkey` 行；用鼠标热键也写清是哪个键
+      placeholder: "hotkey = rightctrl"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: admin
+    attributes:
+      label: 是否涉及管理员窗口
+      description: UIPI 会拦住 SendInput，这类窗口打不进去已是已知限制，勾上便于快速定位
+      options:
+        - label: 目标窗口是以管理员身份运行的（或 UAC 提权过的程序）
+        - label: sainput 本身是以管理员身份启动的
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 启动 sainput，光标放进记事本
+        2. 按住右 Ctrl 说「……」，松开
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+      description: 有报错就贴控制台原文，或托盘「显示日志窗口」里的内容
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: sainput config 输出
+      description: 在项目根目录执行 `sainput.exe config`，粘贴完整输出（只有路径和配置项名，不含语音内容）
+      render: text
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志片段（可选）
+      description: 贴 `logs\sainput-<时间>.log` 里相关的几行；请删掉无关的识别原文
+      render: text
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 已读过 `README.md` 的「已知限制」，并确认不是其中列出的情况
+          required: true

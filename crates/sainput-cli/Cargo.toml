@@ -1,0 +1,15 @@
+[package]
+name = "sainput-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sainput"
+path = "src/main.rs"
+
+[dependencies]
+sainput-core = { path = "../sainput-core" }
+anyhow.workspace = true
+serde_json = "1"

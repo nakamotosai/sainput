@@ -1,0 +1,53 @@
+name: CI
+
+# 只验证「能编译 + 单测通过 + Python 语法正确」。
+# 不在 CI 里下载模型，也不跑 tools/*.ps1：它们需要真实麦克风、真实前台窗口和 SendInput，
+# 在无头 runner 上只会误报（详见 CONTRIBUTING.md 第 3 节）。
+on: [push, pull_request]
+
+# 同一分支的新 push 直接取消上一次还在跑的 CI，省 runner 也省等待。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: build & test (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 默认 stable 就是 MSVC target。
+      # 开发者本机可能用 GNU（.cargo/config.toml + rust-toolchain.toml），
+      # 但这两个文件已 gitignore，CI 检出里不存在，所以不会被带偏。
+      - name: Install Rust (stable, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace (release)
+        run: cargo build --release --workspace
+
+      # 单测只在 sainput-core：cli 包是参数解析 + 主循环，没有可离线跑的单测。
+      - name: Unit tests (sainput-core)
+        run: cargo test --release -p sainput-core
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 只做语法编译检查，不安装 sherpa-onnx，也不导入模块。
+      # 注意别用 `python -m py_compile tools/*.py`：PowerShell 不会替原生程序展开通配符。
+      - name: Python syntax check (tools)
+        run: python -m compileall -q tools

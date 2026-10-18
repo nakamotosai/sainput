@@ -1,0 +1,7 @@
+# sainput ASR sidecar 的运行时依赖（tools/asr_sidecar.py）。
+# 需要 64 位 Python 3.11+（sherpa-onnx 不提供 32 位轮子）。
+#   安装：python -m pip install -r requirements.txt
+# 测过：Python 3.14 (x64) + sherpa-onnx 1.13.4。
+
+sherpa-onnx==1.13.4
+numpy

@@ -1,0 +1,28 @@
+# rust-toolchain 示例 —— 复制成仓库根目录的 rust-toolchain.toml（去掉 .example）。
+#
+# 这份文件锁定本仓库用的 Rust 版本与 target。没有它也能编译（用默认 stable），
+# 但不同人拿到不同编译器版本时行为会有差异，所以建议锁一个。
+#
+# 先确认本机装没装：rustup toolchain list
+# 没装就加：        rustup toolchain install 1.91.1
+
+# ---------------------------------------------------------------- 方案 A：MSVC（默认，推荐）
+# 装了 Visual Studio Build Tools（含「使用 C++ 的桌面开发」工作负载）就用这个。
+# [toolchain]
+# channel = "1.91.1"
+# components = ["rustfmt", "clippy"]
+# targets = []
+# profile = "minimal"
+
+# ---------------------------------------------------------------- 方案 B：GNU（无 MSVC 时）
+# 用 w64devkit / MSYS2 / MinGW-w64 的 gcc 作链接器。还需要 .cargo/config.toml 里
+# 指向你的 gcc / ar（见 .cargo/config.toml.example 的方案 B）。
+# 注意 channel 里要带 -x86_64-pc-windows-gnu 后缀，rustup 才知道装哪个宿主工具链。
+# [toolchain]
+# channel = "1.91.1-x86_64-pc-windows-gnu"
+# components = ["rustfmt", "clippy"]
+
+# ---------------------------------------------------------------- 说明
+# · components 里没列的组件（如 rust-src）不会被安装，需要时自己加。
+# · targets 留空 = 不额外装交叉编译目标。
+# · 只想临时换版本、不改文件：cargo +1.91.1 build

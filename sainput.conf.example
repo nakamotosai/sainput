@@ -1,0 +1,178 @@
+# sainput 配置文件示例 —— 一行一个「键 = 值」，命令行参数优先级更高。
+#
+# 用法：把本文件复制成 sainput.conf（去掉 .example），重启 sainput 生效。
+# 全部注释掉就是默认行为；下面只留 `hotkey = rightctrl` 一行做示范（它也是默认值）。
+#
+# ⚠️ 本配置**不支持行尾注释**：一行里 `=` 右边整段都是值。
+#    所以想启用哪项，直接去掉行首的 `#` 就行 —— 说明文字都写在这一项的上面，别留在值后面。
+
+# ============ 怎么打开 ============
+# 仓库根目录的 start.bat（或在命令行执行 sainput run）。
+# 启动后：光标放进任意能打字的窗口 → 按住热键（默认右 Ctrl）说话 → 松开上屏
+# 退出：右键托盘图标 → 退出
+#
+# 双击启动时控制台会自动收起，托盘图标才是「它在跑」的标志。
+# 想找回日志：右键托盘 → 「显示日志窗口」。
+# 重复双击不会开出两个（第二个会自己退出，避免一句话打两遍）。
+# 想让它在开机时自己起来：右键托盘 → 「开机自启」。
+
+# ---- 说话方式 ----
+# 说话热键。键盘：rightctrl / rightalt / rightshift / leftctrl / leftalt / leftshift /
+# capslock / f8 / f9 / f10 / backquote / 0xXX（十六进制虚拟键码）；
+# 鼠标：mousex1 / mousex2（侧键）/ mousemiddle（中键）。
+hotkey = rightctrl
+
+# true = 按一下开始、再按一下结束（长段听写更省手）；默认按住说话。
+# toggle = false
+
+# ---- 悬浮显示（四选一，互斥）----
+# off = 不显示 / bar = 细条 / orb = 悬浮球 / edge = 屏幕边缘光（默认）
+#   细条：半透明，只有一行文字，不挡字
+#   球  ：圆形，录音时波形随真实音量起伏
+#   边缘：四边晕光，完全不占中央，录音时亮起、松手淡出
+# overlay_mode = edge
+
+# 边缘光颜色：white（默认）/ rainbow / amber / cyan / aurora。
+# 白光在深色背景上容易糊成灰雾，彩色更醒目。
+# edge_tint = white
+
+# 兼容老写法：true 等价于 overlay_mode = bar。
+# overlay = true
+
+# true = 松手就放掉麦克风（省电，代价是吞掉开头几十毫秒）。
+# lazy_mic = false
+
+# ---- 界面 ----
+# 系统托盘图标（看得见它在跑，右键能退出）。
+# tray = true
+
+# true = 启动后自动收起黑窗口，只留托盘图标。
+# hide_console = false
+
+# ---- 上屏 ----
+# 保持 true。设成 false（--no-stream）当前版本实际一个字都不打，暂时不要用。
+# stream = true
+
+# 流式修正的安全阀：一次改动超过这么多字就放弃本帧，等 final。
+# max_backspace = 8
+
+# ---- 文本整形 ----
+# 标点策略：keep = 原样（默认）；space = 中文标点转空格（问号保留）。
+#   space 适用于「不要标点、用停顿断句」的场景：
+#   逗号/句号/顿号/分号/冒号/感叹号 -> 空格；**问号保留**；
+#   ASCII 与数字夹缝里的标点、URL、`cd ..`、`3.14` 一律不动。
+# punct_mode = keep
+
+# 英文拆字合并：ASR 把 "API" 吐成 "A P I" 时粘回去。
+# 只合并「全由单字母 + 空格组成」的组，正常英文词不受影响。
+# merge_terms = true
+
+# 英文大小写修复：句首与专有名词首字母大写。
+# fix_case = true
+
+# ---- 上下文偏置 ----
+# 把最近几句打出去的词（人名/术语/缩写）临时喂给识别器，让下一句更贴合你的用词。
+# 做法是把它们写进临时热词表，只影响本地识别器，不联网。
+# ctx_bias = true
+
+# true = 每次偏置生效时在控制台打一行提示。
+# verbose_ctx = false
+
+# 偏置用的临时热词文件路径（一般不用改）。
+# ctx_hotwords = .ctx_hotwords.txt
+
+# ---- 松手之后的尾巴（吞字 / 跟手感的取舍，实测见 README 第 6 节）----
+# 松手后先把麦克风里还在流的音频收进来（否则最后一个字会被扔掉），
+# 再一次性补一段底噪把模型的右上下文喂饱，最后才定稿。
+#
+# 松手后最少再收多久的真音频（毫秒）。
+# tail_ms = 200
+#
+# 尾巴里连续安静这么久就收工（太短会把「松手后补的半句」切掉）。
+# tail_quiet_ms = 250
+#
+# 尾巴硬上限（还在说话也不会无限等）。
+# tail_max_ms = 1200
+#
+# 收工时一次性补多少毫秒底噪；调小 = 最后一个字上屏更快，但可能又吞字。
+# tail_pad_ms = 480
+#
+# 安静判定阈值（帧 RMS）；按自己麦克风的底噪量级调。
+# tail_rms = 0.012
+
+# ---- 识别模型（改一行就能换，选型与实测对比见 docs/model-selection.md）----
+# 默认（推荐）：x-asr-160ms —— 每 160ms 刷一次、每次约 1 个字，最跟手。
+# model_dir = models/sherpa-onnx-x-asr-160ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05
+#
+# 更准但更顿：480ms 分块（每次刷 3~4 个字）。
+# model_dir = models/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05
+#
+# 最省 CPU：960ms 分块（跟手感最差）。
+# model_dir = models/sherpa-onnx-x-asr-960ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05
+#
+# 纯中文大模型（中文用词更准；英文会听成乱码，别用它听写英文）。
+# model_dir = models/sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30
+#
+# 旧档：英文最好，但真机中文容易重复打转 —— 除非你几乎只讲英文。
+# model_dir = models/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20
+#
+# 24MB 超轻量。
+# model_dir = models/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23
+#
+# 80ms 分块（首个字最快、中文可用）—— 但它是 0.6B，比较吃 CPU，
+# 需要多线程才跟得上实时，配合下面的 threads = 8 用。
+# model_dir = models/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-80ms-int8-2026-06-11
+
+# ---- 后处理 ----
+# 自动标点。
+# punct = true
+#
+# 标点模型目录。
+# punct_dir = models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8
+#
+# 汉字数字 -> 阿拉伯数字（「三十四个」->「34个」）。
+# itn = true
+#
+# 热词表；留空/删掉行就不启用（默认位置有 hotwords.txt 就自动用）。
+# hotwords = hotwords.txt
+#
+# modified_beam_search；实测反而更容易出错，默认 greedy。
+# beam = false
+#
+# 还没识别出任何字时的静音断句阈值（秒）。
+# rule1 = 15
+#
+# 已识别出字之后的静音断句阈值（秒）；调大 = 句中停顿不易被切句。
+# rule2 = 15
+#
+# 最长一句（秒）。
+# rule3 = 20
+
+# ---- 日志 ----
+# 每次会话写一份 logs\sainput-<时间>.log。
+# 里面逐条记录 partial 的原文/渲染结果/耗时，排查「吞字 / 慢」用它。
+# log = true
+#
+# 日志目录。
+# log_dir = logs
+#
+# ASR 线程数（换大模型时调大，见上面的 Nemotron）。
+# threads = 2
+#
+# 流式刷新节拍（毫秒）。小于模型更新间隔就等于不限流。
+# throttle_ms = 80
+
+# ---- 设备 ----
+# 指定麦克风名字（sainput devices 可以看到全部）；留空 = 系统默认设备。
+# device =
+
+# ---- Python ----
+# sidecar 用的解释器；要用特定虚拟环境时填完整路径。
+# python = python
+
+# ---- 安全 ----
+# ⚠️ 绝对不要用 Stop-Process -Force / 任务管理器「结束进程」杀 sainput。
+#    它会吃掉热键的 keydown，而 keyup 要靠同一个钩子送达 —— 强杀会让
+#    keyup 永远丢失，系统认为那个键一直按着（空格打不出、滚轮变缩放）。
+#    要退出请用：右键托盘 → 退出 sainput。
+#    万一已经卡住：托盘 →「释放卡住的键」，或命令行 sainput release-keys。

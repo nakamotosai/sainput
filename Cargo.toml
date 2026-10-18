@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/sainput-core", "crates/sainput-cli"]
+
+[workspace.package]
+version = "0.2.2"
+edition = "2021"
+rust-version = "1.91"
+license = "MIT"
+description = "Offline Windows voice input method: streaming local ASR, global hotkey hook, and SendInput text injection."
+readme = "README.md"
+keywords = ["asr", "speech-to-text", "ime", "voice-input", "offline"]
+categories = ["command-line-utilities", "multimedia::audio", "os::windows-apis"]
+
+[workspace.dependencies]
+anyhow = "1"
