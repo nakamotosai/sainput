@@ -51,3 +51,7 @@
 *.bak
 *.bak-*
 *~
+
+# release artifacts (packaging pipeline)
+dist/
+.runtime-src/
