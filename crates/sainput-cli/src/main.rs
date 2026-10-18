@@ -1467,6 +1467,9 @@ fn worker(
         }
 
         // 2) 采集 → sidecar（录音时喂；松键后继续喂尾巴，喂够了才 finish）
+        // 本轮采集流是否已断开：断开后必须丢掉 Capture，否则下一次按下只会
+        // 立刻再次收到 Disconnected —— 表现为「按了没反应」，永远恢复不了。
+        let mut cap_dead = false;
         if recording {
             if o.feed.is_some() {
                 for fr in feed_tick(&o, &mut fst) {
@@ -1520,9 +1523,28 @@ fn worker(
                     }
                 }
                 if disconnected {
+                    // 采集流断了（设备被拔/被独占/驱动报错）。
+                    // 语义上就是「这一句到此为止」：必须走和松手一样的收尾，
+                    // 包括把录音指示收掉、把死掉的 Capture 丢掉。
+                    //
+                    // 🔴 以前这里只改 recording/stage，既不淡出边缘光、也不丢 Capture：
+                    //    · 边缘光永远挂在屏幕上，而且它是 60fps 全屏重绘，白烧一个核；
+                    //    · 之后每次按下热键都会在这里立刻再断一次，用户看到的是
+                    //      「输入法彻底卡死、还关不掉」。
                     recording = false;
                     stage = Stage::AwaitFinal;
                     let _ = side.finish();
+                    ov_record_end(&o.overlay);
+                    cap_dead = true;
+                    if let Some(l) = &o.log {
+                        l.line(&format!(
+                            "D {:6}ms  麦克风流断开 → 按松手收尾（丢弃采集会话，下次按下重开）",
+                            t0.elapsed().as_millis()
+                        ));
+                    }
+                    eprintln!(
+                        "[sainput] ⚠ 麦克风流已断开 —— 本句按松手收尾，下次按下时重新打开麦克风"
+                    );
                 } else if got == 0 {
                     // 没数据就小睡一下，别空转烧 CPU
                     std::thread::sleep(Duration::from_millis(4));
@@ -1555,10 +1577,23 @@ fn worker(
         } else if o.lazy_mic {
             cap = None; // 按需模式：松手就释放麦克风
         } else {
+            let mut errored = false;
             if let Some(c) = &cap {
                 while c.rx.try_recv().is_ok() {} // 常驻模式：空闲时排掉，防堆积
+                // 驱动报过错 = 这条流已经不可信。留着它，下次按下热键只会
+                // 收不到任何音频（用户看到「没输入」）；丢掉它，下一次
+                // audio::start 会重新打开麦克风。
+                errored = c.stats.stream_errors.load(Ordering::Relaxed) > 0;
+            }
+            if errored {
+                cap = None;
+                eprintln!("[sainput] ⚠ 麦克风流报过错，已释放；下次按下热键时重新打开");
             }
             std::thread::sleep(Duration::from_millis(8));
+        }
+
+        if cap_dead {
+            cap = None; // 死流必须丢，否则下次按下会立刻再断一次
         }
 
         // 2.5) 托盘开关 → sidecar（立刻改策略，不必重开）
