@@ -1085,6 +1085,39 @@ unsafe fn paint(hwnd: isize) {
     DeleteDC(mem_dc);
 }
 
+thread_local! {
+    /// D2D 渲染目标缓存（窗口线程专用；COM 对象不是 Send）。
+    static RT: std::cell::RefCell<Option<(
+        windows::Win32::Graphics::Direct2D::ID2D1Factory,
+        windows::Win32::Graphics::Direct2D::ID2D1DCRenderTarget,
+        windows::Win32::Graphics::Direct2D::ID2D1RenderTarget,
+    )>> = const { std::cell::RefCell::new(None) };
+
+    /// 上一次 D2D 报错的时刻和内容。
+    /// 窗口线程在设备丢失时会按 60fps 重试，不设限流会把控制台/日志刷爆。
+    static LAST_D2D_ERR: std::cell::RefCell<Option<(std::time::Instant, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 记录 D2D 错误：同一条错误最多 2 秒输出一次。
+fn log_d2d_err(stage: &str, e: &windows::core::Error) {
+    LAST_D2D_ERR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let msg = format!("{stage}: {e:?}");
+        let now = std::time::Instant::now();
+        let should = match slot.as_ref() {
+            Some((at, prev)) => {
+                prev != &msg || now.duration_since(*at) >= std::time::Duration::from_secs(2)
+            }
+            None => true,
+        };
+        if should {
+            eprintln!("[ov] D2D {msg}");
+            *slot = Some((now, msg));
+        }
+    });
+}
+
 /// 建一个绑到 DIB 上的 D2D render target，跑 `f`，收尾。
 ///
 /// 抽出来是因为细条和悬浮球用的是**同一套** D2D 初始化 ——
@@ -1102,23 +1135,16 @@ fn with_target(hdc: isize, rc: &Rect, f: impl FnOnce(&d2d_target::Target)) {
     // 用户看到的就是"边缘光啪一下出现"，因为淡入的十几帧被拖成了好几百毫秒。
     // 复用后同一段绘制降到毫秒级。
     //
-    // 用 thread_local：窗口线程只有一个，且 COM 对象不是 Send。
-    thread_local! {
-        static RT: std::cell::RefCell<Option<(
-            d2d::ID2D1Factory,
-            d2d::ID2D1DCRenderTarget,
-            d2d::ID2D1RenderTarget,
-        )>> = const { std::cell::RefCell::new(None) };
-    }
-
+    // 复用缓存；每帧只需要重新 BindDC（尺寸/位置可能变）
     RT.with(|slot| unsafe {
     let mut slot = slot.borrow_mut();
+    let mut dead = false;
     if slot.is_none() {
         let factory: d2d::ID2D1Factory =
             match d2d::D2D1CreateFactory(d2d::D2D1_FACTORY_TYPE_SINGLE_THREADED, None) {
                 Ok(f) => f,
                 Err(e) => {
-                    eprintln!("[ov] D2D1CreateFactory failed: {e:?}");
+                    log_d2d_err("D2D1CreateFactory", &e);
                     return;
                 }
             };
@@ -1138,7 +1164,7 @@ fn with_target(hdc: isize, rc: &Rect, f: impl FnOnce(&d2d_target::Target)) {
         let rt: d2d::ID2D1DCRenderTarget = match factory.CreateDCRenderTarget(&props) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[ov] CreateDCRenderTarget failed: {e:?}");
+                log_d2d_err("CreateDCRenderTarget", &e);
                 return;
             }
         };
@@ -1150,13 +1176,13 @@ fn with_target(hdc: isize, rc: &Rect, f: impl FnOnce(&d2d_target::Target)) {
             bottom: rc.bottom,
         };
         if let Err(e) = rt.BindDC(HDC(hdc), &sub) {
-            eprintln!("[ov] BindDC failed: {e:?}");
+            log_d2d_err("BindDC(create)", &e);
             return;
         }
         let target: d2d::ID2D1RenderTarget = match rt.cast() {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("[ov] cast to RenderTarget failed: {e:?}");
+                log_d2d_err("cast<ID2D1RenderTarget>", &e);
                 return;
             }
         };
@@ -1172,15 +1198,28 @@ fn with_target(hdc: isize, rc: &Rect, f: impl FnOnce(&d2d_target::Target)) {
         right: rc.right,
         bottom: rc.bottom,
     };
+    // 🔴 设备丢失的唯一出口。
+    //
+    // GPU 驱动报错 / 睡眠唤醒后，Direct2D 设备会被重置：旧 target 的
+    // EndDraw 返回 D2DERR_RECREATE_TARGET（BindDC 也可能直接失败）。
+    // 以前这里只打印一行、继续用同一个死 target —— 之后每一帧都画进
+    // 不存在的设备，DIB 保持全透明，用户看到的就是「彩虹边缘光突然
+    // 消失，但语音输入一切正常」，只能重启进程。
+    // 现在只要出错就丢弃缓存，下一帧用新 target 重建，最多丢一帧。
     if let Err(e) = rt.BindDC(HDC(hdc), &sub) {
-        eprintln!("[ov] BindDC failed: {e:?}");
-        return;
+        log_d2d_err("BindDC", &e);
+        dead = true;
+    } else {
+        target.BeginDraw();
+        target.Clear(Some(&color(0, 0, 0, 0.0)));
+        f(&d2d_target::Target { target });
+        if let Err(e) = target.EndDraw(None, None) {
+            log_d2d_err("EndDraw", &e);
+            dead = true;
+        }
     }
-    target.BeginDraw();
-    target.Clear(Some(&color(0, 0, 0, 0.0)));
-    f(&d2d_target::Target { target });
-    if let Err(e) = target.EndDraw(None, None) {
-        eprintln!("[ov] EndDraw failed: {e:?}");
+    if dead {
+        *slot = None;
     }
     });
 }
@@ -1605,6 +1644,78 @@ fn draw_bar_text(
                 d2d::D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 DWRITE_MEASURING_MODE_NATURAL,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：D2D 目标失效后必须丢掉缓存，并在下一帧重建。
+    ///
+    /// 真实触发条件是 GPU 驱动报错 / 睡眠唤醒后的设备丢失：旧代码只
+    /// eprintln、继续复用死 target，边缘光会永久消失（用户实测报过）。
+    /// 这里用「已删除的 DC」当替身，让 BindDC 必然失败。
+    #[test]
+    fn d2d_target_cache_recovers_after_failure() {
+        unsafe {
+            let mem_dc = CreateCompatibleDC(0);
+            assert!(mem_dc != 0, "CreateCompatibleDC failed");
+            let bmi = BitmapInfo {
+                header: BitmapInfoHeader {
+                    bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+                    bi_width: 64,
+                    bi_height: -64,
+                    bi_planes: 1,
+                    bi_bit_count: 32,
+                    bi_compression: 0,
+                    bi_size_image: 64 * 64 * 4,
+                    ..Default::default()
+                },
+                colors: [0; 3],
+            };
+            let mut bits: *mut u8 = ptr::null_mut();
+            let dib = CreateDIBSection(mem_dc, &bmi, 0, &mut bits, 0, 0);
+            assert!(dib != 0 && !bits.is_null(), "CreateDIBSection failed");
+            let old_bmp = SelectObject(mem_dc, dib);
+
+            let rc = Rect {
+                left: 0,
+                top: 0,
+                right: 64,
+                bottom: 64,
+            };
+
+            let mut drew = false;
+            with_target(mem_dc, &rc, |_| drew = true);
+            assert!(drew, "健康 target 应执行绘制");
+            assert!(
+                RT.with(|s| s.borrow().is_some()),
+                "健康绘制后应留下缓存"
+            );
+
+            // 失败替身：先建再删，留下的句柄保证 BindDC 失败
+            let stale = CreateCompatibleDC(0);
+            assert!(stale != 0);
+            DeleteDC(stale);
+            with_target(stale, &rc, |_| {});
+            assert!(
+                RT.with(|s| s.borrow().is_none()),
+                "BindDC 失败后必须丢弃缓存（旧 bug：继续复用死 target）"
+            );
+
+            // 下一帧用健康 DC：必须重建并继续画
+            let mut drew_again = false;
+            with_target(mem_dc, &rc, |_| drew_again = true);
+            assert!(drew_again, "缓存重建后应继续绘制");
+            assert!(RT.with(|s| s.borrow().is_some()));
+
+            // 先清缓存再收尾，别让 target 绑着已删除的 DC
+            RT.with(|s| *s.borrow_mut() = None);
+            SelectObject(mem_dc, old_bmp);
+            DeleteObject(dib);
+            DeleteDC(mem_dc);
         }
     }
 }
