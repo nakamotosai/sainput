@@ -115,6 +115,10 @@ pub const HOTKEY_CANDIDATES: &[(&str, &str)] = &[
 
 /// 主循环每拍读一次：托盘点了哪个开关。
 static PENDING: std::sync::Mutex<Option<TrayToggle>> = std::sync::Mutex::new(None);
+/// 托盘图标的数据块 —— 必须留着：Explorer 重启后要拿同一份数据重新 NIM_ADD。
+static TRAY_NID: std::sync::Mutex<Option<NotifyIconDataW>> = std::sync::Mutex::new(None);
+/// Explorer 重启时广播的消息 id（RegisterWindowMessageW 的返回值；0 = 没注册成功）。
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 /// 当前开关状态（由主循环推给托盘，用来画勾）。
 static FLAGS: std::sync::Mutex<TrayFlags> = std::sync::Mutex::new(TrayFlags {
     punct_to_space: false,
@@ -212,6 +216,7 @@ static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static MAIN_THREAD: AtomicU32 = AtomicU32::new(0);
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct NotifyIconDataW {
     cb_size: u32,
     hwnd: isize,
@@ -313,6 +318,10 @@ extern "system" {
     fn PostThreadMessageW(thread: u32, msg: u32, wp: usize, lp: isize) -> i32;
     fn GetCurrentThreadId() -> u32;
     fn GetModuleHandleW(name: *const u16) -> isize;
+    fn RegisterWindowMessageW(name: *const u16) -> u32;
+    fn EnumWindows(cb: Option<unsafe extern "system" fn(isize, isize) -> i32>, lp: isize) -> i32;
+    fn GetClassNameW(hwnd: isize, buf: *mut u16, max: i32) -> i32;
+    fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
 }
 
 #[link(name = "user32")]
@@ -388,6 +397,11 @@ impl Tray {
         std::thread::Builder::new()
             .name("sainput-tray".into())
             .spawn(move || unsafe {
+                // Explorer 重启会广播这条消息。名字注册一次，id 全进程有效。
+                TASKBAR_CREATED.store(
+                    RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
+                    Ordering::Relaxed,
+                );
                 let hwnd = create_window();
                 if hwnd == 0 {
                     let _ = tx.send(false);
@@ -402,6 +416,9 @@ impl Tray {
                 if Shell_NotifyIconW(NIM_ADD, &mut nid) == 0 {
                     let _ = tx.send(false);
                     return;
+                }
+                if let Ok(mut g) = TRAY_NID.lock() {
+                    *g = Some(nid);
                 }
                 let _ = tx.send(true);
                 let mut msg: Msg = std::mem::zeroed();
@@ -431,12 +448,7 @@ impl Tray {
             None => return,
         };
         unsafe {
-            let mut nid = new_nid(hwnd);
-            nid.u_flags = NIF_INFO;
-            set_fixed(&mut nid.sz_info_title, title);
-            set_fixed(&mut nid.sz_info, text);
-            nid.dw_info_flags = 1; // NIIF_INFO
-            Shell_NotifyIconW(NIM_MODIFY, &mut nid);
+            balloon_now(hwnd, title, text);
         }
     }
 
@@ -502,6 +514,40 @@ pub fn set_console_visible(v: bool) {
     }
 }
 
+/// 让指定进程走「托盘退出」路径：它的主循环收尾、sidecar 由 Drop 结束。
+///
+/// 找不到它的托盘窗口（旧版没起托盘 / 托盘线程已死）时返回 false，
+/// 交给调用方硬杀。跨进程 PostMessage 不需要命名管道 —— 类名固定，找得到就能发。
+pub fn request_exit_of(pid: u32) -> bool {
+    struct Ctx {
+        pid: u32,
+        sent: bool,
+    }
+
+    unsafe extern "system" fn find_and_exit(hwnd: isize, lp: isize) -> i32 {
+        let ctx = &mut *(lp as *mut Ctx);
+        let mut wpid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut wpid);
+        if wpid != ctx.pid {
+            return 1;
+        }
+        let mut buf = [0u16; 64];
+        let n = GetClassNameW(hwnd, buf.as_mut_ptr(), 64);
+        if n <= 0 || String::from_utf16_lossy(&buf[..n as usize]) != TRAY_CLASS {
+            return 1;
+        }
+        PostMessageW(hwnd, WM_COMMAND, ID_EXIT, 0);
+        ctx.sent = true;
+        0
+    }
+
+    let mut ctx = Ctx { pid, sent: false };
+    unsafe {
+        EnumWindows(Some(find_and_exit), &mut ctx as *mut Ctx as isize);
+    }
+    ctx.sent
+}
+
 /// 用户是否通过托盘点了退出。
 pub fn exit_requested() -> bool {
     EXIT_REQUESTED.load(Ordering::Relaxed)
@@ -558,7 +604,37 @@ unsafe fn create_window() -> isize {
     hwnd
 }
 
+/// Explorer 重启会把通知区域整个重建，托盘图标随之消失。
+/// 拿启动时存下的 nid 重新 ADD 一次 —— 不重新 ADD，进程还在但用户永远看不到图标。
+/// 图标本来就在时 ADD 会失败（同一 hwnd+uID 重复注册），这不是错误，走 MODIFY 更新即可。
+unsafe fn restore_icon() {
+    if let Ok(mut g) = TRAY_NID.lock() {
+        if let Some(nid) = g.as_mut() {
+            nid.u_flags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+            if Shell_NotifyIconW(NIM_ADD, nid) == 0 {
+                Shell_NotifyIconW(NIM_MODIFY, nid);
+            }
+        }
+    }
+}
+
+unsafe fn balloon_now(hwnd: isize, title: &str, text: &str) {
+    let mut nid = new_nid(hwnd);
+    nid.u_flags = NIF_INFO;
+    set_fixed(&mut nid.sz_info_title, title);
+    set_fixed(&mut nid.sz_info, text);
+    nid.dw_info_flags = 1; // NIIF_INFO
+    Shell_NotifyIconW(NIM_MODIFY, &mut nid);
+}
+
 unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wp: usize, lp: isize) -> isize {
+    // Explorer 崩溃/更新/重启后广播 TaskbarCreated。收到就重新挂图标，
+    // 否则图标永久消失：sainput 照常工作，用户却以为它没开。
+    let tc = TASKBAR_CREATED.load(Ordering::Relaxed);
+    if tc != 0 && msg == tc {
+        restore_icon();
+        return 0;
+    }
     match msg {
         WM_TRAY => {
             // 传统版本的托盘回调：lParam 就是鼠标消息

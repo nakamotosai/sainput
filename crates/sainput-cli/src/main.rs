@@ -1679,11 +1679,10 @@ fn tail_of(a: &Args) -> Result<TailCfg> {
 
 fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
     // 单实例：两个 sainput 同时跑会各挂一个全局钩子，说一句话屏幕上打两遍。
-    // 桌面快捷方式被双击两次是最常见的触发方式。
-    let Some(_guard) = single::acquire() else {
-        println!("[sainput] 已经有一个 sainput 在跑了 —— 看任务栏右下角的托盘图标。");
-        println!("[sainput] 这个窗口可以直接关掉。");
-        // 托盘图标是「它在跑」的唯一可见标志，停留一下让用户看见这句话再走。
+    // 后启动的接管：先让旧实例退出（优先托盘退出，退不掉才硬杀），再自己拿锁。
+    // 这样每次重新构建后双击一次，跑的一定是最新二进制，也不会留下旧进程。
+    let Some(_guard) = single::acquire_or_take_over() else {
+        println!("[sainput] 旧实例退不掉（可能以管理员权限在跑）—— 先手动退出它再启动。");
         std::thread::sleep(Duration::from_secs(6));
         return Ok(());
     };
