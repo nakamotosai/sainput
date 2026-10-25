@@ -60,7 +60,9 @@ def open_sidecar_log(max_bytes: int = 2 << 20):
 
     Its stderr used to go to DEVNULL: a sidecar that exited left nothing behind
     but a proxy that kept accepting audio and returned no text, which is
-    indistinguishable from a slow model. Rotated by size so it cannot grow.
+    indistinguishable from a slow model. Truncated at startup if it is already
+    larger than max_bytes, so a long-lived proxy does not accumulate one forever
+    (the recognizer itself is quiet, so this is a guard, not routine).
     """
     try:
         if os.path.exists(SIDECAR_LOG_PATH) and os.path.getsize(SIDECAR_LOG_PATH) > max_bytes:
@@ -278,6 +280,7 @@ class Proxy:
             # gets its text instead of failing on a socket error. Deaths are
             # logged by the watchdog thread.
             self.ensure_sidecar()
+            session_pid = self.sidecar.pid
             # Clear any leftovers from a previous session, and make the sidecar
             # end utterances only when we ask (the IME commits on key release).
             self.sidecar.send({"cmd": "set", "key": "silence_sec", "value": 0})
@@ -310,6 +313,15 @@ class Proxy:
                     continue
                 if message_type != 0x02:
                     continue
+
+                if self.sidecar.pid != session_pid:
+                    # The recognizer was replaced mid-dictation: the audio already
+                    # sent went with the dead child, so this utterance cannot be
+                    # completed. Say so -- committing the replacement's empty
+                    # answer would be exactly the silent failure this exists to
+                    # stop, only without the error line.
+                    raise RuntimeError("recognizer replaced mid-session (pid %d -> %d)"
+                                       % (session_pid, self.sidecar.pid))
 
                 if message_type == 0x02 and payload:
                     audio_bytes += len(payload)
@@ -385,6 +397,12 @@ class Proxy:
                             final_text = str(msg.get("text") or "")
                             tail_chunks = int(msg.get("tail_chunks") or 0)
                             break
+                    if self.sidecar.pid != session_pid:
+                        # Same swap, but it landed while the ending drain ran: the
+                        # "final" we just read came from a child that never heard
+                        # this utterance.
+                        raise RuntimeError("recognizer replaced during finish (pid %d -> %d)"
+                                           % (session_pid, self.sidecar.pid))
                     if final_text and final_text != last_text:
                         ws.send(server_packet(final_text, last=False))
                     ws.send(server_packet(final_text, last=True))

@@ -130,6 +130,7 @@ class Sidecar:
         self.q: "queue.Queue[dict]" = queue.Queue()
         self.lock = threading.Lock()          # one request at a time
         self.spawn_lock = threading.Lock()    # one respawn at a time
+        self.state_lock = threading.Lock()    # pairs a proc swap with EOF handling
         self.dead = threading.Event()
         self.ready = False
         self.model = ""
@@ -141,7 +142,7 @@ class Sidecar:
         self._spawn()
 
     def _spawn(self) -> None:
-        self.proc = subprocess.Popen(
+        proc = subprocess.Popen(
             self._argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -149,16 +150,21 @@ class Sidecar:
             bufsize=0,
             creationflags=CREATE_NO_WINDOW,
         )
-        self.pid = self.proc.pid
-        self.ready = False
-        self.exit_code = None
-        self.dead.clear()
+        # Swap under state_lock: a reader thread handling the previous child's
+        # EOF must not be able to mark THIS child dead, and its "exited" message
+        # must not land in the queue after the drain below.
+        with self.state_lock:
+            self.proc = proc
+            self.pid = proc.pid
+            self.ready = False
+            self.exit_code = None
+            self.dead.clear()
         while True:   # whatever the previous child said is stale now
             try:
                 self.q.get_nowait()
             except queue.Empty:
                 break
-        threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
+        threading.Thread(target=self._reader, args=(proc,), daemon=True).start()
 
     def alive(self) -> bool:
         return not self.dead.is_set() and self.proc.poll() is None
@@ -194,12 +200,16 @@ class Sidecar:
                 # EOF and process exit are not atomic: wait briefly for the real
                 # exit code, it is the first thing to read when asking why.
                 try:
-                    self.exit_code = proc.wait(timeout=2.0)
+                    code = proc.wait(timeout=2.0)
                 except Exception:
-                    self.exit_code = proc.poll()
-                self.ready = False
-                self.dead.set()
-                self.q.put({"type": "error", "msg": "exited (code=%s)" % fmt_code(self.exit_code)})
+                    code = proc.poll()
+                with self.state_lock:
+                    if proc is self.proc:   # a respawn may have landed while we waited
+                        self.exit_code = code
+                        self.ready = False
+                        self.dead.set()
+                        self.q.put({"type": "error",
+                                    "msg": "exited (code=%s)" % fmt_code(self.exit_code)})
 
     def send(self, obj: dict) -> None:
         if self.dead.is_set():
@@ -311,7 +321,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            self._json(200, {"ok": True, "model": self.server.sidecar.model})
+            # A dead recognizer must not be reported as healthy: that is the
+            # whole failure mode this bridge shares with the Doubao proxy.
+            alive = self.server.sidecar.alive()
+            self._json(200 if alive else 503,
+                       {"ok": alive, "alive": alive,
+                        "model": self.server.sidecar.model,
+                        "exit_code": self.server.sidecar.exit_code})
         else:
             self._json(404, {"error": "not found"})
 
