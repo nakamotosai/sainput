@@ -64,7 +64,12 @@ def open_sidecar_log(max_bytes: int = 2 << 20):
     """
     try:
         if os.path.exists(SIDECAR_LOG_PATH) and os.path.getsize(SIDECAR_LOG_PATH) > max_bytes:
-            os.remove(SIDECAR_LOG_PATH)
+            try:
+                os.remove(SIDECAR_LOG_PATH)
+            except OSError:
+                # A live child still holds it (an orphan from an earlier proxy).
+                # Appending to a big log beats silently losing the next crash.
+                pass
         return open(SIDECAR_LOG_PATH, "ab", buffering=0)
     except Exception as exc:
         log("sidecar log unusable:", SIDECAR_LOG_PATH, repr(exc))
