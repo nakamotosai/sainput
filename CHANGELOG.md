@@ -13,6 +13,16 @@
   endpoint 上,解码一旦落后(长句、机器忙),定稿时 `get_result()` 拿到的就是
   没喂完的音频,最后一个词消失。收尾改为一次解完(`drain_all`),并在 `final`
   里报告 `tail_chunks`(定稿时补解了多少帧)。回归测试:`tools/test_tail_drain.py`。
+- 识别器静默死掉导致「有波形、没文字」:sidecar 子进程退出后代理并不知情,照样
+  收音频,每段会话只在日志里留一行 `session error: OSError(22, 'Invalid argument')`
+  ——侧键、波形、提示音一切正常,却永远不出字(2026-10-25 真机上从 11:42 第一次
+  静默失败到 14:37 重启,坏了近 3 小时)。
+  现在:`Sidecar` 以 stdout EOF 判定存活,子进程一死立刻唤醒等待者并报
+  `exited (code=N)`(Windows 异常码同时给十六进制,如 `-1073741819 (0xC0000005)`);
+  代理带看门狗,发现死了立即换新的(加载约 7 秒),会话开头会等它回来再说话;
+  子进程 stderr 从此写 `%TEMP%\sainput_sidecar.log`(以前是 DEVNULL,所以死因
+  无迹可查),启动时模型加载失败也留日志再退出。回归测试:
+  `tools/test_proxy_respawn.py`。
 
 ### Added
 
@@ -25,6 +35,9 @@
 - `tools/asr_sidecar.py`:`SAINPUT_PUMP_DEBUG=1` 时发 `dbg` 事件(每轮解了几帧、
   还剩没解完的帧),给探针判断积压用;不设这个变量时不发 `dbg`,除每轮一次
   环境变量查询外没有额外开销,解码结果与耗时不受影响。
+- `tools/test_proxy_respawn.py` + `tools/stub_sidecar.py`:假识别器(同一套 JSON
+  协议、不加载模型)用来验证「识别器死了,代理会自己换一个,并在日志里说清
+  死因」,3 秒跑完,不碰真模型、不占 19000 端口。
 
 ## [0.2.3] - 2026-10-20
 

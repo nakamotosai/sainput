@@ -30,22 +30,45 @@ from websockets.sync.server import serve
 
 from local_asr_http import Sidecar
 
-LOG_PATH = os.path.join(os.environ.get("TEMP", "."), "sainput_doubao_proxy.log")
-MUTEX_NAME = "Local\\SainputDoubaoProxy"
+LOG_PATH = os.environ.get("SAINPUT_PROXY_LOG") or os.path.join(
+    os.environ.get("TEMP", "."), "sainput_doubao_proxy.log")
+SIDECAR_LOG_PATH = os.environ.get("SAINPUT_SIDECAR_LOG") or os.path.join(
+    os.environ.get("TEMP", "."), "sainput_sidecar.log")
 
 
-def acquire_single_instance():
+def mutex_name(port: int) -> str:
+    """One proxy per port. The supervisor watches the default port's name."""
+    return "Local\\SainputDoubaoProxy" if port == 19000 else "Local\\SainputDoubaoProxy-%d" % port
+
+
+def acquire_single_instance(name: str):
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
     kernel32.CreateMutexW.restype = wintypes.HANDLE
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    handle = kernel32.CreateMutexW(None, False, name)
     if not handle:
         return None
     if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
         kernel32.CloseHandle(handle)
         return None
     return handle
+
+
+def open_sidecar_log(max_bytes: int = 2 << 20):
+    """Give the recognizer a place to say why it died.
+
+    Its stderr used to go to DEVNULL: a sidecar that exited left nothing behind
+    but a proxy that kept accepting audio and returned no text, which is
+    indistinguishable from a slow model. Rotated by size so it cannot grow.
+    """
+    try:
+        if os.path.exists(SIDECAR_LOG_PATH) and os.path.getsize(SIDECAR_LOG_PATH) > max_bytes:
+            os.remove(SIDECAR_LOG_PATH)
+        return open(SIDECAR_LOG_PATH, "ab", buffering=0)
+    except Exception as exc:
+        log("sidecar log unusable:", SIDECAR_LOG_PATH, repr(exc))
+        return subprocess.DEVNULL
 
 
 def log(*args) -> None:
@@ -126,6 +149,39 @@ class Proxy:
             except Exception as exc:
                 log("dump dir unusable:", dump_dir, repr(exc))
                 self.dump_dir = ""
+        # The recognizer can die outside any session (crash, something killing
+        # it, a device event). Serving audio into a dead one used to mean
+        # "waveform moves, no text ever again" with nothing in any log. Watch it
+        # and put a fresh one in place instead.
+        threading.Thread(target=self._sidecar_watchdog, daemon=True).start()
+
+    def ensure_sidecar(self, timeout: float = 150.0) -> None:
+        """Wait for a live recognizer, respawning one that died.
+
+        Called at the start of a session, so a dictation that lands while the
+        recognizer is being replaced still gets its text. `Sidecar.restart`
+        serialises with the watchdog, so only one child is ever spawned.
+        """
+        if self.sidecar.alive():
+            return
+        t0 = time.monotonic()
+        log("session waiting for recognizer")
+        self.sidecar.restart(timeout)
+        log("recognizer back (pid=%s, %.1fs)" % (self.sidecar.pid, time.monotonic() - t0))
+
+    def _sidecar_watchdog(self) -> None:
+        failures = 0
+        while True:
+            time.sleep(2.0)
+            if self.sidecar.alive():
+                failures = 0
+                continue
+            try:
+                self.sidecar.restart()
+            except Exception as exc:
+                failures += 1
+                log("sidecar watchdog: respawn failed (%d): %r" % (failures, exc))
+                time.sleep(min(60.0, 5.0 * failures))
 
     def dump_session(self, pcm: bytearray, text: str, audio_ms: int) -> None:
         """Write one session's raw audio + its transcript next to it.
@@ -213,6 +269,10 @@ class Proxy:
         final_text = ""
         tail_chunks = 0
         try:
+            # A dictation that lands while the recognizer is being replaced still
+            # gets its text instead of failing on a socket error. Deaths are
+            # logged by the watchdog thread.
+            self.ensure_sidecar()
             # Clear any leftovers from a previous session, and make the sidecar
             # end utterances only when we ask (the IME commits on key release).
             self.sidecar.send({"cmd": "set", "key": "silence_sec", "value": 0})
@@ -378,17 +438,24 @@ def main() -> int:
                     help="把每次会话的原始音频+最终文本写到这个目录(默认关;排查丢尾巴用)")
     args = ap.parse_args()
 
-    mutex = acquire_single_instance()
+    mutex = acquire_single_instance(mutex_name(args.port))
     if mutex is None:
         log("already running; exit")
         return 0
-    log("starting pid=%d" % os.getpid())
+    log("starting pid=%d port=%d" % (os.getpid(), args.port))
 
     sidecar = Sidecar(args.python, args.script, args.model_dir, args.punct_dir, args.hotwords, args.threads,
-                      stderr=subprocess.DEVNULL if sys.stderr is None else None)
+                      stderr=open_sidecar_log(), log=log)
     log("loading model...")
-    sidecar.wait_ready()
-    log("model ready: " + sidecar.model)
+    try:
+        sidecar.wait_ready()
+    except Exception as exc:
+        # A recognizer that will not come up must say so here, or every
+        # dictation after it turns into a silent "no text".
+        log("model load failed: %r" % (exc,))
+        sidecar.close()
+        return 1
+    log("model ready: pid=%d %s" % (sidecar.pid, sidecar.model))
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certfile=args.cert, keyfile=args.key)

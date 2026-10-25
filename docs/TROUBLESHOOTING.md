@@ -273,3 +273,50 @@ python  tools\probe_tail_oracle.py --dir "%TEMP%\sainput_sessions"
 不一致 → 尾巴就是在这段路径里丢的。dump 文件名里带 `live<N>ms-dump<M>ms-t<K>`,
 `dump < live` 或 `t0`(现场没拿到文本)时脚本会直接标 SKIP / NOTE,不算尾巴丢失。
 `--dump-dir` 默认关(会把语音原文写到磁盘),排查完记得去掉。
+
+## 11. 侧键、波形、提示音都正常,但一个字都不出
+
+先看代理日志最近的几行:
+
+```bat
+powershell -NoProfile -Command "Get-Content $env:TEMP\sainput_doubao_proxy.log -Tail 15"
+```
+
+按日志里的说法对号入座:
+
+- `session error: ... exited (code=N)` → 识别器子进程死了。`exit=` 后面是死法:
+  `-1 (0xFFFFFFFF)` 是被外部强杀(`taskkill`、任务管理器、清理脚本),
+  `-1073741819 (0xC0000005)` 之类是它自己崩了。原因写在
+  `%TEMP%\sainput_sidecar.log`(子进程的 stderr,以前这里进的是 DEVNULL,
+  所以死因查不到)。
+- `sidecar died ... respawning` 后跟着 `sidecar ready (pid=... 7.1s)` → 代理已经
+  自动换了一个新的识别器,等这行出现再按一次侧键就行(换的那 7 秒里按下的
+  那一次不会有文字)。不需要重启代理,更不需要重启输入法。
+- `already running; exit` → 这个端口已经有代理在跑(单实例互斥量按端口区分,
+  19000 的名字仍是 `Local\SainputDoubaoProxy`),先关掉旧的。
+- `model load failed: ...` → 模型路径或文件有问题,代理主动退出并把原因写进日志。
+
+想确认此刻有几个识别器、挂在谁下面:
+
+```bat
+powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'asr_sidecar' } | Select-Object ProcessId,ParentProcessId,CreationDate"
+```
+
+正常只有一个,`ParentProcessId` 是代理的 pid。
+
+### 识别器为什么会死
+
+识别器(`asr_sidecar.py`)是一个独立子进程,跑在 `dist/.../runtime/python.exe` 上,
+只从管道读 PCM:不碰麦克风、不出网、不读输入法配置。所以能弄死它的只有进程层面的事:
+
+- 被外部强杀:PID 清理、"清残留 python"之类的脚本、任务管理器收尾。
+  它平时看起来就是一个 `python.exe`,最容易被顺手清掉。
+- 自己崩:内存、模型文件损坏、onnxruntime 异常 —— 这时退出码会给出类别。
+
+麦克风插拔不会直接杀它(它不碰音频设备)。设备变化只会让输入法重开一段会话,
+所以「刚插拔完麦克风就不出字」通常是巧合:识别器更早之前就已经死了,而
+死掉之后每一次按键都只是安静地失败,直到有人去看日志。
+
+代理现在会把死掉的识别器自己换掉(约 7 秒),所以这类故障的代价是一次按键的
+白等 + 十秒内自动恢复,而不是「从此永远不出字」。回归测试 `tools/test_proxy_respawn.py`
+(用 `tools/stub_sidecar.py` 假识别器,3 秒跑完,不需要模型)。

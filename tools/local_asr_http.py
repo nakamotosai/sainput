@@ -88,9 +88,32 @@ def decode_wav(data: bytes) -> array.array:
     return pcm
 
 
+def fmt_code(code) -> str:
+    """Readable exit code: decimal, plus hex for Windows exception codes.
+
+    A real crash shows up as -1073741819 (0xC0000005) rather than as
+    18446744073709551615, which is what the OS reports for a kill.
+    """
+    if code is None:
+        return "?"
+    if code >= 0x80000000:
+        return "%d (0x%08X)" % (code - 0x100000000, code)
+    return str(code)
+
+
 class Sidecar:
+    """The recognizer child process and its JSON protocol.
+
+    A missing recognizer must not look like a working one. When the child exits,
+    `alive()` turns false, everyone waiting for a reply is woken with an error
+    instead of sitting out their timeout, and `restart()` starts a fresh child
+    with the same arguments. Without that, a dead sidecar leaves the Doubao proxy
+    accepting audio and returning no text at all -- the "waveform moves, nothing
+    is typed" failure, which used to be indistinguishable from a slow model.
+    """
+
     def __init__(self, python: str, script: str, model_dir: str, punct_dir: str,
-                 hotwords: Optional[str], threads: int, stderr=None):
+                 hotwords: Optional[str], threads: int, stderr=None, log=None):
         args = [
             python,
             script,
@@ -104,36 +127,91 @@ class Sidecar:
         if hotwords and os.path.isfile(hotwords):
             args += ["--hotwords", hotwords]
 
+        self.q: "queue.Queue[dict]" = queue.Queue()
+        self.lock = threading.Lock()          # one request at a time
+        self.spawn_lock = threading.Lock()    # one respawn at a time
+        self.dead = threading.Event()
+        self.ready = False
+        self.model = ""
+        self.pid = 0
+        self.exit_code: Optional[int] = None
+        self._argv = args
+        self._stderr = stderr
+        self.log = log or (lambda *a: None)
+        self._spawn()
+
+    def _spawn(self) -> None:
         self.proc = subprocess.Popen(
-            args,
+            self._argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=stderr,
+            stderr=self._stderr,
             bufsize=0,
             creationflags=CREATE_NO_WINDOW,
         )
-        self.q: "queue.Queue[dict]" = queue.Queue()
-        self.lock = threading.Lock()
-        self.model = ""
+        self.pid = self.proc.pid
         self.ready = False
-        threading.Thread(target=self._reader, daemon=True).start()
-
-    def _reader(self) -> None:
-        assert self.proc.stdout is not None
-        for raw in self.proc.stdout:
-            line = raw.decode("utf-8", "replace").strip()
-            if not line:
-                continue
+        self.exit_code = None
+        self.dead.clear()
+        while True:   # whatever the previous child said is stale now
             try:
-                msg = json.loads(line)
-            except Exception:
-                continue
-            self.q.put(msg)
+                self.q.get_nowait()
+            except queue.Empty:
+                break
+        threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
+
+    def alive(self) -> bool:
+        return not self.dead.is_set() and self.proc.poll() is None
+
+    def restart(self, timeout: float = 120.0) -> None:
+        """Replace the child if it is gone; return at once when it is fine."""
+        with self.spawn_lock:
+            if self.alive():
+                return
+            code = self.exit_code if self.exit_code is not None else self.proc.poll()
+            self.log("sidecar died (pid=%s exit=%s); respawning" % (self.pid, fmt_code(code)))
+            started = time.monotonic()
+            self._spawn()
+            self.wait_ready(timeout)
+            self.log("sidecar ready (pid=%s model=%s, %.1fs)" % (
+                self.pid, self.model, time.monotonic() - started))
+
+    def _reader(self, proc) -> None:
+        try:
+            for raw in proc.stdout:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except Exception:
+                    continue
+                self.q.put(msg)
+        except Exception as exc:
+            self.log("sidecar stdout reader failed: %r" % (exc,))
+        finally:
+            if proc is self.proc:
+                # EOF and process exit are not atomic: wait briefly for the real
+                # exit code, it is the first thing to read when asking why.
+                try:
+                    self.exit_code = proc.wait(timeout=2.0)
+                except Exception:
+                    self.exit_code = proc.poll()
+                self.ready = False
+                self.dead.set()
+                self.q.put({"type": "error", "msg": "exited (code=%s)" % fmt_code(self.exit_code)})
 
     def send(self, obj: dict) -> None:
+        if self.dead.is_set():
+            raise RuntimeError("sidecar exited (code=%s)" % fmt_code(self.exit_code))
         assert self.proc.stdin is not None
-        self.proc.stdin.write(json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n")
-        self.proc.stdin.flush()
+        try:
+            self.proc.stdin.write(json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n")
+            self.proc.stdin.flush()
+        except OSError as exc:
+            # Windows reports a write to a pipe whose reader is gone as
+            # OSError(22, 'Invalid argument'), which tells nobody anything.
+            raise RuntimeError("sidecar gone (write failed: %r)" % (exc,)) from exc
 
     def wait_ready(self, timeout: float = 120.0) -> None:
         deadline = time.monotonic() + timeout
