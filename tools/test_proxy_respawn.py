@@ -19,6 +19,11 @@ deterministic; stub_sidecar's own counter (`DIE_AFTER`, per process) is only
 used for the "it crashed on its own mid-session" phase. Every session here
 sends PKTS = 3 audio commands, and each stub instance is replaced before its
 counter can reach DIE_AFTER except in that phase.
+
+Not pinned here: the EOF/`_spawn` race (a reader thread finishing on the
+previous child while a respawn installs the next one). Its window is
+sub-millisecond in production and it is closed by `Sidecar.state_lock`;
+reproducing it needs a deliberately widened window, unlike everything above.
 """
 from __future__ import annotations
 
@@ -189,8 +194,8 @@ def main() -> int:
         first = kill_current()
         check("death is noticed and logged",
               wait_log(proxy_log, "sidecar died (pid=%d" % first, 15.0), "pid=%d" % first)
-        now = wait_respawn(first)
-        check("watchdog spawned a fresh recognizer", now > 0 and now != first,
+        now = wait_respawn(first)     # != first by construction; can be -1 (timeout)
+        check("watchdog spawned a fresh recognizer", now > 0,
               "old=%d new=%d" % (first, now))
 
         # 3. the same proxy transcribes again, unattended
@@ -202,7 +207,9 @@ def main() -> int:
         mark = len(read(proxy_log))
         text3, close3 = session()
         tail = read(proxy_log)[mark:]
-        check("crash mid-dictation yields no text", text3 == "", repr(text3))
+        check("crash mid-dictation commits nothing",
+              text3 == "" and " final " not in tail,
+              "%r %r" % (text3, [ln for ln in tail.splitlines() if "final" in ln]))
         check("and is reported, never silently committed",
               close3 is not None or "session error" in tail,
               "close=%s tail=%r" % (close3, tail.strip().splitlines()[-2:]))
@@ -226,22 +233,25 @@ def main() -> int:
         swapped: "list[bool]" = []
 
         def swap() -> None:
+            # Wait out the proxy's post-audio drain window (0.8 s) before killing.
+            # Inside it, the queued death message fires first and the session_pid
+            # guard is never reached -- which is exactly how a first version of
+            # this phase passed with the guard deleted.
+            time.sleep(1.0)
             pid = kill_current()
             swapped.append(wait_respawn(pid) > 0)
 
         text5, close5 = session(packets=1, between=swap)
         tail = read(proxy_log)[mark:]
         check("recognizer swapped before the kill", swapped == [True], repr(swapped))
-        check("swap mid-dictation yields no text", text5 == "", repr(text5))
-        # Two mechanisms can notice (the queued death, or the pid guard when a
-        # respawn's queue drain swallowed it); either is fine, quiet is not.
-        check("swap mid-dictation fails loudly",
-              close5 is not None or any(m in tail for m in (
-                  "replaced mid-session", "replaced during finish",
-                  "exited (code=", "sidecar gone (write failed")),
+        # Both conjuncts can fail: text is what the client would have typed, and
+        # the log line is how a silent commit would show up.
+        check("swap mid-dictation commits nothing",
+              text5 == "" and " final " not in tail,
+              "%r %r" % (text5, [ln for ln in tail.splitlines() if "final" in ln]))
+        check("swap mid-dictation is caught by the session_pid guard",
+              "replaced mid-session" in tail or "replaced during finish" in tail,
               "close=%s %r" % (close5, [ln for ln in tail.splitlines() if "session error" in ln][-1:]))
-        check("never a silent empty commit", "final ''" not in tail,
-              [ln for ln in tail.splitlines() if "final" in ln][-1:])
         check("no cryptic OSError(22) anywhere", "OSError(22" not in read(proxy_log))
 
         # 7. and the next dictation works against the replacement
