@@ -7,6 +7,25 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- sidecar 收尾丢尾巴:`pump()` 每轮最多解 4 帧的限量以前也套在 `finish` 和 VAD
+  endpoint 上,解码一旦落后(长句、机器忙),定稿时 `get_result()` 拿到的就是
+  没喂完的音频,最后一个词消失。收尾改为一次解完(`drain_all`),并在 `final`
+  里报告 `tail_chunks`(定稿时补解了多少帧)。回归测试:`tools/test_tail_drain.py`。
+
+### Added
+
+- `tools/sainput_doubao_proxy.py`:日志带时间戳,每段会话写一行汇总
+  (`audio_ms / pkts / tail_bytes / tail_chunks / first_audio / speech_span / pad / finish / listen / dump_ms`),
+  新增 `--dump-dir` 存下每段原始音频 + 最终文本(文件名带 `live/dump/t` 元信息,
+  60 秒上限截断或现场无文本时离线比对会标 SKIP / NOTE,不会误判成丢尾巴)。
+- `tools/probe_tail.py`、`tools/probe_tail_oracle.py`:按真实协议重放音频 / 离线比对
+  某段会话的「现场文本 vs 整段重放文本」,用来判定尾巴是丢在识别链路还是丢在音频里。
+- `tools/asr_sidecar.py`:`SAINPUT_PUMP_DEBUG=1` 时发 `dbg` 事件(每轮解了几帧、
+  还剩没解完的帧),给探针判断积压用;不设这个变量时不发 `dbg`,除每轮一次
+  环境变量查询外没有额外开销,解码结果与耗时不受影响。
+
 ## [0.2.3] - 2026-10-20
 
 ### Added

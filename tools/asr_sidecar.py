@@ -9,8 +9,10 @@
        {"cmd":"quit"}
   out: {"type":"ready","model":...,"decoding":...,"punct":bool,"itn":bool,"hotwords":int}
        {"type":"partial","text":渲染结果,"raw":ASR原文,"ms":渲染耗时}
-       {"type":"final","text":渲染结果,"raw":ASR原文,"reason":"endpoint"|"finish"}
+       {"type":"final","text":渲染结果,"raw":ASR原文,"reason":"endpoint"|"finish","tail_chunks":int}
+                                     tail_chunks = 定稿时补解了多少帧(收尾不再限 4 帧/轮)
        {"type":"rendered","text":...}
+       {"type":"dbg","n":int,"still_ready":bool}   仅在 SAINPUT_PUMP_DEBUG=1 时发(探针用)
        {"type":"error","msg":...}
 
 为什么标点内联、不再拆一个进程：CT-Transformer int8 在 ~20 字上 p50 只有 5ms、
@@ -271,6 +273,8 @@ def main():
     # ⚠️ 必须在循环**之前**初始化：早先漏了这行，`silence_sec += dur` 抛 NameError，
     #    被外层 except 吞掉 —— 识别照常，但静音断句**从来没生效过**，而且没有任何日志。
     silence_sec = 0.0
+    # 上一次 pump 实际解了多少帧 —— finish 用它报告定稿时解码是否落后过。
+    pump_last_decodes = [0]
 
     def is_silent_frame(x):
         """按 RMS 判这一帧算不算安静。阈值与 Rust 侧 `tail_rms` 同量级。"""
@@ -279,23 +283,36 @@ def main():
         rms = float(np.sqrt(np.mean(np.square(x))))
         return rms < 0.012
 
-    def pump(force=False):
-        """吃音频 -> 出 partial。force=True 时忽略节流（final 用）。"""
+    def pump(force=False, drain_all=False):
+        """吃音频 -> 出 partial。force=True 时忽略节流(final 用)。
+
+        drain_all=True 时**不限每轮解码帧数**:只在定稿(finish)用。
+        """
         nonlocal last_raw, last_out, last_tick, stream
         stream = ensure_stream()      # 本句第一帧到这里才建流 —— 此时偏置文件已是最新
-        # 一次 pump 最多解这么多帧，剩下的留给下一轮。
+        # 一次 pump 最多解这么多帧,剩下的留给下一轮 —— **只限流式显示的轮次**。
         #
-        # 为什么必须限：单帧解码平均只要 8~10ms，但实测约 20% 的帧会突刺到
-        # 40~95ms（sherpa 内部的内存分配/beam 搜索抖动，不是文本变长导致的 ——
-        # 0~9 字和 30~39 字的平均耗时都是 10ms）。
-        # 不限的话，一帧突刺 → 音频积压 → 下一轮 while 连解好几帧 →
-        # 又一次突刺…… 雪球越滚越大，用户看到的就是卡住然后一次全出来。
-        # 限量后积压被摊平到多轮，画面是持续小步更新，不会长时间静默。
+        # 为什么必须限:单帧解码平均只要 8~10ms,但实测约 20% 的帧会突刺到
+        # 40~95ms(sherpa 内部的内存分配/beam 搜索抖动,不是文本变长导致的 ——
+        # 0~9 字和 30~39 字的平均耗时都是 10ms)。
+        # 不限的话,一帧突刺 → 音频积压 → 下一轮 while 连解好几帧 →
+        # 又一次突刺...... 雪球越滚越大,用户看到的就是卡住然后一次全出来。
+        # 限量后积压被摊平到多轮,画面是持续小步更新,不会长时间静默。
+        #
+        # ⚠️ 但**收尾(finish)不能限量**:解码一旦落后(长句、机器忙、模型慢),
+        # 限量就等于把还没解的尾巴留在流里,`get_result` 吐出的就是缺尾巴的句子。
+        # 所以定稿走 drain_all=True,一次把剩下的全解完 —— 这时本来就没人看画面了。
         _MAX_DECODE_PER_PUMP = 4
+        _limit = (1 << 30) if drain_all else _MAX_DECODE_PER_PUMP
         _n = 0
-        while _n < _MAX_DECODE_PER_PUMP and rec.is_ready(stream):
+        while _n < _limit and rec.is_ready(stream):
             rec.decode_stream(stream)
             _n += 1
+        pump_last_decodes[0] = _n
+        if os.environ.get("SAINPUT_PUMP_DEBUG"):
+            # 只在调试时开(probe_tail.py 会带上这个环境变量):让探针能看见
+            # 「这一轮解了几帧 / 解完还剩没解完的帧」,用来判断积压。
+            emit({"type": "dbg", "n": _n, "still_ready": bool(rec.is_ready(stream))})
         raw = rec.get_result(stream)
         if raw == last_raw and not force:
             return raw
@@ -363,9 +380,9 @@ def main():
                         # 用户的实际抱怨是「说着说着要想很久」，所以纯计时断句对他不合适。
                         # 现在 rule1/rule2 默认拉到 10 秒（--rule1/--rule2 可调），
                         # 让 VAD 退化成**兜底**（防止忘了松手一直录），而不是主要断句手段。
-                        pump(force=True)
+                        pump(force=True, drain_all=True)
                         emit({"type": "final", "text": last_out, "raw": last_raw,
-                              "reason": "endpoint"})
+                              "reason": "endpoint", "tail_chunks": pump_last_decodes[0]})
                         rec.reset(stream)
                         last_raw = last_out = ""
                         silence_sec = 0.0
@@ -386,9 +403,11 @@ def main():
                 silence_sec = 0.0
                 stream = ensure_stream()
                 stream.input_finished()
-                pump(force=True)
+                # 定稿:把流里剩下的帧**全部**解完再取结果。见 pump 里那段注释 ——
+                # 流式的每轮 4 帧限量用在收尾上就是丢尾巴。
+                pump(force=True, drain_all=True)
                 emit({"type": "final", "text": last_out, "raw": last_raw,
-                      "reason": "finish"})
+                      "reason": "finish", "tail_chunks": pump_last_decodes[0]})
                 reset_stream()
             elif cmd == "render":
                 out, ms = render(msg.get("text") or "")

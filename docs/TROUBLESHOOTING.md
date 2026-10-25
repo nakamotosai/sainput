@@ -218,3 +218,58 @@ run.bat run                            :: 全流程
 ```
 
 哪一步先失败，就查对应的章节。
+
+---
+
+## 10. 水杉输入法(Doubao 代理)这条路上的尾巴
+
+水杉输入法自带豆包流式客户端,配置里把 `asr_endpoint` 指到本机
+`wss://127.0.0.1:19000/api/v3/sauc/bigmodel_async`
+(`tools/sainput_doubao_proxy.py`),由它把音频喂给这个 sidecar。
+这条路上「松手后最后一个词没了」有两个来源,先分清是哪一个。
+
+**一、定稿时解码落后 → sidecar 丢尾巴(已修,2026-10-25)**
+
+`pump()` 每轮最多解 4 帧,那是为了流式画面不被解码突刺卡住;以前这个限量
+也套在 `finish` / VAD endpoint 上。只要解码落后过(长句、机器忙、别的 agent 抢 CPU),
+`get_result()` 拿到的就是**没喂完**的音频,最后一个词直接消失。现在收尾走
+`drain_all=True`(一次解完),`final` 消息里多一个 `tail_chunks`,表示定稿时
+额外补解了多少帧:
+
+- `tail_chunks = 0` → **定稿那一刻**没有积压(收尾不用补解);中途的突刺有没有顶到过
+  4 帧限量,现场日志看不出来,只能拿探针在同样的音频上重放(`probe_tail.py` 的
+  `pumps_at_cap`)。
+- `tail_chunks > 4` → 定稿时积压超过了修复前的 4 帧上限,修复前这种情况尾巴必丢。
+
+回归测试 `tools/test_tail_drain.py` 故意一次灌 1.9s 音频制造积压:修好后
+`tail_chunks=16` 且尾巴还在;把限量塞回去,输出就变成
+`就是频繁的啊,不认识记下来。FRE。`(尾巴没了)。
+
+**二、音频里就没有尾巴 → 不在 sidecar 这边**
+
+代理每段会话都写一行带时间戳的汇总,拿它和 `%TEMP%\sainput_x1_ralt.log`
+(侧键按下/抬起的绝对时间)对一下:
+
+```
+[doubao-proxy] 08:37:27.440 session audio_ms=3940 pkts=20 tail_bytes=4480 first_audio=+225ms speech_span=3760ms pad=152ms finish=7ms listen=4239ms
+```
+
+(上面是一次真实按住说话的记录,新版还会多 `tail_chunks` 与 `dump_ms` 两个字段:
+`tail_chunks=0 dump_ms=3940`)
+
+- `audio_ms` ≈ 按住时长 → 音频全送到了,尾巴只能丢在识别/上屏那一段。
+- `audio_ms` 明显小于按住时长 → 音频在输入法那边就少了(起录延迟记在
+  `first_audio`,抬键到设备真正停止的那几十毫秒算在末尾)。
+- `dump_ms < audio_ms` → 这段会话超过 60 秒,dump 只留了前 60 秒,别拿它当整段重放。
+
+要坐实第二种,用 `--dump-dir` 存下每段的原始音频 + 最终文本,再离线重放同一段音频:
+
+```bat
+pythonw tools\sainput_doubao_proxy.py --dump-dir "%TEMP%\sainput_sessions"
+python  tools\probe_tail_oracle.py --dir "%TEMP%\sainput_sessions"
+```
+
+`live` 与 `oracle` 一致 → 定稿路径没问题,问题在音频或模型本身;
+不一致 → 尾巴就是在这段路径里丢的。dump 文件名里带 `live<N>ms-dump<M>ms-t<K>`,
+`dump < live` 或 `t0`(现场没拿到文本)时脚本会直接标 SKIP / NOTE,不算尾巴丢失。
+`--dump-dir` 默认关(会把语音原文写到磁盘),排查完记得去掉。

@@ -7,7 +7,9 @@
 //! 协议字段（与 tools/asr_sidecar.py 对齐）：
 //!   ready    {model, decoding, punct, itn, hotwords}
 //!   partial  {text, raw, ms}      text 是 ITN+标点+润色之后的，raw 是识别器原文
-//!   final    {text, raw, reason}  reason = "endpoint"（VAD 自动断句）| "finish"
+//!   final    {text, raw, reason, tail_chunks}
+//!            reason = "endpoint"(VAD 自动断句)| "finish"
+//!            tail_chunks = 定稿时补解了多少帧(收尾不限 4 帧/轮),诊断用的是额外字段,客户端可忽略
 //!   rendered {text, ms}
 //!   reset    {ok}
 //!   padded   {ms}                 静音补偿完成（模型右上下文已喂饱）

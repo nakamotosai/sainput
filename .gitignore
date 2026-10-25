@@ -44,6 +44,11 @@
 **/__pycache__/
 *.pyc
 
+# ── 本机语音栈的私钥 / 证书 / 状态快照(绝不入库;证书由 tools/make_certs.py 现生成)──
+/tools/*.key
+/tools/*.pem
+/tools/voice_stack_status.txt
+
 # ── 音频与临时文件 ──
 *.wav
 *.pcm
