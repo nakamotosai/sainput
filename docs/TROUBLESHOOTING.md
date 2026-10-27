@@ -147,7 +147,39 @@ powershell -ExecutionPolicy Bypass -File scripts\fetch_models.ps1           # �
 **绝对不要**：
 
 - `Stop-Process -Force`、任务管理器「结束任务」、`taskkill /F` 杀 sainput。
-- 正确退出永远是：右键托盘 → 退出 sainput。
+- 正确退出永远是:右键托盘 → 退出 sainput。
+
+### 5.1 鼠标侧键卡住(2026-10-28 真实事故,本机持续约 20 分钟)
+
+**症状**:鼠标**能移动**,但**点哪都没反应** —— 点击其实送到了系统(能看到 `L=D` / `L=up` 事件、
+`GetLastInputInfo` 也在刷新),却没有任何窗口被激活;`GetAsyncKeyState(VK_XBUTTON1)` 恒为 DOWN。
+键盘完全不受影响。
+
+**机制(本机实测,不是推测)**:
+
+| 实验 | 结果 |
+|---|---|
+| 不装钩子:注入 `MOUSEEVENTF_XDOWN` → `MOUSEEVENTF_XUP` | 状态 DOWN → up,**可逆** |
+| 装一个「吃掉 X1」的低级鼠标钩子,注入同样两个事件 | 钩子记到吞掉 2 次,`GetAsyncKeyState` **始终 up** |
+
+结论:**被低级钩子 `return 1` 吃掉的事件根本不进系统的按键状态机**。由此两条推论:
+
+1. 闩锁只能来自「**没被吃掉的那一次 down**」——另一个进程注入 XDOWN 后没配对 XUP(当时的真凶是
+   水杉输入法的语音热键 + `tools/x1_to_ralt.ps1` 这条链),或者钩子安装的间隙;
+2. 一旦闩住,**之后所有 XUP(包括别人注入的)都会被钩子吃掉** → 状态自己永远解不开。
+   (推论 2 的「抬起方向」是由同一机制外推的,未单独实测。)
+
+**处理(按代价从小到大)**:
+
+1. 先杀掉「和 sainput 抢同一个侧键」的钩子拥有者(查 `MetasequoiaImeServer` / 变量:任何装了
+   WH_MOUSE_LL 又在处理 X1 的东西)。杀掉后 `GetAsyncKeyState(VK_XBUTTON1)` 常常自己回到 up。
+2. **物理按一下侧键再松开** —— 一次真实的 down/up 对能解开(本机验证有效)。前提同上:当时没有吞键钩子。
+3. `run.bat release-keys`(补发 X1/X2/中键 + 修饰键抬起)。
+   ⚠️ **sainput 正跑着的时候这条对热键本身无效**:命令是另一个进程,但它注入的 XUP 仍会经过
+   sainput 自己的全局鼠标钩子并被吃掉(见上面推论 2)。所以要么先退出 sainput,要么用托盘菜单里
+   在进程内的那条(实现上必须先卸钩子再注入)。
+
+**为什么这条要写进 sainput 自己的代码**:见 `HANDOFF.md` §7 已知限制 #3。
 
 ---
 
@@ -222,6 +254,15 @@ run.bat run                            :: 全流程
 ---
 
 ## 10. 水杉输入法(Doubao 代理)这条路上的尾巴
+
+> 🔚 **这条路 2026-10-28 已退役(保留本节作为历史记录)**。
+> 侧键语音现在直接跑在 sainput 原生路径上(`hotkey = mousex1` + 本仓 `tools/asr_sidecar.py`),
+> 水杉不再参与:它的 `[voice_input]` 已关(`voice_input = false`、`hotkey_ralt = false`),
+> `asr_endpoint` 也从本机代理还原为默认。
+> 退役的胶水件(`tools/x1_to_ralt.ps1`、`voice_stack_supervisor.ps1`、`check_voice_stack.ps1`、
+> 启动文件夹里的 `Sainput Voice Stack.lnk`)已搬进 `F:\archive\20261028-075641-sainput-x1-glue\`。
+> 退役原因:两套前端抢同一个侧键,且那条链的吞键钩子会让侧键闩在按下 → 整个鼠标点不动
+> (见 §5.1)。下面这些「尾巴」分析对 `asr_sidecar.py` 本身仍然成立。
 
 水杉输入法自带豆包流式客户端,配置里把 `asr_endpoint` 指到本机
 `wss://127.0.0.1:19000/api/v3/sauc/bigmodel_async`
