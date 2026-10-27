@@ -7,6 +7,15 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **语音前端归一(2026-10-28)**:侧键语音只跑 sainput 原生路径(`hotkey = mousex1` +
+  本仓 `tools/asr_sidecar.py`)。原先叠在上面的那层前端(水杉输入法的 TSF 行内预编辑 /
+  TSF 上屏 + `tools/sainput_doubao_proxy.py` 代理 + `tools/x1_to_ralt.ps1` 的 X1→右Alt 映射)
+  已退役:`sainput_doubao_proxy.py` 不再接线,水杉侧 `voice_input = false`、`hotkey_ralt = false`、
+  `asr_endpoint` 还原为默认。动因与机制见 `docs/TROUBLESHOOTING.md` §5.1(X1 闩锁事故)与 §10。
+  代价(已知):原生路径只会 `SendInput` 上屏,没有 TSF,管理员权限窗口仍打不进字(路线图 M3)。
+
 ### Fixed
 
 - sidecar 收尾丢尾巴:`pump()` 每轮最多解 4 帧的限量以前也套在 `finish` 和 VAD

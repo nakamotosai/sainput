@@ -317,6 +317,16 @@ python  tools\probe_tail_oracle.py --dir "%TEMP%\sainput_sessions"
 
 ## 11. 侧键、波形、提示音都正常,但一个字都不出
 
+> 🔚 **本节写于「水杉 + Doubao 代理」时代(2026-10-28 那条前端已退役)**。侧键语音现在直接跑
+> sainput 原生路径,判据换成应用自己的输出:
+> - 识别器子进程死了 → 控制台/日志一行
+>   `[sainput] worker 退出: sidecar 提前退出(检查模型路径与 Python 依赖)`
+>   (`crates/sainput-core/src/asr.rs` 用 stdout EOF 判活)。**原生路径只报错,不会自动换一个识别器**
+>   —— 代理时代那条自动重生逻辑随代理一起退役了,重启 sainput 即可。
+> - 逐帧细节看项目根的 `logs\sainput-*.log`,不再是 `%TEMP%\sainput_doubao_proxy.log`。
+>
+> 下面的「对号入座」保留作历史参考。
+
 先看代理日志最近的几行:
 
 ```bat
