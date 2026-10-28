@@ -235,8 +235,9 @@ sainput selftest inject "文字"                只测上屏路径
 | `--hotwords <FILE>` | 热词表（默认根目录 `hotwords.txt`） |
 | `--ctx-bias` / `--no-ctx-bias` | 上下文偏置开关（默认开） |
 | `--ctx-hotwords <FILE>` | 偏置临时热词文件（默认 `.ctx_hotwords.txt`） |
-| `--merge-terms` / `--no-merge-terms` | 英文拆字合并（默认开） |
-| `--fix-case` / `--no-fix-case` | 英文大小写修复（默认开） |
+| `--merge-terms` / `--no-merge-terms` | 英文拆字合并(默认开) |
+| `--fix-case` / `--no-fix-case` | 英文大小写修复(默认开) |
+| `--ime-wmchar auto\|on\|off` | 上屏方式(默认 `auto`):目标窗口挂着输入法时,注入的英文字母会被输入法收走,这时改走 `WM_CHAR`;`on` = 所有窗口都用 `WM_CHAR`,`off` = 老行为 |
 | `--leading-space` / `--no-leading-space` | 光标前有字时补空格（默认开） |
 | `--beam` / `--no-beam` | `modified_beam_search`（更准、稍慢；热词需要它） |
 | `--threads N` | 推理线程数（默认 2） |

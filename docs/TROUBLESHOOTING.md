@@ -231,6 +231,7 @@ powershell -ExecutionPolicy Bypass -File scripts\fetch_models.ps1           # �
 | 句子被切碎 | 日志里 `F` 行原因是 endpoint | 调大 `rule2`（默认 15 秒） |
 | 词总被听错 | `[raw]` 里就是错的 | 加进 `hotwords.txt`;见 [`../hotwords.example.txt`](../hotwords.example.txt) |
 | 说到英文时整句被跳过 / 删掉 | `P` 行的**渲染文本**比上一行短、`[raw]` 却是完整的 | 已有过:标点模型吃掉正文(2026-10-28 修,`tools/test_punct_guard.py`);控制台/日志里会有一行 `标点模型丢了正文`。还在发生就把那行 `[raw]` 贴进 issue |
+| 说英文时弹出输入法的候选面板、字进不去 | 目标窗口所在线程在用输入法(水杉 / 微软拼音 / MS-IME) | 输入法把注入的字母当成它自己的输入了(2026-10-28 加 `ime_wmchar` 兜底)。先试 `ime_wmchar = on`;不行的窗口是 TSF 上屏要解决的(M3)。临时办法:把那个窗口的输入法切到「直接输入 / 英文」 |
 | 长句重复打转 | `[raw]` 里就重复 | 模型固有行为，换档见 [`model-selection.md`](model-selection.md) |
 | 中英混说丢词 | — | 试 `-480ms` 档 |
 

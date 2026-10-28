@@ -118,9 +118,226 @@ pub fn backspace(n: usize) -> Result<()> {
     send(&v)
 }
 
+// ------------------------------------------------------------------ 上屏方式
+//
+// 为什么需要第二条路(2026-10-28 实测):目标窗口所在线程挂着中文/日文输入法时,
+// **注入的字母会被输入法当成它自己的输入** —— 落进它的组字串,弹出候选面板,
+// 程序一个字都收不到;中文汉字反倒不受影响(输入法不吃非字母)。
+// 于是「说英文它就被吃掉 / 全删掉」。这不是模型的问题:同一段音频,识别原文是完整的。
+//
+// 输入法的状态读不到也改不了:跨进程 `ImmGetContext(目标窗口)` 返回 NULL;
+// 用 `WM_INPUTLANGCHANGEREQUEST` 把窗口切到别的键盘布局、或者改 IMM32 的
+// open/conversion 状态,输入法照样把字母收走。所以对这类窗口改走
+// **PostMessage(WM_CHAR)**:消息不经过键盘那条链,输入法看不到,
+// 实测在经典文本控件上「无焦点也能完整落字 + 退格照常」。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeyMode {
+    /// SendInput + KEYEVENTF_UNICODE(默认路径,绝大多数窗口都对)
+    Keys,
+    /// PostMessage WM_CHAR(给「输入法会吃字母」的窗口兜底),带目标窗口句柄
+    WmChar(isize),
+}
+
+impl KeyMode {
+    pub fn is_wmchar(self) -> bool {
+        matches!(self, KeyMode::WmChar(_))
+    }
+}
+
+/// 日志用:当前方式打在哪个窗口上。
+pub fn describe_target(mode: KeyMode) -> String {
+    match mode {
+        KeyMode::Keys => "键盘注入".to_string(),
+        KeyMode::WmChar(h) => target::describe(h),
+    }
+}
+
+/// 该给这个窗口用哪种上屏方式。纯函数,好测。
+///
+/// `policy` 是配置里的 `ime_wmchar`:
+///   `off` / `keys`      —— 永远走键盘注入(老行为)
+///   `on`  / `wmchar`    —— 永远走 WM_CHAR(拿不到窗口句柄时退回键盘)
+///   其它(默认 auto)    —— 目标线程挂着输入法 **且** 焦点是经典文本控件时走 WM_CHAR。
+///                          只对「已实测字母会被吃掉、而 WM_CHAR 已验证能落字」的这一类
+///                          生效,免得在别的窗口上把本来好用的注入方式换掉。
+pub fn decide_key_mode(policy: &str, hwnd: isize, thread_has_ime: bool, classic_control: bool) -> KeyMode {
+    match policy {
+        "off" | "keys" | "input" => KeyMode::Keys,
+        "on" | "wmchar" => {
+            if hwnd != 0 {
+                KeyMode::WmChar(hwnd)
+            } else {
+                KeyMode::Keys
+            }
+        }
+        _ => {
+            if hwnd != 0 && thread_has_ime && classic_control {
+                KeyMode::WmChar(hwnd)
+            } else {
+                KeyMode::Keys
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+mod target {
+    use super::KeyMode;
+
+    #[repr(C)]
+    struct GuiThreadInfo {
+        cb_size: u32,
+        flags: u32,
+        hwnd_active: isize,
+        hwnd_focus: isize,
+        hwnd_capture: isize,
+        hwnd_menu_owner: isize,
+        hwnd_move_size: isize,
+        hwnd_caret: isize,
+        rc_caret: [i32; 4],
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetForegroundWindow() -> isize;
+        fn GetGUIThreadInfo(id_thread: u32, pgui: *mut GuiThreadInfo) -> i32;
+        fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+        fn GetClassNameW(hwnd: isize, buf: *mut u16, max: i32) -> i32;
+    }
+
+    #[link(name = "imm32")]
+    extern "system" {
+        fn ImmIsIME(hkl: isize) -> i32;
+    }
+
+    /// 「经典文本控件」= Edit / RichEdit 这一族。
+    ///
+    /// 判据是类名里带 `Edit`(大小写不敏感):这一类窗口把自己收到的按键交给输入法
+    /// 处理(IMM32 那条链),注入的字母才会被吃掉;而 WM_CHAR 正好绕开它。
+    fn is_classic_text_control(hwnd: isize) -> bool {
+        if hwnd == 0 {
+            return false;
+        }
+        let mut buf = [0u16; 128];
+        let n = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        if n <= 0 {
+            return false;
+        }
+        let name = String::from_utf16_lossy(&buf[..n as usize]).to_ascii_lowercase();
+        name.contains("edit")
+    }
+
+    /// 目标窗口所在线程挂的是不是输入法(IME)。
+    fn thread_uses_ime(hwnd: isize) -> bool {
+        if hwnd == 0 {
+            return false;
+        }
+        let tid = unsafe { GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) };
+        if tid == 0 {
+            return false;
+        }
+        let hkl = unsafe { GetKeyboardLayout(tid as u32) };
+        hkl != 0 && unsafe { ImmIsIME(hkl) } != 0
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetKeyboardLayout(id_thread: u32) -> isize;
+    }
+
+    /// 焦点控件(拿不到就退回前台窗口)。
+    pub fn focused_hwnd() -> isize {
+        let mut info: GuiThreadInfo = unsafe { std::mem::zeroed() };
+        info.cb_size = std::mem::size_of::<GuiThreadInfo>() as u32;
+        if unsafe { GetGUIThreadInfo(0, &mut info) } != 0 && info.hwnd_focus != 0 {
+            return info.hwnd_focus;
+        }
+        if info.hwnd_active != 0 {
+            return info.hwnd_active;
+        }
+        unsafe { GetForegroundWindow() }
+    }
+
+    pub fn key_mode(policy: &str) -> KeyMode {
+        let hwnd = focused_hwnd();
+        super::decide_key_mode(policy, hwnd, thread_uses_ime(hwnd), is_classic_text_control(hwnd))
+    }
+
+    /// 只给日志用:一眼看出为什么走了 WM_CHAR。
+    pub fn describe(hwnd: isize) -> String {
+        if hwnd == 0 {
+            return "无焦点窗口".into();
+        }
+        let mut buf = [0u16; 128];
+        let n = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        let cls = if n > 0 { String::from_utf16_lossy(&buf[..n as usize]) } else { "?".into() };
+        format!("{cls} 上有输入法,注入的字母会被它吃掉")
+    }
+}
+
+#[cfg(not(windows))]
+mod target {
+    use super::KeyMode;
+    pub fn focused_hwnd() -> isize {
+        0
+    }
+    pub fn key_mode(_policy: &str) -> KeyMode {
+        KeyMode::Keys
+    }
+    pub fn describe(_hwnd: isize) -> String {
+        String::new()
+    }
+}
+
+pub use target::key_mode as target_key_mode;
+
+/// 按当前方式打一段文本。
+fn type_text_with(mode: KeyMode, s: &str) -> Result<()> {
+    match mode {
+        KeyMode::Keys => type_text(s),
+        KeyMode::WmChar(h) => post_chars(h, s),
+    }
+}
+
+/// 按当前方式退格 n 次。
+fn backspace_with(mode: KeyMode, n: usize) -> Result<()> {
+    match mode {
+        KeyMode::Keys => backspace(n),
+        // WM_CHAR(0x08) 就是经典控件的退格;实测有效(见 tools/ 里的无焦点探针)
+        KeyMode::WmChar(h) => post_chars(h, &"\u{8}".repeat(n)),
+    }
+}
+
+#[cfg(windows)]
+fn post_chars(hwnd: isize, s: &str) -> Result<()> {
+    const WM_CHAR: u32 = 0x0102;
+    if hwnd == 0 {
+        return Ok(());
+    }
+    for unit in s.encode_utf16() {
+        let ok = unsafe { PostMessageW(hwnd, WM_CHAR, unit as usize, 0) };
+        if ok == 0 {
+            anyhow::bail!("PostMessage(WM_CHAR) 失败:窗口句柄 {hwnd:#x}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn post_chars(_hwnd: isize, _s: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+#[link(name = "user32")]
+extern "system" {
+    fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+}
+
 fn common_prefix_chars(a: &str, b: &str) -> usize {
     a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -157,6 +374,29 @@ mod tests {
         let b = w.want("你好啊");
         assert_eq!(common_prefix_chars(&a, &b), 3);
         assert_eq!(a.chars().count() - common_prefix_chars(&a, &b), 0); // 不用退格
+    }
+
+    /// 上屏方式的选择逻辑(纯函数,不需要真窗口)。
+    ///
+    /// 这里钉的是**只在该换的时候换**:`auto` 只在「目标线程挂着输入法 + 焦点是
+    /// 经典文本控件」时用 WM_CHAR —— 别的窗口照着老路走,不拿没验证过的路去换掉
+    /// 本来就没问题的注入方式。
+    #[test]
+    fn key_mode_policy() {
+        // off:永远是键盘注入
+        assert_eq!(decide_key_mode("off", 0x1234, true, true), KeyMode::Keys);
+        // on:强制 WM_CHAR
+        assert_eq!(decide_key_mode("on", 0x1234, false, false), KeyMode::WmChar(0x1234));
+        // on 但拿不到窗口句柄 → 退回键盘(有句柄才谈得上投递消息)
+        assert_eq!(decide_key_mode("on", 0, true, true), KeyMode::Keys);
+        // auto:输入法 + 经典文本控件才换
+        assert_eq!(decide_key_mode("auto", 0x1234, true, true), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("auto", 0x1234, true, false), KeyMode::Keys);
+        assert_eq!(decide_key_mode("auto", 0x1234, false, true), KeyMode::Keys);
+        assert_eq!(decide_key_mode("auto", 0, true, true), KeyMode::Keys);
+        // 没写这个键(或写错)按 auto 走
+        assert_eq!(decide_key_mode("", 0x1234, true, true), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("whatever", 0x1234, true, true), KeyMode::WmChar(0x1234));
     }
 
     /// 安全阀放弃修正时,**记账必须留在屏幕上那一版**。
@@ -203,6 +443,9 @@ pub struct StreamWriter {
     /// 下一帧算前缀就会错位，退格数算错 → 删到用户自己的字。
     /// 所以空格作为 `prefix` 进入同一条算术：`injected` 始终等于 prefix + 逻辑文本。
     prefix: String,
+    /// 这一句用哪种方式上屏(每句开始时按目标窗口决定,见 `decide_key_mode`)。
+    /// 默认是键盘注入;只有「输入法会吃字母」的窗口才切成 WM_CHAR。
+    mode: KeyMode,
     pub typed_chars: usize,
     pub backspaces: usize,
 }
@@ -214,14 +457,24 @@ impl StreamWriter {
             max_backspace,
             enabled,
             prefix: String::new(),
+            mode: KeyMode::Keys,
             typed_chars: 0,
             backspaces: 0,
         }
     }
 
-    /// 设定这一句的前缀（`" "` 或 `""`）。**每句开始时**由调用方按光标上下文决定一次。
+    /// 设定这一句的前缀(`" "` 或 `""`)。**每句开始时**由调用方按光标上下文决定一次。
     pub fn set_prefix(&mut self, p: &str) {
         self.prefix = p.to_string();
+    }
+
+    /// 设定这一句的上屏方式。**每句开始时**决定一次:目标窗口可能已经换了。
+    pub fn set_mode(&mut self, m: KeyMode) {
+        self.mode = m;
+    }
+
+    pub fn mode(&self) -> KeyMode {
+        self.mode
     }
 
     pub fn reset(&mut self) {
@@ -264,12 +517,12 @@ impl StreamWriter {
             return Ok(()); // 改动太大，等 final
         }
         if bs > 0 {
-            backspace(bs)?;
+            backspace_with(self.mode, bs)?;
             self.backspaces += bs;
         }
         let tail: String = want.chars().skip(common).collect();
         if !tail.is_empty() {
-            type_text(&tail)?;
+            type_text_with(self.mode, &tail)?;
             self.typed_chars += tail.chars().count();
         }
         self.injected = want;
@@ -302,12 +555,12 @@ impl StreamWriter {
             return Ok(());
         }
         if bs > 0 {
-            backspace(bs)?;
+            backspace_with(self.mode, bs)?;
             self.backspaces += bs;
         }
         let tail: String = want.chars().skip(common).collect();
         if !tail.is_empty() {
-            type_text(&tail)?;
+            type_text_with(self.mode, &tail)?;
             self.typed_chars += tail.chars().count();
         }
         self.injected = want;

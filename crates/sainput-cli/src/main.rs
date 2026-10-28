@@ -66,8 +66,10 @@ fn usage() {
          --no-tray              关掉系统托盘图标\n  \
          --show-console         不自动收起控制台窗口\n  \
          --lazy-mic             按需开麦（默认常驻预热，避免吞掉开头）\n  \
-         --max-backspace <N>    流式修正安全阀（默认 8）\n  \
-         --tail-ms <N>          松键后最少再收多久的尾巴音频，默认 200ms\n  \
+         --max-backspace <N>    流式修正安全阀(默认 8)\n  \
+         --ime-wmchar <MODE>    上屏方式:auto(默认)/ on / off。目标窗口挂着输入法时,\n  \
+                                注入的英文字母会被它收走,这时改走 WM_CHAR\n  \
+         --tail-ms <N>          松键后最少再收多久的尾巴音频,默认 200ms\n  \
          --tail-max-ms <N>      尾巴硬上限，默认 1200ms\n  \
          --tail-quiet-ms <N>    尾巴里连续安静这么久就收工，默认 250ms\n  \
          --tail-pad-ms <N>      收工时一次性补灌多少毫秒底噪（模型的右上下文），默认 480ms\n  \
@@ -79,7 +81,8 @@ fn usage() {
          仓库根下的 {CONF_NAME} 可写日常偏好（key = value），命令行参数优先级更高。\n  \
          可用键：hotkey / model_dir / punct_dir / hotwords / punct / itn / beam / toggle / tray /\n  hide_console / \
          overlay_mode / stream / lazy_mic / max_backspace / throttle_ms / threads / device /\n         \
-         tail_ms / tail_max_ms / tail_quiet_ms / tail_pad_ms / tail_rms",
+         tail_ms / tail_max_ms / tail_quiet_ms / tail_pad_ms / tail_rms /\n         \
+         punct_mode / merge_terms / fix_case / ctx_bias / ime_wmchar",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -268,8 +271,12 @@ struct Cfg {
     hotwords_extra: Option<PathBuf>,
     /// 上下文偏置总开关（`ctx_bias`）。
     ctx_bias: bool,
-    /// 英文大小写修复（`fix_case`）。
+    /// 英文大小写修复(`fix_case`)。
     fix_case: bool,
+    /// 上屏方式策略(`ime_wmchar`):auto(默认)| on | off。
+    /// 目标窗口挂着输入法时,注入的字母会被输入法吃掉(中文不受影响),这时改用
+    /// PostMessage(WM_CHAR) 绕开键盘那条链。见 `sainput_core::inject::decide_key_mode`。
+    ime_wmchar: String,
 }
 
 impl Cfg {
@@ -442,6 +449,10 @@ fn cfg(a: &Args) -> Result<Cfg> {
             .to_ascii_lowercase(),
         merge_terms: a.b("merge_terms", "--merge-terms", "--no-merge-terms", true),
         fix_case: a.b("fix_case", "--fix-case", "--no-fix-case", true),
+        ime_wmchar: a
+            .s("ime_wmchar", "--ime-wmchar")
+            .unwrap_or_else(|| "auto".to_string())
+            .to_ascii_lowercase(),
         ctx_bias,
         // 上下文偏置的临时热词文件：默认放仓库根下 .ctx_hotwords.txt，由 run 主循环写。
         // 关掉偏置时给 None —— 这样 sidecar 连 per-stream 热词都不会去碰。
@@ -928,6 +939,14 @@ fn cmd_config(a: &Args, root: &Path) -> Result<()> {
         }
     );
     println!("英文合并  : {}", if c.merge_terms { "开" } else { "关" });
+    println!(
+        "上屏方式  : {} (输入法吃字母时改走 WM_CHAR)",
+        match c.ime_wmchar.as_str() {
+            "on" | "wmchar" => "WM_CHAR(强制)",
+            "off" | "keys" | "input" => "键盘注入(强制)",
+            _ => "auto",
+        }
+    );
     println!("上下文偏置: {}", if c.ctx_bias { "开" } else { "关" });
     println!("渲染节拍  : {}ms", c.throttle_ms);
     {
@@ -1067,8 +1086,10 @@ struct RunOpts {
     ctx_hotwords: Option<PathBuf>,
     /// 偏置生效时打一行提示（默认安静）。
     verbose_ctx: bool,
-    /// feed 测试：每句从 wav 头重放（测两句以上的场景必需）。
+    /// feed 测试:每句从 wav 头重放(测两句以上的场景必需)。
     feed_restart: bool,
+    /// 上屏方式策略(`ime_wmchar`):每句开始时按目标窗口重新决定。
+    ime_wmchar: String,
 }
 
 /// 松键之后还要继续喂多久的「尾巴」音频。
@@ -1419,6 +1440,19 @@ fn worker(
                     } else {
                         wr.set_prefix("");
                     }
+                    // 上屏方式:①目标窗口挂着输入法时,注入的字母会被输入法当成它自己的
+                    // 输入(掉进组字串、弹出候选面板,程序一个字都收不到),中文却不受影响
+                    // —— 这就是「说英文它就被吃掉」。②输入法状态读不到也改不了(跨进程
+                    // ImmGetContext 返回 NULL),所以对这类窗口改用 PostMessage(WM_CHAR)。
+                    // 每句开始时重判一次:用户可能已经换了窗口。
+                    let mode = inject::target_key_mode(&o.ime_wmchar);
+                    if mode.is_wmchar() && !wr.mode().is_wmchar() {
+                        println!(
+                            "[sainput] 上屏改用 WM_CHAR:{} —— 这类窗口里注入的字母会被输入法吃掉",
+                            inject::describe_target(mode)
+                        );
+                    }
+                    wr.set_mode(mode);
                     // 上下文偏置：把「刚打出去的历史」抽成热词写盘，sidecar 在开新流时读。
                     // 必须在 reset 之前做（reset 之后 sidecar 才会重读文件）。
                     // 每句都问一次实时开关 —— 托盘里改了要立刻生效，不能要求重开。
@@ -1914,6 +1948,7 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
             None
         },
         verbose_ctx: a.b("verbose_ctx", "--verbose-ctx", "--quiet-ctx", false),
+        ime_wmchar: c.ime_wmchar.clone(),
         feed_restart: a.b("feed_restart", "--feed-restart", "--no-feed-restart", false),
     };
     // 托盘开关要送到 worker 手里的 sidecar（side 被 worker 独占，主线程够不着）。
