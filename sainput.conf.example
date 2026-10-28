@@ -79,15 +79,17 @@ hotkey = rightctrl
 # 改走 PostMessage(WM_CHAR):消息不经过键盘那条链,输入法看不到。
 #
 #   auto = 只对「输入法 + 经典文本控件(Edit/RichEdit)」自动换;别的窗口不动
-#   on   = 所有窗口都把 ASCII 走 WM_CHAR
+#   on   = 所有窗口都走消息通道(照常流式)
 #   off  = 老行为(全部走键盘注入)
+#   nostream = 走消息通道但**整句一次投递**(不流式,松手才出字)
 #   还可以挂名单,只对该程序生效(试新路子时最安全,不牵动别的窗口):
-#     ime_wmchar = on:pebrel.exe      # 只在 pebrel 里把 ASCII 走 WM_CHAR
-#     ime_wmchar = off:notepad.exe    # notepad 永远走键盘,别的仍按 auto
+#     ime_wmchar = on:pebrel.exe          # 只在 pebrel 里走消息通道(流式)
+#     ime_wmchar = nostream:pebrel.exe    # pebrel 里整句一次投递(乱序时的退路)
+#     ime_wmchar = off:notepad.exe        # notepad 永远走键盘,别的仍按 auto
 #
-# 注意:走 WM_CHAR 的窗口**不做流式** —— 整句在松手定稿时一次打进去,没有逐字效果。
-# 因为消息通道和键盘通道的先后顺序没有保证(混着发会把字母插到汉字中间),而且
-# 消息里的退格各家程序语义不一(自绘终端会忽略它,导致同一句反复叠加)。
+# 消息通道的细节:**整段只走一条路** —— 字符用 PostMessage(WM_CHAR),退格用
+# PostMessage(WM_KEYDOWN/UP, VK_BACK)。两条都是同一个消息队列,先后顺序有保证;
+# 混着键盘注入发会把字母插到汉字中间(真机踩过),所以绝不混。
 # ime_wmchar = auto
 
 # ---- 上下文偏置 ----

@@ -945,9 +945,10 @@ fn cmd_config(a: &Args, root: &Path) -> Result<()> {
         None => (c.ime_wmchar.trim(), ""),
     };
     let label = match label {
-        "on" | "wmchar" => "WM_CHAR(强制)",
+        "on" | "wmchar" => "消息通道(流式)",
+        "nostream" | "final" => "消息通道(整句一次,不流式)",
         "off" | "keys" | "input" => "键盘注入(强制)",
-        _ => "auto(输入法吃字母的窗口改走 WM_CHAR)",
+        _ => "auto(输入法吃字母的窗口改走消息通道)",
     };
     if list.is_empty() {
         println!("上屏方式  : {label}");

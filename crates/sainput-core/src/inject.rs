@@ -134,13 +134,28 @@ pub fn backspace(n: usize) -> Result<()> {
 pub enum KeyMode {
     /// SendInput + KEYEVENTF_UNICODE(默认路径,绝大多数窗口都对)
     Keys,
-    /// PostMessage WM_CHAR(给「输入法会吃字母」的窗口兜底),带目标窗口句柄
+    /// 走窗口消息、**照常流式**:字符用 PostMessage(WM_CHAR),退格用
+    /// PostMessage(WM_KEYDOWN/UP, VK_BACK)。同一个消息队列,先后顺序天然一致。
     WmChar(isize),
+    /// 走窗口消息、**整句一次投递**(不流式):给「连消息里的退格都不认」的程序兜底。
+    /// 代价是松手才出字,但没有退格就不存在「记账 vs 屏幕」的偏差。
+    WmCharFinal(isize),
 }
 
 impl KeyMode {
+    /// 走窗口消息(不管流不流式)
     pub fn is_wmchar(self) -> bool {
-        matches!(self, KeyMode::WmChar(_))
+        matches!(self, KeyMode::WmChar(_) | KeyMode::WmCharFinal(_))
+    }
+    /// 只允许定稿时整句投递
+    pub fn is_final_only(self) -> bool {
+        matches!(self, KeyMode::WmCharFinal(_))
+    }
+    fn hwnd(self) -> isize {
+        match self {
+            KeyMode::Keys => 0,
+            KeyMode::WmChar(h) | KeyMode::WmCharFinal(h) => h,
+        }
     }
 }
 
@@ -148,7 +163,8 @@ impl KeyMode {
 pub fn describe_target(mode: KeyMode) -> String {
     match mode {
         KeyMode::Keys => "键盘注入".to_string(),
-        KeyMode::WmChar(h) => target::describe(h),
+        KeyMode::WmChar(h) => format!("消息通道(流式){}", target::describe(h)),
+        KeyMode::WmCharFinal(h) => format!("消息通道(整句一次){}", target::describe(h)),
     }
 }
 
@@ -157,8 +173,9 @@ pub fn describe_target(mode: KeyMode) -> String {
 /// `policy` 是配置里的 `ime_wmchar`,四种写法:
 ///   `off` / `keys`            —— 永远走键盘注入(老行为)
 ///   `on`  / `wmchar`          —— 永远走 WM_CHAR(拿不到窗口句柄时退回键盘)
-///   `on:pebrel.exe,zed.exe`   —— **只对这几个程序**走 WM_CHAR,别的窗口照旧
+///   `on:pebrel.exe,zed.exe`   —— **只对这几个程序**走消息通道(流式),别的窗口照旧
 ///   `off:some.exe`            —— 这几个程序永远走键盘注入,别的按 auto
+///   `nostream[:<exe>,...]`    —— 走消息通道但**整句一次投递**(连消息退格都不认的程序用)
 ///   `auto`(默认,等于没写)   —— 目标线程挂着输入法 **且** 焦点是经典文本控件时走
 ///                              WM_CHAR。只对「已实测字母会被吃掉、而 WM_CHAR 已验证
 ///                              能落字」的这一类生效,免得在别的窗口上把本来好用的
@@ -190,7 +207,15 @@ pub fn decide_key_mode(
             KeyMode::Keys
         }
     };
+    let wmchar_final = |yes: bool| {
+        if yes && hwnd != 0 {
+            KeyMode::WmCharFinal(hwnd)
+        } else {
+            KeyMode::Keys
+        }
+    };
     match head {
+        "nostream" | "final" => wmchar_final(!only_listed || listed(list)),
         "off" | "keys" | "input" => {
             // `off:foo.exe`:名单里的程序永远走键盘;名单外的按 auto,免得把兜底关掉
             if only_listed && !listed(list) {
@@ -369,17 +394,50 @@ pub use target::key_mode as target_key_mode;
 fn type_text_with(mode: KeyMode, s: &str) -> Result<()> {
     match mode {
         KeyMode::Keys => type_text(s),
-        KeyMode::WmChar(h) => post_chars(h, s),
+        // 消息通道:整段都走消息(两条通道抢顺序会把字母插到汉字中间,所以不混)
+        KeyMode::WmChar(h) | KeyMode::WmCharFinal(h) => post_chars(h, s),
     }
 }
 
 /// 按当前方式退格 n 次。
+///
+/// 消息通道下退格用 **PostMessage(WM_KEYDOWN/UP, VK_BACK)**,不是 WM_CHAR(0x08):
+/// 退格在 GUI 程序里走的是按键那条路(终端收到按键才给 pty 发 DEL),
+/// `WM_CHAR(0x08)` 只有经典控件会当删除用。两种消息进的是同一个队列,
+/// 所以「退格 + 补打」的先后顺序仍然有保证。
 fn backspace_with(mode: KeyMode, n: usize) -> Result<()> {
     match mode {
         KeyMode::Keys => backspace(n),
-        // WM_CHAR(0x08) 就是经典控件的退格;实测有效(见 tools/ 里的无焦点探针)
-        KeyMode::WmChar(h) => post_chars(h, &"\u{8}".repeat(n)),
+        KeyMode::WmChar(h) | KeyMode::WmCharFinal(h) => post_backspace(h, n),
     }
+}
+
+#[cfg(windows)]
+fn post_backspace(hwnd: isize, n: usize) -> Result<()> {
+    const WM_KEYDOWN: u32 = 0x0100;
+    const WM_KEYUP: u32 = 0x0101;
+    const VK_BACK: usize = 0x08;
+    if hwnd == 0 {
+        return Ok(());
+    }
+    // lParam:重复次数 | 扫描码(0x0E=Backspace)<<16 | 抬起标志
+    let scan: isize = 0x0E;
+    let down = 1 | (scan << 16);
+    let up = 1 | (scan << 16) | (1 << 30) | (1 << 31);
+    for _ in 0..n {
+        if unsafe { PostMessageW(hwnd, WM_KEYDOWN, VK_BACK, down) } == 0 {
+            anyhow::bail!("PostMessage(WM_KEYDOWN VK_BACK) 失败:窗口句柄 {hwnd:#x}");
+        }
+        if unsafe { PostMessageW(hwnd, WM_KEYUP, VK_BACK, up) } == 0 {
+            anyhow::bail!("PostMessage(WM_KEYUP VK_BACK) 失败:窗口句柄 {hwnd:#x}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn post_backspace(_hwnd: isize, _n: usize) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -484,25 +542,46 @@ mod tests {
         // auto 带名单:只有名单里的程序吃 auto 规则
         assert_eq!(decide_key_mode("auto:pebrel.exe", 0x1234, true, true, OTHER), KeyMode::Keys);
         assert_eq!(decide_key_mode("auto:pebrel.exe", 0x1234, true, true, E), KeyMode::WmChar(0x1234));
+        // nostream:只对名单生效,走「整句一次投递」
+        assert_eq!(decide_key_mode("nostream:pebrel.exe", 0x1234, false, false, E), KeyMode::WmCharFinal(0x1234));
+        assert_eq!(decide_key_mode("nostream:pebrel.exe", 0x1234, false, false, OTHER), KeyMode::Keys);
+        assert_eq!(decide_key_mode("nostream", 0x1234, false, false, E), KeyMode::WmCharFinal(0x1234));
     }
 
-    /// WM_CHAR 模式:不打流式,定稿时整句一次投递(所以永远不需要退格)。
-    /// 用 `WmChar(0)` 做这个测试:句柄 0 时 post_chars 直接返回,不会真的发消息。
+    /// 消息通道默认**照常流式**(退格走 PostMessage(WM_KEYDOWN/UP, VK_BACK))。
+    /// 用 `WmChar(0)` 做这个测试:句柄 0 时消息函数直接返回,不会真的发消息。
     #[test]
-    fn wmchar_mode_types_only_the_whole_final() {
+    fn wmchar_mode_streams_on_the_message_channel() {
         let mut w = StreamWriter::new(8, true);
         w.set_mode(KeyMode::WmChar(0));
+        w.update("我说到 TOKE").unwrap();
+        assert_eq!(w.injected, "我说到 TOKE", "消息通道要照常逐帧上屏");
+        let typed = w.typed_chars;
+        w.update("我说到 TOKEN 的时候").unwrap();
+        assert_eq!(w.injected, "我说到 TOKEN 的时候");
+        assert!(w.typed_chars > typed, "新增部分要接着打出去");
+        assert_eq!(w.backspaces, 0, "只往后加,不用退格");
+        // 回退(ASR 改口)时才退格:这里退 1 个字再补一个字
+        w.update("我说到 TOKEN 的时").unwrap();
+        assert_eq!(w.backspaces, 1, "改口要退格一次");
+        assert_eq!(w.injected, "我说到 TOKEN 的时");
+    }
+
+    /// `nostream:` 策略:一个字都不流式,定稿时整句一次投递(连消息退格都不认的程序用)。
+    #[test]
+    fn nostream_mode_types_only_the_whole_final() {
+        let mut w = StreamWriter::new(8, true);
+        w.set_mode(KeyMode::WmCharFinal(0));
         w.update("我").unwrap();
         w.update("我说到 TOKEN 的时候").unwrap();
-        assert_eq!(w.injected, "", "WM_CHAR 模式不许流式上屏");
+        assert_eq!(w.injected, "", "整句一次模式不许流式上屏");
         w.finalize("我说到 TOKEN 的时候", 32).unwrap();
         assert_eq!(w.injected, "我说到 TOKEN 的时候", "定稿时整句一次投递");
         assert_eq!(w.typed_chars, "我说到 TOKEN 的时候".chars().count());
         assert_eq!(w.backspaces, 0, "整句投递不需要退格");
-        // 定稿之后再来一次同样的 final 不该重复打一遍
         let typed = w.typed_chars;
         w.finalize("我说到 TOKEN 的时候", 32).unwrap();
-        assert_eq!(w.typed_chars, typed);
+        assert_eq!(w.typed_chars, typed, "重复 final 不该重复打一遍");
     }
 
     /// 安全阀放弃修正时,**记账必须留在屏幕上那一版**。
@@ -614,7 +693,7 @@ impl StreamWriter {
     /// (`说到TOKEN` 变成 `说TO到 说TOKE到N`)。整句一次投递既不需要退格,也不存在
     /// 「消息通道 vs 键盘通道抢先后」的问题。代价:这类窗口里没有逐字上屏。
     pub fn update(&mut self, target: &str) -> Result<()> {
-        if self.mode.is_wmchar() {
+        if self.mode.is_final_only() {
             return Ok(());
         }
         if !self.enabled || target.is_empty() {
@@ -653,7 +732,7 @@ impl StreamWriter {
             self.injected = want;
             return Ok(());
         }
-        if self.mode.is_wmchar() {
+        if self.mode.is_final_only() {
             // 不流式:整句(含前置空格)一次投递,没有退格,也就没有「记账 vs 屏幕」的偏差。
             if want == self.injected {
                 return Ok(());
