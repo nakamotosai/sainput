@@ -19,7 +19,9 @@ use sainput_core::asr::{Msg, Sidecar};
 use sainput_core::config::{self, Settings};
 use sainput_core::overlay::{EdgeTint, Overlay};
 use sainput_core::tray::Tray;
-use sainput_core::{audio, autostart, caretctx, context, hotkey, inject, metrics, single, tray, wav};
+use sainput_core::{
+    audio, autostart, caretctx, context, hotkey, inject, metrics, pebrel, single, tray, wav,
+};
 
 /// 默认模型：x-asr-160ms。
 ///
@@ -273,9 +275,10 @@ struct Cfg {
     ctx_bias: bool,
     /// 英文大小写修复(`fix_case`)。
     fix_case: bool,
-    /// 上屏方式策略(`ime_wmchar`):auto(默认)| on | off。
+    /// 上屏方式策略(`ime_wmchar`):auto(默认)| on | off | nostream | pebrel。
     /// 目标窗口挂着输入法时,注入的字母会被输入法吃掉(中文不受影响),这时改用
-    /// PostMessage(WM_CHAR) 绕开键盘那条链。见 `sainput_core::inject::decide_key_mode`。
+    /// PostMessage(WM_CHAR) 绕开键盘那条链;`pebrel` 则完全不发按键,把整句放进
+    /// Pebrel 自己的组合态缓冲层。见 `sainput_core::inject::decide_key_mode`。
     ime_wmchar: String,
 }
 
@@ -706,6 +709,14 @@ struct Ui<'a> {
     t0: Instant,
 }
 
+/// 换句收尾。组合态会在这一步把上一版组合串从应用里清掉(它挂着的时候应用是把
+/// 按键让给它的),所以失败必须看得见,不能吞。
+fn reset_writer(wr: &mut inject::StreamWriter) {
+    if let Err(e) = wr.reset() {
+        eprintln!("[inject] 收取上一句的缓冲层失败: {e}");
+    }
+}
+
 fn handle_msg(m: Msg, wr: &mut inject::StreamWriter, ui: &Ui) {
     let ms = ui.t0.elapsed().as_millis();
     match m {
@@ -776,7 +787,7 @@ fn handle_msg(m: Msg, wr: &mut inject::StreamWriter, ui: &Ui) {
                 // VAD 自动断句 = 这一句已经定稿。必须丢开跟踪，
                 // 否则下一句的第一个 partial 会被当成"对上一句的修正"而退格掉它。
                 if reason == "endpoint" {
-                    wr.reset();
+                    reset_writer(wr);
                 }
             }
         }
@@ -947,6 +958,7 @@ fn cmd_config(a: &Args, root: &Path) -> Result<()> {
     let label = match label {
         "on" | "wmchar" => "消息通道(流式)",
         "nostream" | "final" => "消息通道(整句一次,不流式)",
+        "pebrel" | "compose" => "Pebrel 控制面(组合态缓冲层)",
         "off" | "keys" | "input" => "键盘注入(强制)",
         _ => "auto(输入法吃字母的窗口改走消息通道)",
     };
@@ -1435,7 +1447,7 @@ fn worker(
                         // 否则它会以为屏幕上什么都没有，把整句重打一遍。
                         defer_reset = true;
                     } else {
-                        wr.reset();
+                        reset_writer(&mut wr);
                     }
                     // 前置空格：**每句开始时问一次**光标左边有没有字。
                     // ⚠️ 必须在 reset **之后**设 —— reset 会清掉前缀（前缀属于"上一句"的决策），
@@ -1460,7 +1472,19 @@ fn worker(
                             inject::describe_target(mode)
                         );
                     }
+                    if mode.is_compose() && !wr.mode().is_compose() {
+                        println!(
+                            "[sainput] 上屏改用 Pebrel 组合态缓冲层:这一句先落在它自己的输入缓冲里,定稿才提交"
+                        );
+                    }
                     wr.set_mode(mode);
+                    // 组合态的传输层:每句装一个新的 —— 目标窗口、活动 pane 都可能换了。
+                    // 别的模式必须卸掉,免得留下来像个「看不见的输入框」。
+                    wr.set_composer(if mode.is_compose() {
+                        Some(Box::new(pebrel::PebrelComposer::new()))
+                    } else {
+                        None
+                    });
                     // 上下文偏置：把「刚打出去的历史」抽成热词写盘，sidecar 在开新流时读。
                     // 必须在 reset 之前做（reset 之后 sidecar 才会重读文件）。
                     // 每句都问一次实时开关 —— 托盘里改了要立刻生效，不能要求重开。
@@ -1700,7 +1724,7 @@ fn worker(
                 stage = Stage::Idle;
                 if defer_reset {
                     // 上一句的 final 终于到了：现在才轮到新一句重新起算
-                    wr.reset();
+                    reset_writer(&mut wr);
                     defer_reset = false;
                 }
             }

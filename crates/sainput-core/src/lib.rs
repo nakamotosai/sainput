@@ -15,6 +15,7 @@ pub mod hotkey;
 pub mod inject;
 pub mod metrics;
 pub mod overlay;
+pub mod pebrel;
 pub mod single;
 pub mod tray;
 pub mod wav;

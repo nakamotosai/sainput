@@ -7,6 +7,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Pebrel 组合态上屏(2026-10-28)**:新增 `ime_wmchar = pebrel` —— 对 Pebrel 一个按键
+  都不发,整句先放进它自己的**组合态缓冲层**(`pane.compose`,和输入法 preedit 同一条
+  渲染路径),每帧整体改写,定稿时才一次性提交进 PTY。这条路的动因是真机语料:1372 帧里
+  94.8% 只是往后加,5% 会回头改中间的词、0.2% 会变短 —— 「边说边改」是常态而不是边角,
+  而按键那条路只能退格补打,中间态会真的落进终端和它的历史里。
+  实现:本仓 `crates/sainput-core/src/pebrel.rs`(客户端,自己发现 `runtime.port`)+
+  `inject.rs` 的 `KeyMode::Pebrel`(`整体替换`而不是退格算术);Pebrel 侧新增
+  `pane.compose` 协议方法(那半个补丁在它自己的仓库里)。
+  边界:只发现端点、只写前台那个 Pebrel 进程、SSH pane 照旧拒绝本地内容;Pebrel 没起、
+  没焦点或版本不带这个方法时,错误写进日志,不会静默降级成键盘注入。
+
 ### Changed
 
 - **语音前端归一(2026-10-28)**:侧键语音只跑 sainput 原生路径(`hotkey = mousex1` +

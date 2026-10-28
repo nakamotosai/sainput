@@ -140,6 +140,10 @@ pub enum KeyMode {
     /// 走窗口消息、**整句一次投递**(不流式):给「连消息里的退格都不认」的程序兜底。
     /// 代价是松手才出字,但没有退格就不存在「记账 vs 屏幕」的偏差。
     WmCharFinal(isize),
+    /// **Pebrel 控制面**:一个按键都不发。整句塞进它自己的组合态缓冲层
+    /// (`pane.compose` 的 preedit,可无限次整体替换),定稿时才作为一次写入提交给
+    /// PTY。见 `crate::pebrel`。
+    Pebrel,
 }
 
 impl KeyMode {
@@ -151,9 +155,14 @@ impl KeyMode {
     pub fn is_final_only(self) -> bool {
         matches!(self, KeyMode::WmCharFinal(_))
     }
+    /// 走应用自己的组合态缓冲层(不产生按键)
+    pub fn is_compose(self) -> bool {
+        matches!(self, KeyMode::Pebrel)
+    }
     fn hwnd(self) -> isize {
         match self {
             KeyMode::Keys => 0,
+            KeyMode::Pebrel => 0,
             KeyMode::WmChar(h) | KeyMode::WmCharFinal(h) => h,
         }
     }
@@ -165,6 +174,7 @@ pub fn describe_target(mode: KeyMode) -> String {
         KeyMode::Keys => "键盘注入".to_string(),
         KeyMode::WmChar(h) => format!("消息通道(流式){}", target::describe(h)),
         KeyMode::WmCharFinal(h) => format!("消息通道(整句一次){}", target::describe(h)),
+        KeyMode::Pebrel => "Pebrel 控制面(组合态缓冲层)".to_string(),
     }
 }
 
@@ -176,6 +186,9 @@ pub fn describe_target(mode: KeyMode) -> String {
 ///   `on:pebrel.exe,zed.exe`   —— **只对这几个程序**走消息通道(流式),别的窗口照旧
 ///   `off:some.exe`            —— 这几个程序永远走键盘注入,别的按 auto
 ///   `nostream[:<exe>,...]`    —— 走消息通道但**整句一次投递**(连消息退格都不认的程序用)
+///   `pebrel[:<exe>,...]`      —— 走 Pebrel 控制面的**组合态缓冲层**(一个按键都不发)。
+///                               端点在本机只有一份,所以不写名单时只对 Pebrel 自己的
+///                               程序名(pebrel.exe / nebula.exe)生效;名单外照旧走键盘。
 ///   `auto`(默认,等于没写)   —— 目标线程挂着输入法 **且** 焦点是经典文本控件时走
 ///                              WM_CHAR。只对「已实测字母会被吃掉、而 WM_CHAR 已验证
 ///                              能落字」的这一类生效,免得在别的窗口上把本来好用的
@@ -216,6 +229,18 @@ pub fn decide_key_mode(
     };
     match head {
         "nostream" | "final" => wmchar_final(!only_listed || listed(list)),
+        "pebrel" | "compose" => {
+            // 组合态那条路走的是 Pebrel 的控制面(发现文件只有一份),所以「不写名单」
+            // = 只对 Pebrel 自己的程序名生效,而不是「对所有窗口生效」。
+            // 名单外仍旧走键盘:静默换成别的程序的控制面是最难查的错误。
+            const PEBREL_EXES: [&str; 2] = ["pebrel.exe", "nebula.exe"];
+            let want = if only_listed { listed(list) } else { PEBREL_EXES.contains(&exe.as_str()) };
+            if want {
+                KeyMode::Pebrel
+            } else {
+                KeyMode::Keys
+            }
+        }
         "off" | "keys" | "input" => {
             // `off:foo.exe`:名单里的程序永远走键盘;名单外的按 auto,免得把兜底关掉
             if only_listed && !listed(list) {
@@ -333,6 +358,17 @@ mod target {
             .to_ascii_lowercase()
     }
 
+    /// 前台窗口所属进程 pid(拿不到就 0)。
+    pub fn focused_pid() -> u32 {
+        let hwnd = focused_hwnd();
+        if hwnd == 0 {
+            return 0;
+        }
+        let mut pid: u32 = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        pid
+    }
+
     /// 焦点控件(拿不到就退回前台窗口)。
     pub fn focused_hwnd() -> isize {
         let mut info: GuiThreadInfo = unsafe { std::mem::zeroed() };
@@ -375,6 +411,10 @@ mod target {
     pub fn focused_hwnd() -> isize {
         0
     }
+
+    pub fn focused_pid() -> u32 {
+        0
+    }
     pub fn key_mode(_policy: &str) -> KeyMode {
         KeyMode::Keys
     }
@@ -384,6 +424,11 @@ mod target {
 }
 
 pub use target::key_mode as target_key_mode;
+
+/// 前台窗口所属进程 pid(拿不到就 0)。
+pub fn focused_pid() -> u32 {
+    target::focused_pid()
+}
 
 /// 按当前方式打一段文本。
 ///
@@ -396,6 +441,9 @@ fn type_text_with(mode: KeyMode, s: &str) -> Result<()> {
         KeyMode::Keys => type_text(s),
         // 消息通道:整段都走消息(两条通道抢顺序会把字母插到汉字中间,所以不混)
         KeyMode::WmChar(h) | KeyMode::WmCharFinal(h) => post_chars(h, s),
+        // 组合态不发按键:文本走 `pane.compose`。走到这里说明模式/传输层接线错了,
+        // 宁可明确报错,也不要静默退化成键盘注入(那正是这条模式要避开的失败)。
+        KeyMode::Pebrel => anyhow::bail!("Pebrel 组合态不走按键通道"),
     }
 }
 
@@ -409,6 +457,7 @@ fn backspace_with(mode: KeyMode, n: usize) -> Result<()> {
     match mode {
         KeyMode::Keys => backspace(n),
         KeyMode::WmChar(h) | KeyMode::WmCharFinal(h) => post_backspace(h, n),
+        KeyMode::Pebrel => anyhow::bail!("Pebrel 组合态不做退格:整句是整体替换的"),
     }
 }
 
@@ -492,7 +541,7 @@ mod tests {
     fn reset_clears_prefix() {
         let mut w = StreamWriter::new(8, true);
         w.set_prefix(" ");
-        w.reset();
+        w.reset().unwrap();
         assert_eq!(w.want("下一句"), "下一句");
     }
 
@@ -546,6 +595,24 @@ mod tests {
         assert_eq!(decide_key_mode("nostream:pebrel.exe", 0x1234, false, false, E), KeyMode::WmCharFinal(0x1234));
         assert_eq!(decide_key_mode("nostream:pebrel.exe", 0x1234, false, false, OTHER), KeyMode::Keys);
         assert_eq!(decide_key_mode("nostream", 0x1234, false, false, E), KeyMode::WmCharFinal(0x1234));
+        // pebrel:组合态缓冲层。**不写名单 = 只对 Pebrel 自己的程序名生效** ——
+        // 控制面在这台机上只有一份,把别的程序的文本塞进它的缓冲层是最难查的错误。
+        assert_eq!(decide_key_mode("pebrel", 0x1234, false, false, E), KeyMode::Pebrel);
+        assert_eq!(
+            decide_key_mode("pebrel", 0x1234, false, false, "nebula.exe"),
+            KeyMode::Pebrel,
+            "旧程序名 nebula.exe 也认"
+        );
+        assert_eq!(decide_key_mode("pebrel", 0x1234, false, false, OTHER), KeyMode::Keys);
+        assert_eq!(
+            decide_key_mode("pebrel:psql.exe", 0x1234, false, false, "psql.exe"),
+            KeyMode::Pebrel
+        );
+        assert_eq!(
+            decide_key_mode("pebrel:psql.exe", 0x1234, false, false, OTHER),
+            KeyMode::Keys,
+            "名单外不许静默换通道"
+        );
     }
 
     /// 消息通道默认**照常流式**(退格走 PostMessage(WM_KEYDOWN/UP, VK_BACK))。
@@ -609,6 +676,86 @@ mod tests {
         w.update("收口").unwrap();
         assert_eq!(w.injected, screen, "流式放弃后 injected 必须还是屏幕上那一版");
     }
+
+    /// 组合态模式的替身:只记录被要求设置/提交了什么,不碰任何窗口。
+    #[derive(Clone, Default)]
+    struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<(String, bool)>>>);
+
+    impl Recorder {
+        fn calls(&self) -> Vec<String> {
+            self.0.lock().unwrap().iter().filter(|(_, commit)| !commit).map(|(t, _)| t.clone()).collect()
+        }
+        fn commits(&self) -> Vec<String> {
+            self.0.lock().unwrap().iter().filter(|(_, commit)| *commit).map(|(t, _)| t.clone()).collect()
+        }
+    }
+
+    impl crate::pebrel::Composer for Recorder {
+        fn set(&mut self, text: &str) -> Result<()> {
+            self.0.lock().unwrap().push((text.to_string(), false));
+            Ok(())
+        }
+        fn commit(&mut self, text: &str) -> Result<()> {
+            self.0.lock().unwrap().push((text.to_string(), true));
+            Ok(())
+        }
+    }
+
+    /// 组合态:**整体替换**缓冲层,不产生一个按键、不产生一次退格。
+    /// (真机语料里约 5% 的帧会回头改前面的词;那些帧在按键模式下就是退格补打。)
+    #[test]
+    fn compose_mode_replaces_the_whole_buffer_and_never_backspaces() {
+        let mut w = StreamWriter::new(8, true);
+        let rec = Recorder::default();
+        w.set_mode(KeyMode::Pebrel);
+        w.set_composer(Some(Box::new(rec.clone())));
+        w.update("我说到 TOKE").unwrap();
+        w.update("我说到 TOKEN 的时候").unwrap();
+        w.update("我说到 TOKEN 的时").unwrap(); // ← 改口那一帧
+        assert_eq!(w.injected, "", "没提交就等于没上屏");
+        assert_eq!(w.backspaces, 0, "组合态不做退格");
+        assert_eq!(w.typed_chars, 0, "组合态不按键,所以不打字");
+        assert_eq!(
+            rec.calls(),
+            vec!["我说到 TOKE", "我说到 TOKEN 的时候", "我说到 TOKEN 的时"],
+            "每一帧都是整体替换"
+        );
+        assert!(rec.commits().is_empty(), "没定稿不许提交");
+        w.update("我说到 TOKEN 的时").unwrap();
+        assert_eq!(rec.calls().len(), 3, "同一段文本不重复发");
+    }
+
+    /// 定稿只提交一次,提交之后记账才等于屏幕。
+    #[test]
+    fn compose_mode_commits_once_on_finalize() {
+        let mut w = StreamWriter::new(8, true);
+        let rec = Recorder::default();
+        w.set_mode(KeyMode::Pebrel);
+        w.set_composer(Some(Box::new(rec.clone())));
+        w.set_prefix(" ");
+        w.update("我说到 TOKE").unwrap();
+        w.finalize("我说到 TOKEN 的时候", 32).unwrap();
+        assert_eq!(rec.commits(), vec![" 我说到 TOKEN 的时候"], "提交要带上前置空格");
+        assert_eq!(w.injected, " 我说到 TOKEN 的时候");
+        assert_eq!(w.typed_chars, " 我说到 TOKEN 的时候".chars().count());
+        w.finalize("我说到 TOKEN 的时候", 32).unwrap();
+        assert_eq!(rec.commits().len(), 1, "重复 final 不许重复提交(等于说了一遍进去两遍)");
+    }
+
+    /// 换句必须把上一版组合串从应用里清掉:它挂着的时候,应用是把按键让给它的。
+    #[test]
+    fn compose_mode_cancels_the_buffer_on_reset() {
+        let mut w = StreamWriter::new(8, true);
+        let rec = Recorder::default();
+        w.set_mode(KeyMode::Pebrel);
+        w.set_composer(Some(Box::new(rec.clone())));
+        w.update("还没说完的一句").unwrap();
+        w.reset().unwrap();
+        assert_eq!(rec.calls(), vec!["还没说完的一句", ""], "换句 = 清掉缓冲层");
+        w.reset().unwrap();
+        assert_eq!(rec.calls().len(), 2, "没有挂着的组合串时不多发一条");
+    }
+
 }
 
 /// 流式改写器：把「当前应显示的文本」增量地落到目标窗口。
@@ -631,6 +778,12 @@ pub struct StreamWriter {
     /// 这一句用哪种方式上屏(每句开始时按目标窗口决定,见 `decide_key_mode`)。
     /// 默认是键盘注入;只有「输入法会吃字母」的窗口才切成 WM_CHAR。
     mode: KeyMode,
+    /// 组合态模式(`KeyMode::Pebrel`)的传输层:设置/提交应用自己的缓冲层。
+    /// 只在这个模式下才需要,别的模式是 `None`。
+    composer: Option<Box<dyn crate::pebrel::Composer>>,
+    /// 当前**已经放进组合串**的文本 —— 屏幕上还没提交的那一版。
+    /// 组合态下 `injected` 始终是空的:没提交就是没上屏。
+    composed: String,
     pub typed_chars: usize,
     pub backspaces: usize,
 }
@@ -643,6 +796,8 @@ impl StreamWriter {
             enabled,
             prefix: String::new(),
             mode: KeyMode::Keys,
+            composer: None,
+            composed: String::new(),
             typed_chars: 0,
             backspaces: 0,
         }
@@ -662,10 +817,27 @@ impl StreamWriter {
         self.mode
     }
 
-    pub fn reset(&mut self) {
+    /// 装上/卸下组合态传输层。**每句开始时**由调用方按模式决定:
+    /// 组合态需要一个真客户端(每句重解析目标窗口与活动 pane)。
+    pub fn set_composer(&mut self, composer: Option<Box<dyn crate::pebrel::Composer>>) {
+        self.composer = composer;
+    }
+
+
+    pub fn reset(&mut self) -> Result<()> {
         self.injected.clear();
         // 前缀属于"这一句"的决策，换句要重新决定（光标位置可能已经变了）
         self.prefix.clear();
+        if self.composed.is_empty() {
+            return Ok(());
+        }
+        // 组合串挂在应用自己的输入缓冲里,而这期间应用的按键处理是让位给它的;
+        // 留着等于替用户按住了一个看不见的输入框。
+        self.composed.clear();
+        if let Some(composer) = self.composer.as_mut() {
+            composer.set("")?;
+        }
+        Ok(())
     }
 
     pub fn enabled(&self) -> bool {
@@ -693,6 +865,12 @@ impl StreamWriter {
     /// (`说到TOKEN` 变成 `说TO到 说TOKE到N`)。整句一次投递既不需要退格,也不存在
     /// 「消息通道 vs 键盘通道抢先后」的问题。代价:这类窗口里没有逐字上屏。
     pub fn update(&mut self, target: &str) -> Result<()> {
+        if self.mode.is_compose() {
+            // 组合态:**整体替换**缓冲层,没有退格算术 —— 因为一个字节都还没上屏。
+            // 这正是「边说边改」在终端里能做到的形态:应用自己那层 preedit 可以随便
+            // 改写,屏幕(和 shell 历史)不会经过任何中间态。
+            return self.compose_set(target);
+        }
         if self.mode.is_final_only() {
             return Ok(());
         }
@@ -723,6 +901,26 @@ impl StreamWriter {
         Ok(())
     }
 
+    /// 组合态:把这一句(含前缀)放进应用的缓冲层。同样的文本不重复发。
+    fn compose_set(&mut self, target: &str) -> Result<()> {
+        if !self.enabled || target.is_empty() {
+            // 空结果 = 这次没听清:不要把已经放进缓冲层的那一版擦掉,
+            // 定稿或换句时才收尾。
+            return Ok(());
+        }
+        let want = self.want(target);
+        if want == self.composed {
+            return Ok(());
+        }
+        let Some(composer) = self.composer.as_mut() else {
+            anyhow::bail!("组合态模式没有装传输层(内部接线错误)");
+        };
+        composer.set(&want)?;
+        self.composed = want;
+        Ok(())
+    }
+
+
     /// final 结果：允许更大的回退（final 通常只是把尾巴改得更准）。
     ///
     /// 走和 `update` **完全相同**的前缀算术（含 `prefix`），否则屏幕与 `injected` 会错位。
@@ -730,6 +928,21 @@ impl StreamWriter {
         let want = self.want(target);
         if !self.enabled {
             self.injected = want;
+            return Ok(());
+        }
+        if self.mode.is_compose() {
+            // 提交:清掉缓冲层,把整段作为**一次**写入交给应用(与输入法提交同一条路)。
+            // `max_bs` 在这里没有意义 —— 缓冲层是整体替换的,不存在退格。
+            if want == self.injected {
+                return Ok(());
+            }
+            let Some(composer) = self.composer.as_mut() else {
+                anyhow::bail!("组合态模式没有装传输层(内部接线错误)");
+            };
+            composer.commit(&want)?;
+            self.typed_chars += want.chars().count();
+            self.injected = want;
+            self.composed.clear();
             return Ok(());
         }
         if self.mode.is_final_only() {
