@@ -153,13 +153,14 @@ fn pick_target(snapshot: &serde_json::Value) -> Result<Target> {
     Ok(Target { pid, window_id, pane_id })
 }
 
-/// 端点在这台机上是全局的,但用户的眼睛只在一个地方:前端应用不是 Pebrel 时
-/// 绝不能把组合串塞进后台窗口。**每次发送都查**,不跟着 target 一起缓存
-/// (前台随时会变,缓存一次就把后台写放进去了)。
+/// 前端应用不是 Pebrel 时的**提示文本**:调用方只记一笔,不据此拒发。
+///
+/// 为什么不再拒:真机上前台会在 Pebrel 和别的窗口之间来回跳(实测一句里 13 帧被拒、
+/// 定稿也被拒 → 整句丢掉),而发错的代价只是那句话落进刚离开的 pane。
 fn ensure_foreground(target: Target, foreground_pid: u32) -> Result<()> {
     if target.pid != 0 && foreground_pid != 0 && foreground_pid != target.pid {
         bail!(
-            "前台不是 Pebrel(前台 pid {foreground_pid} / Pebrel pid {}):不往后台窗口写组合串",
+            "前台不是 Pebrel(前台 pid {foreground_pid} / Pebrel pid {}),这句话可能落进你刚离开的 pane",
             target.pid
         );
     }
@@ -192,7 +193,14 @@ impl PebrelComposer {
     fn send(&mut self, text: &str, commit: bool) -> Result<()> {
         let (port, token) = endpoint()?;
         let target = self.resolve(port, &token)?;
-        ensure_foreground(target, crate::inject::focused_pid())?;
+        // 前端不是 Pebrel 时**照样发**,只留一行痕迹。
+        //
+        // 这里原来是硬拒(「绝不往后台窗口写组合串」),真机上把用户正经说的句子拒掉了:
+        // 一次尝试里 13 帧被拒、连定稿都被拒 —— 整句凭空消失。而「发错」的代价只是那句
+        // 话落进他刚离开的终端 pane:看得见、能删、不会被执行。两害相权,取不丢句。
+        if let Err(e) = ensure_foreground(target, crate::inject::focused_pid()) {
+            eprintln!("[pebrel] {e}(照发)");
+        }
         let id = self.next_id();
         let params = serde_json::json!({
             "window_id": target.window_id,
@@ -272,12 +280,12 @@ mod tests {
     }
 
     #[test]
-    fn background_pebrel_is_refused_on_every_send() {
+    fn foreground_mismatch_only_produces_a_note_not_a_refusal() {
         let snap = real_snapshot();
         let target = pick_target(&snap).unwrap();
-        let err = ensure_foreground(target, target.pid + 15732).unwrap_err().to_string();
-        assert!(err.contains("前台不是 Pebrel"), "{err}");
-        // 前台就是它自己(以及拿不到前台 pid 时)才放行
+        // 这两条现在只用来写日志;发不发不归它管(send 里只 eprintln,不 return Err)
+        let note = ensure_foreground(target, target.pid + 15732).unwrap_err().to_string();
+        assert!(note.contains("前台不是 Pebrel") && note.contains("刚离开的 pane"), "{note}");
         assert!(ensure_foreground(target, target.pid).is_ok());
         assert!(ensure_foreground(target, 0).is_ok());
     }

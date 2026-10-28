@@ -1483,15 +1483,23 @@ fn worker(
                     // 每句开始时重判一次:用户可能已经换了窗口。
                     let mode = inject::target_key_mode(&o.ime_wmchar);
                     if mode.is_wmchar() && !wr.mode().is_wmchar() {
-                        println!(
+                        let line = format!(
                             "[sainput] 上屏改用 WM_CHAR:{} —— 这类窗口里注入的字母会被输入法吃掉",
                             inject::describe_target(mode)
                         );
+                        if let Some(l) = o.log.as_ref() {
+                            l.line(&line);
+                        }
+                        println!("{line}");
                     }
                     if mode.is_compose() && !wr.mode().is_compose() {
-                        println!(
-                            "[sainput] 上屏改用 Pebrel 组合态缓冲层:这一句先落在它自己的输入缓冲里,定稿才提交"
-                        );
+                        // 隐藏控制台时 println 看不见:走了哪条上屏路必须能在会话日志里查
+                        // —— 真机上正是靠日志才看出「前台不是 Pebrel」把整句拒掉这件事。
+                        let line = "[sainput] 上屏改用 Pebrel 组合态缓冲层:这一句先落在它自己的输入缓冲里,定稿才提交".to_string();
+                        if let Some(l) = o.log.as_ref() {
+                            l.line(&line);
+                        }
+                        println!("{line}");
                     }
                     wr.set_mode(mode);
                     // 组合态的传输层:每句装一个新的 —— 目标窗口、活动 pane 都可能换了。
