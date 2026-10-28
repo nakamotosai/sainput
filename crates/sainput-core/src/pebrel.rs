@@ -38,7 +38,7 @@ pub struct PebrelComposer {
     seq: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Target {
     /// Pebrel 进程 pid:用来确认「眼前这个前台窗口就是 Pebrel」。
     pid: u32,
@@ -124,6 +124,48 @@ fn refusal(method: &str, error: &serde_json::Value) -> anyhow::Error {
     anyhow::anyhow!("Pebrel 拒绝了 {method}:{code} {message}")
 }
 
+/// 从快照里挑出「这一句该写进哪个 pane」。纯函数 —— 截下真实 `runtime.snapshot`
+/// 的 JSON 就能测(`tests/fixtures/pebrel-snapshot.json`)。
+fn pick_target(snapshot: &serde_json::Value) -> Result<Target> {
+    let pid = snapshot.get("process_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let windows = snapshot
+        .get("windows")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    // 只有一个窗口时不必要求它 focused:用户可能刚切走又切回来,
+    // 而听写的目标从来就是「Pebrel 的那个窗口」。
+    let window = windows
+        .iter()
+        .find(|w| w.get("focused").and_then(|v| v.as_bool()) == Some(true))
+        .or_else(|| (windows.len() == 1).then(|| &windows[0]))
+        .context("Pebrel 有多个窗口且当前没有聚焦的那个:请把焦点放在目标窗口")?;
+    let window_id = window.get("id").and_then(|v| v.as_u64()).context("快照里没有 window.id")?;
+    let active_tab = window
+        .get("tabs")
+        .and_then(|t| t.as_array())
+        .and_then(|tabs| tabs.iter().find(|t| t.get("active").and_then(|v| v.as_bool()) == Some(true)));
+    let pane_id = window
+        .get("focused_pane_id")
+        .and_then(|v| v.as_u64())
+        .or_else(|| active_tab.and_then(|t| t.get("focused_pane_id")).and_then(|v| v.as_u64()))
+        .context("快照里找不到活动 pane")?;
+    Ok(Target { pid, window_id, pane_id })
+}
+
+/// 端点在这台机上是全局的,但用户的眼睛只在一个地方:前端应用不是 Pebrel 时
+/// 绝不能把组合串塞进后台窗口。**每次发送都查**,不跟着 target 一起缓存
+/// (前台随时会变,缓存一次就把后台写放进去了)。
+fn ensure_foreground(target: Target, foreground_pid: u32) -> Result<()> {
+    if target.pid != 0 && foreground_pid != 0 && foreground_pid != target.pid {
+        bail!(
+            "前台不是 Pebrel(前台 pid {foreground_pid} / Pebrel pid {}):不往后台窗口写组合串",
+            target.pid
+        );
+    }
+    Ok(())
+}
+
 impl PebrelComposer {
     pub fn new() -> Self {
         Self { target: None, seq: 0 }
@@ -142,30 +184,7 @@ impl PebrelComposer {
         }
         let id = self.next_id();
         let snapshot = call(port, token, &id, "runtime.snapshot", serde_json::Value::Null)?;
-        let pid = snapshot.get("process_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let windows = snapshot
-            .get("windows")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        // 只有一个窗口时不必要求它 focused:用户可能刚切走又切回来,
-        // 而听写的目标从来就是「Pebrel 的那个窗口」。
-        let window = windows
-            .iter()
-            .find(|w| w.get("focused").and_then(|v| v.as_bool()) == Some(true))
-            .or_else(|| (windows.len() == 1).then(|| &windows[0]))
-            .context("Pebrel 有多个窗口且当前没有聚焦的那个:请把焦点放在目标窗口")?;
-        let window_id = window.get("id").and_then(|v| v.as_u64()).context("快照里没有 window.id")?;
-        let active_tab = window
-            .get("tabs")
-            .and_then(|t| t.as_array())
-            .and_then(|tabs| tabs.iter().find(|t| t.get("active").and_then(|v| v.as_bool()) == Some(true)));
-        let pane_id = window
-            .get("focused_pane_id")
-            .and_then(|v| v.as_u64())
-            .or_else(|| active_tab.and_then(|t| t.get("focused_pane_id")).and_then(|v| v.as_u64()))
-            .context("快照里找不到活动 pane")?;
-        let target = Target { pid, window_id, pane_id };
+        let target = pick_target(&snapshot)?;
         self.target = Some(target);
         Ok(target)
     }
@@ -173,15 +192,7 @@ impl PebrelComposer {
     fn send(&mut self, text: &str, commit: bool) -> Result<()> {
         let (port, token) = endpoint()?;
         let target = self.resolve(port, &token)?;
-        // 端点在这台机上是全局的,但用户的眼睛只在一个地方:前端应用不是 Pebrel
-        // 时绝不能把组合串塞进后台窗口。
-        let foreground = crate::inject::focused_pid();
-        if target.pid != 0 && foreground != 0 && foreground != target.pid {
-            bail!(
-                "前台不是 Pebrel(前台 pid {foreground} / Pebrel pid {}):不往后台窗口写组合串",
-                target.pid
-            );
-        }
+        ensure_foreground(target, crate::inject::focused_pid())?;
         let id = self.next_id();
         let params = serde_json::json!({
             "window_id": target.window_id,
@@ -236,5 +247,46 @@ mod tests {
         // 别的哪个方法报 method_not_found,都不该套用这条专用提示
         let text = refusal("pane.read", &old).to_string();
         assert!(!text.contains("还没有组合态缓冲层"), "{text}");
+    }
+
+    /// 真机截下来的 `runtime.snapshot` 原样存进 fixtures —— 目标是「写进哪个 pane」
+    /// 这种错了会很难看的地方,拿真数据测才算数。
+    fn real_snapshot() -> serde_json::Value {
+        serde_json::from_str(include_str!("../tests/fixtures/pebrel-snapshot.json")).expect("fixture")
+    }
+
+    #[test]
+    fn picks_the_active_pane_from_a_real_snapshot() {
+        let snap = real_snapshot();
+        let pid = snap["process_id"].as_u64().expect("快照里有 process_id") as u32;
+        assert_eq!(pick_target(&snap).expect("该挑得出目标"), Target { pid, window_id: 1, pane_id: 1 });
+    }
+
+    #[test]
+    fn a_single_window_is_the_target_even_when_it_is_not_focused() {
+        // 真机快照里窗口正是 focused=false(焦点在别的程序上)—— 只有一个窗口时
+        // 该写的还是它,这是「切走又切回来」的常见形态。
+        let snap = real_snapshot();
+        assert_eq!(snap["windows"][0]["focused"], serde_json::json!(false));
+        assert!(pick_target(&snap).is_ok());
+    }
+
+    #[test]
+    fn background_pebrel_is_refused_on_every_send() {
+        let snap = real_snapshot();
+        let target = pick_target(&snap).unwrap();
+        let err = ensure_foreground(target, target.pid + 15732).unwrap_err().to_string();
+        assert!(err.contains("前台不是 Pebrel"), "{err}");
+        // 前台就是它自己(以及拿不到前台 pid 时)才放行
+        assert!(ensure_foreground(target, target.pid).is_ok());
+        assert!(ensure_foreground(target, 0).is_ok());
+    }
+
+    #[test]
+    fn several_windows_without_a_focused_one_is_an_error() {
+        let mut snap = real_snapshot();
+        let window = snap["windows"][0].clone();
+        snap["windows"] = serde_json::json!([window.clone(), window]);
+        assert!(pick_target(&snap).unwrap_err().to_string().contains("多个窗口"));
     }
 }

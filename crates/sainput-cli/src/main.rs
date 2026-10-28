@@ -747,6 +747,11 @@ fn handle_msg(m: Msg, wr: &mut inject::StreamWriter, ui: &Ui) {
                     }
                 }
                 if let Err(e) = wr.update(&text) {
+                    // 隐藏控制台时 stderr 看不见:这条路失败必须留在日志里
+                    // (组合态最常见的失败是「Pebrel 不在前台 / 被更新覆盖」)。
+                    if let Some(l) = ui.log {
+                        l.line(&format!("! partial 上屏失败: {e}"));
+                    }
                     eprintln!("[inject] partial 失败: {e}");
                 }
             }
@@ -768,6 +773,9 @@ fn handle_msg(m: Msg, wr: &mut inject::StreamWriter, ui: &Ui) {
                 }
                 if !text.is_empty() {
                     if let Err(e) = wr.finalize(&text, ui.max_bs * 4) {
+                        if let Some(l) = ui.log {
+                            l.line(&format!("! final 上屏失败: {e}"));
+                        }
                         eprintln!("[inject] final 失败: {e}");
                     }
                 }

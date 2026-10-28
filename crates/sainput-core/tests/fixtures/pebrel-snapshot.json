@@ -1,0 +1,44 @@
+{
+  "revision": 7,
+  "process_id": 26284,
+  "app_version": "2.3.1 (cf7fe6f)",
+  "protocol_version": 1,
+  "detached_windows": 0,
+  "windows": [
+    {
+      "id": 1,
+      "focused": false,
+      "session_exempt": false,
+      "active_tab": 0,
+      "focused_pane_id": 1,
+      "tabs": [
+        {
+          "tab_id": "18e2ab920ace36dc0000000000000001",
+          "index": 0,
+          "active": true,
+          "label": "saaaai",
+          "kind": "shell",
+          "bell": false,
+          "focused_pane_id": 1,
+          "layout": {
+            "type": "pane",
+            "pane_id": 1
+          },
+          "panes": [
+            {
+              "id": 1,
+              "active": true,
+              "title": "WIN: saaaai",
+              "cwd": "C:\\Users\\sai\\saaaai",
+              "branch": "",
+              "ssh_destination": null,
+              "running_program": "herdr",
+              "task_state": "running",
+              "state_change_seq": 2
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
