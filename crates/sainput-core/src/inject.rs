@@ -362,37 +362,14 @@ pub use target::key_mode as target_key_mode;
 
 /// 按当前方式打一段文本。
 ///
-/// WM_CHAR 模式**只把 ASCII 走消息**:汉字那条路本来就没被输入法挡住(实测同一窗口
-/// 注入 4 个汉字全部落地),没必要跟着换 —— 换了万一某个自绘程序不吃 WM_CHAR,
-/// 反而把本来好用的中文听写弄坏。所以两种字符各走各的路,谁也不牵连谁。
+/// WM_CHAR 模式下**整段都走消息**:不能一半走消息、一半走键盘。
+/// 这两条通道在系统里的处理时机不一样(SendInput 要过输入子系统,PostMessage 直接进
+/// 消息队列),混着发**先后顺序不保证** —— 真机上表现为字母插到汉字中间
+/// (`说到TOKEN` 变成 `说TO到 说TOKE到N`)。所以选定一条路就一条路走到底。
 fn type_text_with(mode: KeyMode, s: &str) -> Result<()> {
     match mode {
         KeyMode::Keys => type_text(s),
-        KeyMode::WmChar(h) => {
-            let mut run = String::new();
-            let mut ascii = true;
-            for ch in s.chars() {
-                let is_ascii = (ch as u32) < 0x80;
-                if is_ascii != ascii && !run.is_empty() {
-                    if ascii {
-                        post_chars(h, &run)?;
-                    } else {
-                        type_text(&run)?;
-                    }
-                    run.clear();
-                }
-                ascii = is_ascii;
-                run.push(ch);
-            }
-            if !run.is_empty() {
-                if ascii {
-                    post_chars(h, &run)?;
-                } else {
-                    type_text(&run)?;
-                }
-            }
-            Ok(())
-        }
+        KeyMode::WmChar(h) => post_chars(h, s),
     }
 }
 
@@ -509,6 +486,25 @@ mod tests {
         assert_eq!(decide_key_mode("auto:pebrel.exe", 0x1234, true, true, E), KeyMode::WmChar(0x1234));
     }
 
+    /// WM_CHAR 模式:不打流式,定稿时整句一次投递(所以永远不需要退格)。
+    /// 用 `WmChar(0)` 做这个测试:句柄 0 时 post_chars 直接返回,不会真的发消息。
+    #[test]
+    fn wmchar_mode_types_only_the_whole_final() {
+        let mut w = StreamWriter::new(8, true);
+        w.set_mode(KeyMode::WmChar(0));
+        w.update("我").unwrap();
+        w.update("我说到 TOKEN 的时候").unwrap();
+        assert_eq!(w.injected, "", "WM_CHAR 模式不许流式上屏");
+        w.finalize("我说到 TOKEN 的时候", 32).unwrap();
+        assert_eq!(w.injected, "我说到 TOKEN 的时候", "定稿时整句一次投递");
+        assert_eq!(w.typed_chars, "我说到 TOKEN 的时候".chars().count());
+        assert_eq!(w.backspaces, 0, "整句投递不需要退格");
+        // 定稿之后再来一次同样的 final 不该重复打一遍
+        let typed = w.typed_chars;
+        w.finalize("我说到 TOKEN 的时候", 32).unwrap();
+        assert_eq!(w.typed_chars, typed);
+    }
+
     /// 安全阀放弃修正时,**记账必须留在屏幕上那一版**。
     ///
     /// 两条路径都不许把 `injected` 推到屏幕前面 —— 一旦对不上,后面每次退格都是
@@ -610,11 +606,20 @@ impl StreamWriter {
         }
     }
 
-    /// 用 partial 结果更新屏幕。失败不致命，交给下一帧。
+    /// 用 partial 结果更新屏幕。失败不致命,交给下一帧。
+    ///
+    /// ⚠️ WM_CHAR 模式**不流式**:一个字都不打,等定稿(`finalize`)整句一次投递。
+    /// 为什么:这条路靠 PostMessage,而「消息里的退格」(WM_CHAR(0x08))各家程序语义
+    /// 不一样 —— 真机上退格被忽略、插入照常,屏幕就成了同一句反复叠加
+    /// (`说到TOKEN` 变成 `说TO到 说TOKE到N`)。整句一次投递既不需要退格,也不存在
+    /// 「消息通道 vs 键盘通道抢先后」的问题。代价:这类窗口里没有逐字上屏。
     pub fn update(&mut self, target: &str) -> Result<()> {
+        if self.mode.is_wmchar() {
+            return Ok(());
+        }
         if !self.enabled || target.is_empty() {
-            // 空结果一律当成「这次没听清」，绝不把已经上屏的字擦掉。
-            // final 走 finalize()，那条路径才允许改写/清空。
+            // 空结果一律当成「这次没听清」,绝不把已经上屏的字擦掉。
+            // final 走 finalize(),那条路径才允许改写/清空。
             return Ok(());
         }
         let want = self.want(target);
@@ -645,6 +650,16 @@ impl StreamWriter {
     pub fn finalize(&mut self, target: &str, max_bs: usize) -> Result<()> {
         let want = self.want(target);
         if !self.enabled {
+            self.injected = want;
+            return Ok(());
+        }
+        if self.mode.is_wmchar() {
+            // 不流式:整句(含前置空格)一次投递,没有退格,也就没有「记账 vs 屏幕」的偏差。
+            if want == self.injected {
+                return Ok(());
+            }
+            type_text_with(self.mode, &want)?;
+            self.typed_chars += want.chars().count();
             self.injected = want;
             return Ok(());
         }

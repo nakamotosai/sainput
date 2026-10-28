@@ -85,8 +85,9 @@ hotkey = rightctrl
 #     ime_wmchar = on:pebrel.exe      # 只在 pebrel 里把 ASCII 走 WM_CHAR
 #     ime_wmchar = off:notepad.exe    # notepad 永远走键盘,别的仍按 auto
 #
-# 注意:WM_CHAR 这条路**只接管 ASCII**(字母/数字/标点/空格);汉字仍旧走键盘注入
-# —— 汉字本来就不受输入法影响,没必要跟着换。
+# 注意:走 WM_CHAR 的窗口**不做流式** —— 整句在松手定稿时一次打进去,没有逐字效果。
+# 因为消息通道和键盘通道的先后顺序没有保证(混着发会把字母插到汉字中间),而且
+# 消息里的退格各家程序语义不一(自绘终端会忽略它,导致同一句反复叠加)。
 # ime_wmchar = auto
 
 # ---- 上下文偏置 ----

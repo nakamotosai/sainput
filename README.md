@@ -237,7 +237,7 @@ sainput selftest inject "文字"                只测上屏路径
 | `--ctx-hotwords <FILE>` | 偏置临时热词文件（默认 `.ctx_hotwords.txt`） |
 | `--merge-terms` / `--no-merge-terms` | 英文拆字合并(默认开) |
 | `--fix-case` / `--no-fix-case` | 英文大小写修复(默认开) |
-| `--ime-wmchar auto\|on\|off\|<策略>:<exe>[,<exe>]` | 上屏方式(默认 `auto`):目标窗口挂着输入法时,注入的 ASCII 会被输入法收走,这时改走 `WM_CHAR`(汉字不受影响,仍走键盘)。`on` = 到处都用;`off` = 老行为;挂名单 = 只对这些程序生效(如 `on:pebrel.exe`) |
+| `--ime-wmchar auto\|on\|off\|<策略>:<exe>[,<exe>]` | 上屏方式(默认 `auto`):目标窗口挂着输入法时,注入的 ASCII 会被输入法收走,这时改走 `WM_CHAR`(汉字不受影响,仍走键盘)。`on` = 到处都用;`off` = 老行为;挂名单 = 只对这些程序生效(如 `on:pebrel.exe`)。注意:`on` 的窗口**不做逐字流式**,整句在定稿时一次投递 |
 | `--leading-space` / `--no-leading-space` | 光标前有字时补空格（默认开） |
 | `--beam` / `--no-beam` | `modified_beam_search`（更准、稍慢；热词需要它） |
 | `--threads N` | 推理线程数（默认 2） |
