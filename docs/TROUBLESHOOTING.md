@@ -229,7 +229,8 @@ powershell -ExecutionPolicy Bypass -File scripts\fetch_models.ps1           # �
 | 吞最后一个字 | 日志里的 `T` 行 | 调大 `tail_pad_ms`（默认 480），或 `tail_quiet_ms` |
 | 松手后半天不落句 | `T` 行的「松键→收尾」 | 调小 `tail_pad_ms` / `tail_max_ms` |
 | 句子被切碎 | 日志里 `F` 行原因是 endpoint | 调大 `rule2`（默认 15 秒） |
-| 词总被听错 | `[raw]` 里就是错的 | 加进 `hotwords.txt`；见 [`../hotwords.example.txt`](../hotwords.example.txt) |
+| 词总被听错 | `[raw]` 里就是错的 | 加进 `hotwords.txt`;见 [`../hotwords.example.txt`](../hotwords.example.txt) |
+| 说到英文时整句被跳过 / 删掉 | `P` 行的**渲染文本**比上一行短、`[raw]` 却是完整的 | 已有过:标点模型吃掉正文(2026-10-28 修,`tools/test_punct_guard.py`);控制台/日志里会有一行 `标点模型丢了正文`。还在发生就把那行 `[raw]` 贴进 issue |
 | 长句重复打转 | `[raw]` 里就重复 | 模型固有行为，换档见 [`model-selection.md`](model-selection.md) |
 | 中英混说丢词 | — | 试 `-480ms` 档 |
 

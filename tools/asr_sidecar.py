@@ -21,7 +21,7 @@
 用法: python asr_sidecar.py --model-dir <dir> [--punct-dir <dir>] [--hotwords f.txt]
                             [--threads N] [--beam] [--no-itn] [--throttle-ms N]
 """
-import sys, os, glob, json, base64, argparse, time, traceback
+import sys, os, glob, json, base64, argparse, time, traceback, unicodedata
 
 sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 
@@ -48,6 +48,79 @@ def pick(md, kind):
 def emit(obj):
     sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
     sys.stdout.flush()
+
+
+def note(msg):
+    """stderr 上的一行说明。写不进去(控制台已 detach / 句柄失效)**绝不能**影响
+    识别 —— 上屏永远比日志重要,所以这里吞掉一切异常。"""
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------ 标点守卫
+def content_key(t):
+    """正文指纹:去掉空白 / 标点 / 符号,大小写归一。
+
+    用 Unicode 类别判,而不是手写一张标点表 —— 手写的表一定会漏(半角标点、全角
+    标点、省略号、波浪号这类符号各算一类),漏一个就会把**正常加了标点的结果**
+    误判成「吃掉了正文」,守卫反而把标点丢掉。
+
+    类别 P*(标点)/Z*(分隔)/S*(符号)都不算正文,剩下的(汉字、字母、数字……)
+    才是「正文」。标点模型只许动这些,动了就说明它把话吃了。
+    """
+    out = []
+    for c in t:
+        if c.isspace():
+            continue
+        if unicodedata.category(c)[0] in ("P", "Z", "S"):
+            continue
+        out.append(c)
+    return "".join(out).casefold()
+
+
+def punctuate_guarded(punct, t):
+    """跑标点模型,但**验一遍正文有没有缺**。返回 (文本, 是否吃掉了正文)。
+
+    为什么要这道闸:sherpa 的 CT-Transformer 会偶发只回**前一小段** ——
+    实测 `我理解不了的你怎么报错了我现在就在 OPEN CODE 里面你居然跟我说必须用
+    OPEN CODE 才能用免费模型我现`(59 字)只回了 `我理解不了的,你怎么报错了?`
+    (14 字),而只差一个字的邻居输入就正常。直接采信等于把用户刚说的话从屏幕上
+    删掉(下游上屏器只会按「文本变短了」去退格),而这条路径**一声不响**。
+    标点和热词一样只是加分项:宁可这句不带标点,也不能少一个字。
+    """
+    if punct is None:
+        return t, False
+    try:
+        out = punct.add_punctuation(t)
+    except Exception as e:
+        note(f"[sidecar] 标点模型报错,本句退回未加标点的文本: {e}")
+        return t, False
+    if out and content_key(out) == content_key(t):
+        return out, False
+    return t, True
+
+
+def render_text(t, punct=None, use_itn=True, punct_mode="keep",
+                merge_terms=True, fix_case=True):
+    """ITN -> 标点 -> 排版整形。render() 的纯函数版本(不碰 live 状态,好测)。"""
+    if not t:
+        return t
+    # 顺序有讲究:先去重复循环,再做 ITN 和标点 ——
+    # 让标点模型看到的是干净文本,不然它会给打转的片段也加标点。
+    t = repair_mod.repair(t)
+    if use_itn:
+        t = itn_mod.normalize(t)
+    t, dropped = punctuate_guarded(punct, t)
+    if dropped:
+        note("[sidecar] 标点模型丢了正文,本句退回未加标点的文本")
+    t = polish_mod.polish(t)
+    # 排版整形放最后:标点已经落定,才轮到「标点转空格」和「英文拆字合并」。
+    # 反过来做的话,标点模型会看到被抹掉标点的句子,断句会变差。
+    if merge_terms or punct_mode != "keep" or fix_case:
+        t = textfix_mod.normalize(t, punct_mode, fix_case=fix_case)
+    return t
 
 
 def main():
@@ -190,21 +263,8 @@ def main():
         if not t:
             return "", 0.0
         t0 = time.perf_counter()
-        # 顺序有讲究：先去重复循环，再做 ITN 和标点 ——
-        # 让标点模型看到的是干净文本，不然它会给打转的片段也加标点。
-        t = repair_mod.repair(t)
-        if use_itn:
-            t = itn_mod.normalize(t)
-        if punct is not None:
-            try:
-                t = punct.add_punctuation(t)
-            except Exception:
-                pass
-        t = polish_mod.polish(t)
-        # 排版整形放最后：标点已经落定，才轮到「标点转空格」和「英文拆字合并」。
-        # 反过来做的话，标点模型会看到被抹掉标点的句子，断句会变差。
-        if live["merge_terms"] or live["punct_mode"] != "keep" or live["fix_case"]:
-            t = textfix_mod.normalize(t, live["punct_mode"], fix_case=live["fix_case"])
+        t = render_text(t, punct, use_itn,
+                        live["punct_mode"], live["merge_terms"], live["fix_case"])
         return t, (time.perf_counter() - t0) * 1000.0
 
     emit({

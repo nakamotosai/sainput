@@ -147,8 +147,8 @@ mod tests {
         assert_eq!(w.want("下一句"), "下一句");
     }
 
-    /// 前缀变化不能影响"公共前缀"的正确性：
-    /// 从" 你好"到" 你好啊" → 公共前缀 3 个字（空格+你好），只需补"啊"。
+    /// 前缀变化不能影响"公共前缀"的正确性:
+    /// 从" 你好"到" 你好啊" → 公共前缀 3 个字(空格+你好),只需补"啊"。
     #[test]
     fn prefix_participates_in_common_prefix() {
         let mut w = StreamWriter::new(8, true);
@@ -157,6 +157,32 @@ mod tests {
         let b = w.want("你好啊");
         assert_eq!(common_prefix_chars(&a, &b), 3);
         assert_eq!(a.chars().count() - common_prefix_chars(&a, &b), 0); // 不用退格
+    }
+
+    /// 安全阀放弃修正时,**记账必须留在屏幕上那一版**。
+    ///
+    /// 两条路径都不许把 `injected` 推到屏幕前面 —— 一旦对不上,后面每次退格都是
+    /// 照「屏幕上有这些字」算的,算出来的退格数会删掉用户真正的文字。
+    ///
+    /// 这两次调用的差值都**故意超过**安全阀(final 32 / 流式 `max_backspace` 8),
+    /// 所以都走「放弃」分支 —— 不会真的 SendInput,测试里可以放心跑。
+    #[test]
+    fn giveup_keeps_bookkeeping_on_screen() {
+        let mut w = StreamWriter::new(8, true);
+        // 屏幕上已经有一句(测试里直接摆好状态,不真的敲键盘)。
+        // 必须比 final 的 32 字上限长,否则就会走进「真的退格重打」那条路。
+        w.injected =
+            "已经上屏的这一句 hello world 后面还有一大截没说完还在继续说下去".to_string();
+        assert!(w.injected.chars().count() > 32);
+        let screen = w.injected.clone();
+
+        // final 超限(> 32):整笔放弃,记账不动
+        w.finalize("收口", 32).unwrap();
+        assert_eq!(w.injected, screen, "final 放弃后 injected 必须还是屏幕上那一版");
+
+        // 流式超限(> max_backspace 8):同样是放弃且记账不动
+        w.update("收口").unwrap();
+        assert_eq!(w.injected, screen, "流式放弃后 injected 必须还是屏幕上那一版");
     }
 }
 
@@ -265,8 +291,14 @@ impl StreamWriter {
         let common = common_prefix_chars(&self.injected, &want);
         let bs = self.injected.chars().count().saturating_sub(common);
         if bs > max_bs {
-            // 超限：不动屏幕，只更新内部状态，避免误删
-            self.injected = want;
+            // 超限:整笔放弃,**屏幕和记账都不动**。
+            //
+            // 这里原来会 `self.injected = want` —— 于是记账跑到了屏幕前面
+            // (记账说屏幕上是新文本,屏幕上其实还是旧文本)。之后每一次退格都是
+            // 照着「屏幕上有这些字」算的,算出来的退格数就会删掉用户真正的文字;
+            // 真机上表现为「说英文的那一句整段不见了」。
+            // 宁可这一笔不生效(屏幕留着上一版假设,反正下一句会 reset),
+            // 也不能让记账和屏幕对不上。
             return Ok(());
         }
         if bs > 0 {
