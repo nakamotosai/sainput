@@ -762,6 +762,10 @@ fn handle_msg(m: Msg, wr: &mut inject::StreamWriter, ui: &Ui) {
                 }
             } else {
                 // 空 final 绝不能当成「把屏幕清掉」——只更新内部状态。
+                // 组合态是例外:它本来就还没上屏,挂着不放会卡住那边的按键。
+                if text.is_empty() {
+                    wr.cancel_buffer();
+                }
                 if !text.is_empty() {
                     if let Err(e) = wr.finalize(&text, ui.max_bs * 4) {
                         eprintln!("[inject] final 失败: {e}");
@@ -793,7 +797,11 @@ fn handle_msg(m: Msg, wr: &mut inject::StreamWriter, ui: &Ui) {
         }
         Msg::Rendered { .. } => {}
         Msg::ResetAck => {}
-        Msg::Error { msg } => eprintln!("[asr] 错误: {msg}"),
+        Msg::Error { msg } => {
+            // 识别这一句失败了、也不会有 final:组合态必须现在收掉(见 cancel_buffer)。
+            wr.cancel_buffer();
+            eprintln!("[asr] 错误: {msg}");
+        }
     }
 }
 

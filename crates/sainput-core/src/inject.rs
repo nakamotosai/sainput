@@ -742,6 +742,24 @@ mod tests {
         assert_eq!(rec.commits().len(), 1, "重复 final 不许重复提交(等于说了一遍进去两遍)");
     }
 
+    /// 流水线中途结束(识别报错 / 空定稿)时也要收掉组合态,但不能动记账。
+    #[test]
+    fn cancel_buffer_only_drops_the_composition() {
+        let mut w = StreamWriter::new(8, true);
+        let rec = Recorder::default();
+        w.set_mode(KeyMode::Pebrel);
+        w.set_composer(Some(Box::new(rec.clone())));
+        w.update("还没说完就被打断的一句").unwrap();
+        w.cancel_buffer();
+        assert_eq!(rec.calls().last().map(String::as_str), Some(""), "组合态要被收掉");
+        // 按键模式的记账不许被这条路径碰到
+        w.set_mode(KeyMode::Keys);
+        w.injected = "屏幕上已经有的一句".into();
+        w.cancel_buffer();
+        assert_eq!(w.injected, "屏幕上已经有的一句", "取消组合态不许动按键模式的记账");
+        assert_eq!(rec.calls().len(), 2, "没有挂着的组合串时不再多发");
+    }
+
     /// 换句必须把上一版组合串从应用里清掉:它挂着的时候,应用是把按键让给它的。
     #[test]
     fn compose_mode_cancels_the_buffer_on_reset() {
@@ -821,6 +839,25 @@ impl StreamWriter {
     /// 组合态需要一个真客户端(每句重解析目标窗口与活动 pane)。
     pub fn set_composer(&mut self, composer: Option<Box<dyn crate::pebrel::Composer>>) {
         self.composer = composer;
+    }
+
+    /// 只收组合态:**不碰** `injected` 记账。
+    ///
+    /// 用在「这一句没有定稿,但流水线已经结束」的路径上(识别报错、空定稿):
+    /// 组合串挂在应用里的时候,那边是把按键让给它的 —— 留着不放,用户会觉得
+    /// 键盘坏了。丢掉的只是「应用里还没提交的那一版」,屏幕上真正上过的东西不动。
+    pub fn cancel_buffer(&mut self) {
+        if self.composed.is_empty() {
+            return;
+        }
+        self.composed.clear();
+        if let Some(composer) = self.composer.as_mut() {
+            // 取消失败没有第二个补救动作(下一句开始时 reset 还会清一次),
+            // 所以这里只记一笔,不把整条路径判成失败。
+            if let Err(e) = composer.set("") {
+                eprintln!("[inject] 取消组合态失败: {e}");
+            }
+        }
     }
 
 
