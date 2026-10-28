@@ -104,11 +104,24 @@ fn call(
         serde_json::from_str(&line).context("Pebrel 响应不是 JSON")?;
     if response.get("ok").and_then(|v| v.as_bool()) != Some(true) {
         let error = response.get("error").cloned().unwrap_or(serde_json::Value::Null);
-        let code = error.get("code").and_then(|c| c.as_str()).unwrap_or("unknown");
-        let message = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
-        bail!("Pebrel 拒绝了 {method}:{code} {message}");
+        return Err(refusal(method, &error));
     }
     Ok(response.get("result").cloned().unwrap_or(serde_json::Value::Null))
+}
+
+/// 把控制面的错误信封翻成一句用户能照做的话(纯函数,好测)。
+///
+/// 最可预见的一种是「这台 Pebrel 还没有 `pane.compose`」(旧版本):用户看到的应该
+/// 是「换一版 Pebrel」,而不是一句协议错误 —— 后者会让人以为是自己配错了。
+fn refusal(method: &str, error: &serde_json::Value) -> anyhow::Error {
+    let code = error.get("code").and_then(|c| c.as_str()).unwrap_or("unknown");
+    let message = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
+    if code == "method_not_found" && method == "pane.compose" {
+        return anyhow::anyhow!(
+            "这台 Pebrel 还没有组合态缓冲层(pane.compose):换一个带它的构建,或把配置改回 `ime_wmchar = on:pebrel.exe`"
+        );
+    }
+    anyhow::anyhow!("Pebrel 拒绝了 {method}:{code} {message}")
 }
 
 impl PebrelComposer {
@@ -199,5 +212,29 @@ impl Composer for PebrelComposer {
 
     fn commit(&mut self, text: &str) -> Result<()> {
         self.send(text, true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refusal_explains_the_version_gap_instead_of_a_protocol_error() {
+        let old = serde_json::json!({
+            "code": "method_not_found",
+            "message": "runtime API method \"pane.compose\" does not exist"
+        });
+        let text = refusal("pane.compose", &old).to_string();
+        assert!(text.contains("还没有组合态缓冲层"), "{text}");
+        assert!(text.contains("ime_wmchar"), "要告诉用户怎么退回去:{text}");
+
+        let other = serde_json::json!({ "code": "target_not_found", "message": "pane 9 does not exist" });
+        let text = refusal("pane.compose", &other).to_string();
+        assert!(text.contains("target_not_found") && text.contains("pane 9 does not exist"), "{text}");
+
+        // 别的哪个方法报 method_not_found,都不该套用这条专用提示
+        let text = refusal("pane.read", &old).to_string();
+        assert!(!text.contains("还没有组合态缓冲层"), "{text}");
     }
 }
