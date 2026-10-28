@@ -233,12 +233,27 @@ powershell -ExecutionPolicy Bypass -File scripts\fetch_models.ps1           # �
 | 说到英文时整句被跳过 / 删掉 | `P` 行的**渲染文本**比上一行短、`[raw]` 却是完整的 | 已有过:标点模型吃掉正文(2026-10-28 修,`tools/test_punct_guard.py`);控制台/日志里会有一行 `标点模型丢了正文`。还在发生就把那行 `[raw]` 贴进 issue |
 | 说英文时弹出输入法的候选面板、字进不去 | 目标窗口所在线程在用输入法(水杉 / 微软拼音 / MS-IME) | 输入法把注入的字母当成它自己的输入了(2026-10-28 加 `ime_wmchar` 兜底)。先试 `ime_wmchar = on:那个程序.exe`;不行的窗口是 TSF 上屏要解决的(M3)。临时办法:把那个窗口的输入法切到「直接输入 / 英文」 |
 | 走消息通道的窗口里字被插到中间 / 同一句反复叠加 | 该窗口是不是混了两条通道(SendInput + PostMessage),或者退格被忽略 | 2026-10-28 已修:消息通道**整段一条路**(字符 WM_CHAR、退格 WM_KEYDOWN/UP VK_BACK)且不再混键盘注入。还乱的话把该程序换成 `ime_wmchar = nostream:<exe>`(整句一次投递),并把那段日志给我 |
-| Pebrel 里说英文还是被输入法收走 / 想「边说边改」 | 注入按键这条路在终端里只能逐字上屏+退格 | 换 `ime_wmchar = pebrel`(需要 Pebrel 2.3.2+):一个按键都不发,整句先落在它自己的组合态缓冲层里反复改写,定稿才提交。日志里会有 `上屏改用 Pebrel 组合态缓冲层`;失败会写明原因(前台不是 Pebrel / 读不到 runtime.port / 目标 pane 找不到) |
+| Pebrel 里说英文还是被输入法收走 / 想「边说边改」 | 注入按键这条路在终端里只能逐字上屏+退格 | 换 `ime_wmchar = pebrel`(需要带 `pane.compose` 的 Pebrel:上游还没发布,本机用补丁版,见下面一节):一个按键都不发,整句先落在它自己的组合态缓冲层里反复改写,定稿才提交。日志里会有 `上屏改用 Pebrel 组合态缓冲层`;失败会写明原因(前台不是 Pebrel / 读不到 runtime.port / 目标 pane 找不到) |
 | 长句重复打转 | `[raw]` 里就重复 | 模型固有行为，换档见 [`model-selection.md`](model-selection.md) |
 | 中英混说丢词 | — | 试 `-480ms` 档 |
 
-`--no-stream`（`stream = false`）**当前版本不可用**：它实际一个字都不打。
+`--no-stream`(`stream = false`)**当前版本不可用**:它实际一个字都不打。
 需要逐字上屏就保持默认 `stream = true`。
+
+### 组合态上屏(`ime_wmchar = pebrel`)依赖的是打过补丁的 Pebrel
+
+`pane.compose` 是我们给 Pebrel 加的协议方法(和 `pane.paste` 同一族):文本先进应用
+自己的输入缓冲,可以无限次**整段改写**,定稿才作为**一次写入**提交给 PTY —— 所以终端
+和 shell 历史里看不到任何中间态,也不需要退格算术。**上游还没发布**这个方法,本机用的是
+打过补丁的构建,维护说明在 [`../tools/pebrel/README.md`](../tools/pebrel/README.md)。
+
+要知道两件事:
+
+- 生效时会有一行 `[sainput] 上屏改用 Pebrel 组合态缓冲层:…`
+- **Pebrel 被官方更新覆盖后这条能力就没了**:说一句会在日志/控制台看到
+  `这台 Pebrel 还没有组合态缓冲层(pane.compose)`。这时把 `ime_wmchar` 改回
+  `on:pebrel.exe` 就立刻回到老路;要补回组合态按 `tools/pebrel/README.md` 的三步
+  (关掉 Pebrel → 覆盖 `pebrel.exe` → 重开),sainput 这边一个字都不用改。
 
 ---
 

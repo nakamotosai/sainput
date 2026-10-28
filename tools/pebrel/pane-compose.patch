@@ -1,0 +1,725 @@
+From cf7fe6fa2e20211252809ceb93330068b0aa3567 Mon Sep 17 00:00:00 2001
+From: caisiyang <caisiyang@gmail.com>
+Date: Wed, 28 Oct 2026 17:35:26 +0900
+Subject: [PATCH] =?UTF-8?q?feat(runtime):=20pane.compose=20=E2=80=94?=
+ =?UTF-8?q?=E2=80=94=20=E8=BE=93=E5=85=A5=E9=A9=B1=E5=8A=A8=E7=94=A8?=
+ =?UTF-8?q?=E7=9A=84=E7=BB=84=E5=90=88=E6=80=81=E7=BC=93=E5=86=B2=E5=B1=82?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+给「一句话在说完之前一直在改」的输入来源(听写/ASR、任何按帧产出的驱动)一条
+**不产生按键**的上屏路:文本先只进 pane 的组合串(与输入法 preedit 同一条渲染
+路径,光标处可见),可以按新假设无限次整体改写;`commit` 时才清掉缓冲层、把整段
+作为一次写入交给 PTY。
+
+动因(真机语料 1372 帧):94.8% 的定稿只是「上一帧往后加」,但 5.0% 会回头改句子
+中间的词、0.2% 会变短。按键那条路只能逐字上屏 + 退格补打:中间态是真的落进别人
+窗口的输入副作用,每次改写都在和目标程序的输入栈博弈,半句被改残的文本还会留在
+终端和它的历史里。而进程内那套 preedit 生命周期(`marked_text` /
+`replace_text_in_range` ⇄ `write_user_text`)本来就是这个形状,只是进程外**够不着**:
+`ImmGetContext` 对另一个进程的窗口返回 NULL。
+
+改动:
+- `runtime_api`:方法 `pane.compose`(`text` + `commit` 默认 false),能力表与
+  `pane.compose.buffer` 特性;`text` 与 `pane.paste` 同一套字节边界校验,提交才写 PTY。
+- `gpui_shell/workspace/residency.rs` + `terminal/view/runtime.rs`:复用既有 pane 输入
+  管线(目标解析、远端 pane 护栏、typed action 回执),实现 set/commit/cancel 三种语义;
+  组合态期间该 pane 的按键处理让位给组合串(与输入法组合态一致),因此 cancel 是合同
+  的一部分。
+- 经典窗口无组合串渲染层:`commit=false` 明确回 `unsupported_target`,不假装有缓冲层。
+- `docs/runtime-api-v1.schema.json` / `docs/runtime-control-api.md`:方法、参数与语义。
+- `scripts/conformance/cases/compose.py`:合同级验收 —— 组合态不进 Grid、改写不留痕、
+  提交只写一次、取消不留东西、控制序列被拒且不进 Grid。
+- 决策记录:`architecture/notes/nebula_app/runtime_api/2026-10-28-compose-buffer-for-input-drivers.md`。
+
+刻意不做 CLI 动词:调用方是按帧调用的输入驱动,不是「一轮一条命令」的模型入口;
+资源+动词那层仍留给可发现性,这个方法只走协议。
+---
+ ...-10-28-compose-buffer-for-input-drivers.md | 98 +++++++++++++++++++
+ docs/runtime-api-v1.schema.json               | 42 ++++++++
+ docs/runtime-control-api.md                   | 14 +++
+ nebula_app/src/event/runtime_control.rs       | 14 +++
+ .../src/gpui_shell/terminal/view/runtime.rs   | 59 +++++++++++
+ .../src/gpui_shell/workspace/residency.rs     | 30 ++++++
+ .../src/gpui_shell/workspace/windowing.rs     |  2 +
+ nebula_app/src/runtime_api.rs                 | 12 +++
+ nebula_app/src/runtime_api/command.rs         | 27 +++++
+ nebula_app/src/runtime_api/tests.rs           | 45 +++++++++
+ nebula_app/src/runtime_api/transport.rs       |  2 +
+ nebula_app/src/window_context/runtime.rs      | 19 ++++
+ scripts/conformance/cases/compose.py          | 80 +++++++++++++++
+ scripts/conformance/harness.py                | 16 +++
+ scripts/conformance/run.py                    |  1 +
+ 15 files changed, 461 insertions(+)
+ create mode 100644 architecture/notes/nebula_app/runtime_api/2026-10-28-compose-buffer-for-input-drivers.md
+ create mode 100644 scripts/conformance/cases/compose.py
+
+diff --git a/architecture/notes/nebula_app/runtime_api/2026-10-28-compose-buffer-for-input-drivers.md b/architecture/notes/nebula_app/runtime_api/2026-10-28-compose-buffer-for-input-drivers.md
+new file mode 100644
+index 0000000..3bc6c25
+--- /dev/null
++++ b/architecture/notes/nebula_app/runtime_api/2026-10-28-compose-buffer-for-input-drivers.md
+@@ -0,0 +1,98 @@
++# Composition buffer for text-input drivers (`pane.compose`)
++
++## Status
++
++Implemented; validated by `scripts/conformance/cases/compose.py` on Windows.
++
++## Context
++
++A text-input driver (dictation, or any producer whose sentence is still being revised as
++it arrives) can only reach a pane through keystrokes or through a program-to-program API.
++Keystrokes force the producer to commit a partly-correct hypothesis into the terminal and
++then repair it with backspaces. On a real dictation corpus of 1372 frames, 94.8% of the
++finals only extended the previous frame, but 5.0% rewrote words in the middle of the
++sentence and 0.2% shortened it: correction is not an edge case, it happens several times
++per sentence.
++
++The application already implements the shape such a driver needs — the IME composition
++path: `marked_text` is rendered at the cursor as a preedit, and committing clears it and
++writes the result to the PTY as a single write. Nothing outside the process can drive it,
++because `ImmGetContext` for another process's window returns NULL.
++
++## Evidence
++
++- `docs/runtime-control-api.md` — the method table has no way to express "hold this text
++  in a buffer and write it later"; `pane.prompt` and `pane.paste` write immediately.
++- [`view.rs`](../../../../nebula_app/src/gpui_shell/terminal/view.rs) — `marked_text`,
++  `marked_text_range`, `replace_and_mark_text_in_range` and `replace_text_in_range`
++  already implement the preedit lifecycle, including "clear the preedit, then write the
++  committed string once" and feeding the command-line mirror.
++- [`view/runtime.rs`](../../../../nebula_app/src/gpui_shell/terminal/view/runtime.rs) and
++  [`workspace/residency.rs`](../../../../nebula_app/src/gpui_shell/workspace/residency.rs)
++  — the existing pane input methods already resolve window/pane, enforce the remote-pane
++  rule and reply with a typed `action` result; the new method reuses that plumbing.
++- `tools/probe_ime.rs` and an out-of-process probe: `ImmGetContext` against another
++  process's window returns NULL, so an external tool cannot address that process's IME
++  context to set a composition string.
++
++## Decision
++
++Add one runtime method, `pane.compose`:
++
++- `text` with `commit=false` (default) sets or replaces the pane's composition string.
++  Nothing is written to the PTY; the text renders through the same path as an IME preedit.
++  An empty string cancels the composition.
++- `text` with `commit=true` clears the buffer and writes the whole string to the PTY as
++  one write — the path an IME uses for a committed result.
++- `text` passes the same byte boundary as `pane.paste`, and local content still may not be
++  sent automatically to a remote (SSH) pane.
++- The method is declared in `runtime.describe` (`pane.compose`, feature
++  `pane.compose.buffer`) so clients probe instead of guessing.
++
++## Rejected alternatives
++
++- **Streaming keystrokes plus backspace repairs** (what an external driver can do today):
++  intermediate states become real input side effects in someone else's window, every
++  repair competes with the target's input stack, and the half-corrected sentence is
++  visible in the terminal and in its shell history.
++- **Setting the target process's composition string from outside**: not possible — a
++  cross-process `ImmGetContext` returns NULL, so the composition must be created in the
++  target process.
++- **Being an IME (TSF text service)**: it would compose in-process, but it hijacks the
++  user's active input method for the duration, needs installation and registration, and is
++  far heavier than an API the application can expose about itself.
++- **A CLI verb (`pebrel pane compose`)**: the caller is a driver that calls this per frame,
++  not a model issuing one command per turn. The resource+verb surface stays for
++  discoverability; this method is deliberately protocol-only and documented as such.
++
++## Consequences
++
++- While a composition is set, that pane's key handling defers to the composition, exactly
++  as it does for an IME composition. Callers must commit or cancel, which is why cancel is
++  part of the contract rather than an afterthought.
++- `pane.compose` needs the GPUI shell for its rendering. The legacy shell returns
++  `unsupported_target` for `commit=false` instead of silently downgrading to a paste.
++- Composition is not a byte-injection bypass: the validation and the control-sequence
++  boundary are the same as `pane.paste`.
++
++## Validation
++
++- `cargo test -p nebula`: parse and validation tests in
++  [`runtime_api/tests.rs`](../../../../nebula_app/src/runtime_api/tests.rs) cover the
++  commit flag, empty-text cancel and the byte boundary.
++- `python scripts/conformance/run.py --case compose` against a freshly built Windows
++  binary: the composition stays off the Grid, rewriting leaves no trace, commit writes
++  the text exactly once, cancel leaves nothing behind, and a control sequence is rejected
++  without reaching the Grid.
++- Manual: composing into a live pane shows the preedit at the cursor; committing inserts
++  the final text once.
++
++## Supersedes
++
++None.
++
++## Revisit when
++
++A TSF text service lands (in-process composition for applications other than this one), or
++a second consumer needs composition semantics other than "replace the whole buffer, commit
++once".
+diff --git a/docs/runtime-api-v1.schema.json b/docs/runtime-api-v1.schema.json
+index 4ec141b..a60e5cd 100644
+--- a/docs/runtime-api-v1.schema.json
++++ b/docs/runtime-api-v1.schema.json
+@@ -81,6 +81,7 @@
+             "pane.resize",
+             "pane.prompt",
+             "pane.paste",
++            "pane.compose",
+             "pane.read",
+             "pane.procs",
+             "pane.send_key",
+@@ -491,6 +492,22 @@
+             }
+           }
+         },
++        {
++          "if": {
++            "properties": {
++              "method": {
++                "const": "pane.compose"
++              }
++            }
++          },
++          "then": {
++            "properties": {
++              "params": {
++                "$ref": "#/$defs/compose_params"
++              }
++            }
++          }
++        },
+         {
+           "if": {
+             "properties": {
+@@ -1652,6 +1669,31 @@
+       },
+       "additionalProperties": false
+     },
++    "compose_params": {
++      "type": "object",
++      "required": [
++        "pane_id",
++        "text"
++      ],
++      "properties": {
++        "window_id": {
++          "$ref": "#/$defs/nullable_window_id"
++        },
++        "pane_id": {
++          "type": "integer",
++          "minimum": 0
++        },
++        "text": {
++          "type": "string",
++          "maxLength": 32768
++        },
++        "commit": {
++          "type": "boolean",
++          "default": false
++        }
++      },
++      "additionalProperties": false
++    },
+     "read_params": {
+       "type": "object",
+       "required": [
+diff --git a/docs/runtime-control-api.md b/docs/runtime-control-api.md
+index a09a766..bf7b3c8 100644
+--- a/docs/runtime-control-api.md
++++ b/docs/runtime-control-api.md
+@@ -184,6 +184,7 @@ Pane ID 当前在 Window 内稳定，而不是进程内全局唯一。存在多
+ | `pane.resize` | 设置目标 Pane 在直接父分屏中的占比 | `window_id?`, `pane_id`, `ratio` |
+ | `pane.prompt` | 写入一行纯文本，可追加 Enter | `window_id?`, `pane_id`, `text`, `submit` |
+ | `pane.paste` | 通过 bracketed paste 写入有界 UTF-8 文本 | `window_id?`, `pane_id`, `text`, `submit` |
++| `pane.compose` | 把文本放进组合态缓冲层(可无限次改写,不碰 PTY);`commit` 时整段一次上屏 | `window_id?`, `pane_id`, `text`, `commit?` |
+ | `pane.read` | 从真实终端 Grid 尾部读取最近逻辑行 | `window_id?`, `pane_id`, `lines` |
+ | `pane.procs` | 读取本地 PTY shell 为根的真实进程树 | `window_id?`, `pane_id` |
+ | `pane.send_key` | 按当前终端模式编码受限的命名控制键 | `window_id?`, `pane_id`, `key`, `modifiers?`, `repeat?` |
+@@ -202,6 +203,19 @@ Pane ID 当前在 Window 内稳定，而不是进程内全局唯一。存在多
+ 升级后的客户端带 `shell` 请求旧运行时会在解析阶段被拒（`invalid_params`），因此升级后
+ 需要重启驻留实例。
+ 
++`pane.compose` 是**组合态**(输入法 preedit)那条路径的入口,给的是「**什么时候**写」的控制:
++`commit` 缺省为假时,`text` 只进该 pane 的组合串 —— 走的就是输入法组合串同一条渲染路径,
++屏幕上能看到它在光标处,但**一个字节都没有进 PTY**;可以按新的假设反复改写,改写不产生
++按键、不产生退格,因此也不会有半句被改残的文本留在屏幕或 shell 历史里。`commit=true` 时
++清掉组合串,把整段作为**一次**写入交给 PTY(与输入法提交 `GCS_RESULTSTR` 同一条路)。
++`text` 为空且不提交 = 取消组合。
++
++这条方法服务于输入驱动(听写、语音输入、任何「一句话在说完之前一直在改」的来源),不是
++模型入口,因此没有 `pebrel pane` 动词别名:它的往返频率按帧算,不是按次算。组合态期间该
++pane 的按键处理会让位给组合串(与输入法组合态一致),所以调用方必须负责提交或取消,不能
++把组合串挂在那里不管。`text` 与 `pane.paste` 走同一套字节边界校验(提交会进 PTY);本地内容
++同样不得自动流向 SSH 目标。
++
+ `pane.paste` 专用于确实需要保留换行的输入：只接受 UTF-8，限制 32 KiB，拒绝 ESC、NUL
+ 与危险控制字符，并要求目标终端已启用 bracketed-paste。SSH Pane 明确拒绝本地文件/文本
+ 转发。资源 CLI 可从字面文本、`--stdin` 或 `--from-file` 读取，但协议边界始终只接收验证后的
+diff --git a/nebula_app/src/event/runtime_control.rs b/nebula_app/src/event/runtime_control.rs
+index 04ea94f..52ee94f 100644
+--- a/nebula_app/src/event/runtime_control.rs
++++ b/nebula_app/src/event/runtime_control.rs
+@@ -293,6 +293,20 @@ impl Processor {
+                     "input": "paste"
+                 }))
+             },
++            RuntimeCommand::Compose { window_id, pane_id, text, commit } => {
++                let id = self.runtime_target_window(*window_id, Some(*pane_id))?;
++                self.windows.get_mut(&id).expect("resolved runtime window exists").runtime_compose(
++                    *pane_id,
++                    text.clone(),
++                    *commit,
++                )?;
++                self.runtime_result(serde_json::json!({
++                    "window_id": u64::from(id),
++                    "pane_id": pane_id,
++                    "committed": commit,
++                    "input": "compose"
++                }))
++            },
+             RuntimeCommand::ReadPane { window_id, pane_id, lines, screen } => {
+                 let id = self.runtime_target_window(*window_id, Some(*pane_id))?;
+                 let read = self
+diff --git a/nebula_app/src/gpui_shell/terminal/view/runtime.rs b/nebula_app/src/gpui_shell/terminal/view/runtime.rs
+index 3dec1ac..cd04627 100644
+--- a/nebula_app/src/gpui_shell/terminal/view/runtime.rs
++++ b/nebula_app/src/gpui_shell/terminal/view/runtime.rs
+@@ -674,6 +674,65 @@ impl TerminalView {
+         Ok(())
+     }
+ 
++    /// `pane.compose`:把文本放进**组合态缓冲层**(与输入法 preedit 同一条渲染
++    /// 路径),完全不碰 PTY;`commit` 时清掉缓冲层,把整段作为**一次**写入交给 PTY。
++    ///
++    /// 为什么要有这个东西:听写/ASR 的一句话在说完之前一直在被改写(实测语料里
++    /// 约 5% 的帧会回头改前面的词)。逐字上屏 + 退格补打能把结果修对,但中间态是
++    /// 真实的按键副作用,而且每一次改写都在和应用的输入栈博弈。组合串把中间态放在
++    /// **应用自己的 preedit** 里:改写零成本、零副作用,屏幕上永远不会出现半句被改
++    /// 残的文本;定稿只写一次 PTY。
++    ///
++    /// 语义边界:
++    /// - 空 `text` + `commit=false` = 取消组合(与 IME 清除同义);
++    /// - 组合态期间该 pane 的按键处理会让位给组合串(与输入法组合态一致),
++    ///   所以调用方必须负责提交或取消,不能把组合串挂在那里不管;
++    /// - 本地内容同样不得自动流向 SSH 目标(`ensure_local_context_allowed`)。
++    pub fn runtime_compose(
++        &mut self,
++        text: String,
++        commit: bool,
++        origin: InputOrigin,
++        cx: &mut Context<Self>,
++    ) -> Result<(), crate::runtime_api::ApiError> {
++        self.ensure_local_context_allowed(origin)?;
++        if let Some(reason) = &self.exited {
++            return Err(crate::runtime_api::ApiError::new(
++                "invalid_state",
++                format!("pane has exited: {reason}"),
++            ));
++        }
++        if self.answer_reader.is_some() {
++            return Err(crate::runtime_api::ApiError::new(
++                "invalid_state",
++                "pane is showing a question panel",
++            ));
++        }
++        self.ensure_runtime_readable()?;
++        if self.session.is_none() {
++            return Err(crate::runtime_api::ApiError::new(
++                "runtime_unavailable",
++                "terminal session is unavailable for this pane",
++            ));
++        }
++
++        if commit {
++            // 与输入法的 GCS_RESULTSTR 同一条路:先清组合串,再一次性写入。
++            self.marked_text = None;
++            if !text.is_empty() {
++                if !self.term_mode().contains(TermMode::ALT_SCREEN) {
++                    crate::display::nebula_input_text(&mut self.suggest, &text);
++                }
++                self.write_user_text(text.clone(), false, text.as_bytes().to_vec(), cx);
++            }
++        } else {
++            self.marked_text = if text.is_empty() { None } else { Some(text) };
++        }
++        self.restart_cursor_blink(cx);
++        cx.notify();
++        Ok(())
++    }
++
+     /// 三层护栏里唯一强制的那一层。
+     ///
+     /// 另两层都能被绕过，所以都只是护栏：第一层是便利层，Send-to-Chat 的目标
+diff --git a/nebula_app/src/gpui_shell/workspace/residency.rs b/nebula_app/src/gpui_shell/workspace/residency.rs
+index b3cd1d4..c5814f4 100644
+--- a/nebula_app/src/gpui_shell/workspace/residency.rs
++++ b/nebula_app/src/gpui_shell/workspace/residency.rs
+@@ -175,6 +175,7 @@ impl NebulaWorkspace {
+             | RuntimeCommand::Split { .. }
+             | RuntimeCommand::Prompt { .. }
+             | RuntimeCommand::Paste { .. }
++            | RuntimeCommand::Compose { .. }
+             | RuntimeCommand::SendKey { .. }
+             | RuntimeCommand::Run { .. }
+             | RuntimeCommand::AgentStart { .. }
+@@ -571,6 +572,35 @@ impl NebulaWorkspace {
+                     cx,
+                 )
+             },
++            RuntimeCommand::Compose { window_id, pane_id, text, commit } => {
++                self.runtime_window_requested(*window_id)?;
++                let Some(tab_ix) = self.tab_of_pane(*pane_id) else {
++                    return Err(ApiError::new(
++                        "target_not_found",
++                        format!("pane {pane_id} does not exist"),
++                    ));
++                };
++                let view = match self.tabs.get(tab_ix) {
++                    Some(WorkspaceTab::Terminal { panes, .. }) => {
++                        panes.iter().find(|pane| pane.id == *pane_id).map(|pane| pane.view.clone())
++                    },
++                    _ => None,
++                }
++                .expect("tab_of_pane resolved a terminal pane");
++                view.update(cx, |view, cx| {
++                    view.runtime_compose(text.clone(), *commit, InputOrigin::Program, cx)
++                })?;
++                self.runtime_result(
++                    json!({
++                        "window_id": self.runtime_window_id,
++                        "pane_id": pane_id,
++                        "committed": commit,
++                        "input": "compose"
++                    }),
++                    window,
++                    cx,
++                )
++            },
+             RuntimeCommand::ReadPane { window_id, pane_id, lines, screen } => {
+                 self.runtime_window_requested(*window_id)?;
+                 let Some(tab_ix) = self.tab_of_pane(*pane_id) else {
+diff --git a/nebula_app/src/gpui_shell/workspace/windowing.rs b/nebula_app/src/gpui_shell/workspace/windowing.rs
+index db15c41..8c00925 100644
+--- a/nebula_app/src/gpui_shell/workspace/windowing.rs
++++ b/nebula_app/src/gpui_shell/workspace/windowing.rs
+@@ -183,6 +183,7 @@ fn runtime_window_policy(command: &RuntimeCommand) -> RuntimeWindowPolicy {
+         | RuntimeCommand::ResizePane { .. }
+         | RuntimeCommand::Prompt { .. }
+         | RuntimeCommand::Paste { .. }
++        | RuntimeCommand::Compose { .. }
+         | RuntimeCommand::ReadPane { .. }
+         | RuntimeCommand::Procs { .. }
+         | RuntimeCommand::SendKey { .. }
+@@ -705,6 +706,7 @@ fn route_entry(command: &RuntimeCommand, cx: &mut App) -> Result<WindowEntry, Ap
+         | RuntimeCommand::MoveTab { window_id, .. } => (*window_id, None),
+         RuntimeCommand::Prompt { window_id, pane_id, .. }
+         | RuntimeCommand::Paste { window_id, pane_id, .. }
++        | RuntimeCommand::Compose { window_id, pane_id, .. }
+         | RuntimeCommand::ClosePane { window_id, pane_id }
+         | RuntimeCommand::ZoomPane { window_id, pane_id, .. }
+         | RuntimeCommand::ResizePane { window_id, pane_id, .. }
+diff --git a/nebula_app/src/runtime_api.rs b/nebula_app/src/runtime_api.rs
+index e126c82..a13d95b 100644
+--- a/nebula_app/src/runtime_api.rs
++++ b/nebula_app/src/runtime_api.rs
+@@ -831,6 +831,18 @@ pub enum RuntimeCommand {
+         text: String,
+         submit: bool,
+     },
++    /// 输入法风格的**组合态缓冲层**:文本先只进组合串(完全不碰 PTY),可以无限次
++    /// 改写;`commit` 为真时清掉缓冲层、把整段一次写进 PTY。
++    ///
++    /// 与 `Paste` 的区别不是「怎么写」而是「**什么时候**写」:听写/ASR 的自然形态是
++    /// 边说话边改这一句,逐字上屏再退格会把中间态留在屏幕上,也会在别人的窗口里
++    /// 产生一串按键副作用。组合串把这个中间态放在应用的 preedit 里,改写零成本。
++    Compose {
++        window_id: Option<u64>,
++        pane_id: u64,
++        text: String,
++        commit: bool,
++    },
+     ReadPane {
+         window_id: Option<u64>,
+         pane_id: u64,
+diff --git a/nebula_app/src/runtime_api/command.rs b/nebula_app/src/runtime_api/command.rs
+index e4bf1c5..0ac8591 100644
+--- a/nebula_app/src/runtime_api/command.rs
++++ b/nebula_app/src/runtime_api/command.rs
+@@ -91,6 +91,19 @@ struct PasteParams {
+     submit: bool,
+ }
+ 
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct ComposeParams {
++    #[serde(default)]
++    window_id: Option<u64>,
++    pane_id: u64,
++    /// 组合串内容;空串 = 取消组合(与 IME 的清除同义)。
++    text: String,
++    /// `true` = 提交:清掉缓冲层并把这段文本一次性写进 PTY。
++    #[serde(default)]
++    commit: bool,
++}
++
+ #[derive(Debug, Deserialize)]
+ #[serde(deny_unknown_fields)]
+ struct ReadParams {
+@@ -363,6 +376,20 @@ impl RuntimeCommand {
+                     submit: params.submit,
+                 })
+             },
++            "pane.compose" => {
++                let params: ComposeParams = parse_params(&request.params)?;
++                // 提交要走 PTY 的字节边界,按 paste 同一套规则校验;只设组合串时
++                // 允许空串(= 取消组合),别让「清空」也要求一段非空文本。
++                if params.commit || !params.text.is_empty() {
++                    validate_paste_text(&params.text)?;
++                }
++                Ok(Self::Compose {
++                    window_id: params.window_id,
++                    pane_id: params.pane_id,
++                    text: params.text,
++                    commit: params.commit,
++                })
++            },
+             "pane.read" => {
+                 let params: ReadParams = parse_params(&request.params)?;
+                 if params.lines == 0 || params.lines > MAX_READ_LINES {
+diff --git a/nebula_app/src/runtime_api/tests.rs b/nebula_app/src/runtime_api/tests.rs
+index 8d5dfb3..181d8f0 100644
+--- a/nebula_app/src/runtime_api/tests.rs
++++ b/nebula_app/src/runtime_api/tests.rs
+@@ -301,6 +301,51 @@ fn paste_accepts_layout_whitespace_but_not_terminal_control_sequences() {
+     .expect("pane paste parses");
+     assert!(matches!(pane, RuntimeCommand::Paste { pane_id: 17, submit: false, .. }));
+ 
++    let compose = RuntimeCommand::from_request(&ApiRequest::new(
++        "token".into(),
++        "pane.compose",
++        json!({ "pane_id": 17, "text": "边说话边改这一句", "commit": false }),
++    ))
++    .expect("pane compose parses");
++    assert!(matches!(compose, RuntimeCommand::Compose { pane_id: 17, commit: false, .. }));
++    assert!(matches!(
++        RuntimeCommand::from_request(&ApiRequest::new(
++            "token".into(),
++            "pane.compose",
++            json!({ "pane_id": 17, "text": "第一版", "commit": true }),
++        ))
++        .expect("compose commit parses"),
++        RuntimeCommand::Compose { commit: true, .. }
++    ));
++    // 空串 + 不提交 = 取消组合,必须合法;但要进 PTY 的内容仍按 paste 的边界校验。
++    assert!(
++        RuntimeCommand::from_request(&ApiRequest::new(
++            "token".into(),
++            "pane.compose",
++            json!({ "pane_id": 17, "text": "" }),
++        ))
++        .is_ok()
++    );
++    assert_eq!(
++        RuntimeCommand::from_request(&ApiRequest::new(
++            "token".into(),
++            "pane.compose",
++            json!({ "pane_id": 17, "text": "unsafe\u{1b}[201~tail", "commit": true }),
++        ))
++        .unwrap_err()
++        .code,
++        "invalid_params"
++    );
++    // 组合串是缓冲层,不是字节注入:未知字段照旧拒绝。
++    assert!(
++        RuntimeCommand::from_request(&ApiRequest::new(
++            "token".into(),
++            "pane.compose",
++            json!({ "pane_id": 17, "text": "x", "bytes": [27] }),
++        ))
++        .is_err()
++    );
++
+     let agent = RuntimeCommand::from_request(&ApiRequest::new(
+         "token".into(),
+         "agent.paste",
+diff --git a/nebula_app/src/runtime_api/transport.rs b/nebula_app/src/runtime_api/transport.rs
+index ff9c47e..dc7b812 100644
+--- a/nebula_app/src/runtime_api/transport.rs
++++ b/nebula_app/src/runtime_api/transport.rs
+@@ -170,6 +170,7 @@ pub(super) fn runtime_description() -> Value {
+             "pane.resize",
+             "pane.prompt",
+             "pane.paste",
++            "pane.compose",
+             "pane.read",
+             "pane.procs",
+             "pane.send_key",
+@@ -198,6 +199,7 @@ pub(super) fn runtime_description() -> Value {
+             ,"layout.typed_mutations"
+             ,"pane.exec.non_tty"
+             ,"pane.read.screen.v1"
++            ,"pane.compose.buffer"
+         ],
+         // 环境契约：pane 里的进程靠这些变量发现自己和控制面，不必扫进程或猜
+         // 端口。写进 describe 是为了让外部客户端能**探测**契约而不是硬编码变量
+diff --git a/nebula_app/src/window_context/runtime.rs b/nebula_app/src/window_context/runtime.rs
+index 39b705a..7eade99 100644
+--- a/nebula_app/src/window_context/runtime.rs
++++ b/nebula_app/src/window_context/runtime.rs
+@@ -435,6 +435,25 @@ impl WindowContext {
+         Ok(())
+     }
+ 
++    /// `pane.compose` 的经典窗口那一半。这里没有 GPUI 的组合串渲染层,所以
++    /// **只支持提交**,不假装自己有一个可见的缓冲层:调用方需要组合态时应当
++    /// 拿到一个明确的 `unsupported_target`,而不是一次「设了但屏幕上没有」的
++    /// 静默降级。
++    pub(crate) fn runtime_compose(
++        &mut self,
++        pane_id: u64,
++        text: String,
++        commit: bool,
++    ) -> Result<(), ApiError> {
++        if !commit {
++            return Err(ApiError::new(
++                "unsupported_target",
++                "pane.compose 的组合态需要 GPUI 外壳;经典窗口只支持 commit=true",
++            ));
++        }
++        self.runtime_paste(pane_id, text, false, false)
++    }
++
+     pub(crate) fn runtime_paste(
+         &mut self,
+         pane_id: u64,
+diff --git a/scripts/conformance/cases/compose.py b/scripts/conformance/cases/compose.py
+new file mode 100644
+index 0000000..0a9c91a
+--- /dev/null
++++ b/scripts/conformance/cases/compose.py
+@@ -0,0 +1,80 @@
++"""`pane.compose`:组合态缓冲层 —— 输入驱动用的一条路。
++
++断言的是这条路的**合同**,不是它的实现:
++  1. `runtime.describe` 声明了方法与特性(旧版本据此回落,而不是猜);
++  2. 组合态期间**一个字节都不进 PTY**(读真实 Grid 验证),可以反复整体改写;
++  3. `commit` 时整段作为**一次**写入进 Grid(不许出现两遍);
++  4. 空串 + 不提交 = 取消:Grid 里不留任何痕迹;
++  5. 字节边界与 `pane.paste` 一致:控制序列被拒,且拒绝之后 Grid 仍然干净。
++"""
++
++from __future__ import annotations
++
++import time
++
++from conformance.harness import ApiFailure, ConformanceContext, require
++
++
++def run(ctx: ConformanceContext) -> dict[str, object]:
++    capabilities = set(ctx.description.get("capabilities") or [])
++    require("pane.compose" in capabilities, "runtime.describe omits pane.compose")
++    features = set(ctx.description.get("features") or [])
++    require("pane.compose.buffer" in features, "runtime.describe omits pane.compose.buffer")
++
++    ctx.refresh_targets()
++    first = "NEBULA_COMPOSE_ALPHA"
++    revised = "NEBULA_COMPOSE_ALPHA_REVISED"
++
++    # 组合态:整句只进缓冲层。它渲染在光标处,但**不进 Grid** —— Grid 里的东西
++    # 已经交给 PTY 了,那正是这条路要避开的中间态。
++    ctx.compose(first)
++    time.sleep(0.3)
++    require(first not in ctx.read(lines=40)["text"], "composition reached the terminal grid before commit")
++
++    # 改写是整体替换:输入驱动每帧都这么干(真机语料里约 5% 的帧会回头改前面的词)。
++    ctx.compose(revised)
++    time.sleep(0.3)
++    grid = ctx.read(lines=40)["text"]
++    require(
++        revised not in grid and first not in grid,
++        "rewriting the composition leaked into the terminal grid",
++    )
++
++    # 取消:不留痕迹。
++    ctx.compose("")
++    time.sleep(0.2)
++    require(revised not in ctx.read(lines=40)["text"], "cancel left text behind")
++
++    # 提交:整段一次进 Grid,而且只出现一次。
++    ctx.compose(revised, commit=True)
++    read = ctx.poll(
++        lambda: ctx.read(lines=40),
++        lambda value: revised in value["text"],
++        "committed composition never reached the terminal grid",
++    )
++    require(
++        read["text"].count(revised) == 1,
++        f"committed composition was written {read['text'].count(revised)} times",
++    )
++
++    # 组合串不是字节注入旁路:控制序列必须被拒,且拒绝之后 Grid 仍然干净。
++    rejected = False
++    try:
++        ctx.compose("unsafe\u001b[201~tail", commit=True)
++    except ApiFailure as error:
++        rejected = error.error.get("code") == "invalid_params"
++    require(rejected, "pane.compose accepted a terminal control sequence")
++    require(
++        "unsafe" not in ctx.read(lines=40)["text"],
++        "rejected composition still reached the terminal grid",
++    )
++
++    ctx.send_key("c", control=True)
++    return {
++        "composition_stays_off_grid": True,
++        "rewrite_is_free": True,
++        "commit_is_single_write": True,
++        "cancel_leaves_nothing": True,
++        "byte_boundary_enforced": True,
++        "coverage": "runtime_compose_buffer",
++    }
+diff --git a/scripts/conformance/harness.py b/scripts/conformance/harness.py
+index 4fcc2b9..1e1dacb 100644
+--- a/scripts/conformance/harness.py
++++ b/scripts/conformance/harness.py
+@@ -758,6 +758,22 @@ class ConformanceContext:
+                 raise ApiFailure("pane.paste", error)
+             time.sleep(0.1)
+ 
++    def compose(self, text: str, commit: bool = False, pane_id: int | None = None) -> Any:
++        """`pane.compose`:`commit=False` 只改缓冲层(不碰 PTY),`True` 时整段一次写入。
++
++        输入驱动按帧调用它,所以这里不重试:一次「设置组合串」失败要立刻让调用方
++        看见(它决定是重发还是放弃),而不是替它猜。
++        """
++        return self.api(
++            "pane.compose",
++            {
++                "window_id": self.window_id,
++                "pane_id": pane_id or self.pane_id,
++                "text": text,
++                "commit": commit,
++            },
++        )
++
+     def send_key(
+         self,
+         key: str,
+diff --git a/scripts/conformance/run.py b/scripts/conformance/run.py
+index 53148f7..b42390c 100644
+--- a/scripts/conformance/run.py
++++ b/scripts/conformance/run.py
+@@ -44,6 +44,7 @@ CASE_NAMES = (
+     "session",
+     "ssh_loop",
+     "paste",
++    "compose",
+     "cjk_roundtrip",
+     "close",
+ )
+-- 
+2.55.0.windows.5
+
