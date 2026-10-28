@@ -154,28 +154,56 @@ pub fn describe_target(mode: KeyMode) -> String {
 
 /// 该给这个窗口用哪种上屏方式。纯函数,好测。
 ///
-/// `policy` 是配置里的 `ime_wmchar`:
-///   `off` / `keys`      —— 永远走键盘注入(老行为)
-///   `on`  / `wmchar`    —— 永远走 WM_CHAR(拿不到窗口句柄时退回键盘)
-///   其它(默认 auto)    —— 目标线程挂着输入法 **且** 焦点是经典文本控件时走 WM_CHAR。
-///                          只对「已实测字母会被吃掉、而 WM_CHAR 已验证能落字」的这一类
-///                          生效,免得在别的窗口上把本来好用的注入方式换掉。
-pub fn decide_key_mode(policy: &str, hwnd: isize, thread_has_ime: bool, classic_control: bool) -> KeyMode {
-    match policy {
-        "off" | "keys" | "input" => KeyMode::Keys,
-        "on" | "wmchar" => {
-            if hwnd != 0 {
-                KeyMode::WmChar(hwnd)
+/// `policy` 是配置里的 `ime_wmchar`,四种写法:
+///   `off` / `keys`            —— 永远走键盘注入(老行为)
+///   `on`  / `wmchar`          —— 永远走 WM_CHAR(拿不到窗口句柄时退回键盘)
+///   `on:pebrel.exe,zed.exe`   —— **只对这几个程序**走 WM_CHAR,别的窗口照旧
+///   `off:some.exe`            —— 这几个程序永远走键盘注入,别的按 auto
+///   `auto`(默认,等于没写)   —— 目标线程挂着输入法 **且** 焦点是经典文本控件时走
+///                              WM_CHAR。只对「已实测字母会被吃掉、而 WM_CHAR 已验证
+///                              能落字」的这一类生效,免得在别的窗口上把本来好用的
+///                              注入方式换掉。
+///
+/// `exe` 是目标进程的可执行文件名(小写,含 `.exe`),用来匹配名单。
+pub fn decide_key_mode(
+    policy: &str,
+    hwnd: isize,
+    thread_has_ime: bool,
+    classic_control: bool,
+    exe: &str,
+) -> KeyMode {
+    let exe = exe.to_ascii_lowercase();
+    let (head, list) = match policy.split_once(':') {
+        Some((h, l)) => (h.trim(), l.trim()),
+        None => (policy.trim(), ""),
+    };
+    let listed = |list: &str| -> bool {
+        list.split(',')
+            .map(|x| x.trim().to_ascii_lowercase())
+            .any(|x| !x.is_empty() && x == exe)
+    };
+    let only_listed = !list.is_empty();
+    let wmchar = |yes: bool| {
+        if yes && hwnd != 0 {
+            KeyMode::WmChar(hwnd)
+        } else {
+            KeyMode::Keys
+        }
+    };
+    match head {
+        "off" | "keys" | "input" => {
+            // `off:foo.exe`:名单里的程序永远走键盘;名单外的按 auto,免得把兜底关掉
+            if only_listed && !listed(list) {
+                wmchar(thread_has_ime && classic_control)
             } else {
                 KeyMode::Keys
             }
         }
+        "on" | "wmchar" => wmchar(!only_listed || listed(list)),
         _ => {
-            if hwnd != 0 && thread_has_ime && classic_control {
-                KeyMode::WmChar(hwnd)
-            } else {
-                KeyMode::Keys
-            }
+            // auto(以及任何写错的值):经典文本控件 + 输入法才换;带名单时只对名单生效
+            let allow = !only_listed || listed(list);
+            wmchar(allow && thread_has_ime && classic_control)
         }
     }
 }
@@ -245,6 +273,41 @@ mod target {
         fn GetKeyboardLayout(id_thread: u32) -> isize;
     }
 
+    /// 目标窗口所属进程的可执行文件名(小写,含 `.exe`);拿不到就空串。
+    fn exe_name(hwnd: isize) -> String {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+            fn QueryFullProcessImageNameW(h: isize, flags: u32, buf: *mut u16, size: *mut u32) -> i32;
+            fn CloseHandle(h: isize) -> i32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        if hwnd == 0 {
+            return String::new();
+        }
+        let mut pid: u32 = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if pid == 0 {
+            return String::new();
+        }
+        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if h == 0 {
+            return String::new();
+        }
+        let mut buf = [0u16; 512];
+        let mut size = buf.len() as u32;
+        let ok = unsafe { QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size) };
+        unsafe { CloseHandle(h) };
+        if ok == 0 {
+            return String::new();
+        }
+        let path = String::from_utf16_lossy(&buf[..size as usize]);
+        path.rsplit(['\\', '/'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    }
+
     /// 焦点控件(拿不到就退回前台窗口)。
     pub fn focused_hwnd() -> isize {
         let mut info: GuiThreadInfo = unsafe { std::mem::zeroed() };
@@ -260,7 +323,13 @@ mod target {
 
     pub fn key_mode(policy: &str) -> KeyMode {
         let hwnd = focused_hwnd();
-        super::decide_key_mode(policy, hwnd, thread_uses_ime(hwnd), is_classic_text_control(hwnd))
+        super::decide_key_mode(
+            policy,
+            hwnd,
+            thread_uses_ime(hwnd),
+            is_classic_text_control(hwnd),
+            &exe_name(hwnd),
+        )
     }
 
     /// 只给日志用:一眼看出为什么走了 WM_CHAR。
@@ -292,10 +361,38 @@ mod target {
 pub use target::key_mode as target_key_mode;
 
 /// 按当前方式打一段文本。
+///
+/// WM_CHAR 模式**只把 ASCII 走消息**:汉字那条路本来就没被输入法挡住(实测同一窗口
+/// 注入 4 个汉字全部落地),没必要跟着换 —— 换了万一某个自绘程序不吃 WM_CHAR,
+/// 反而把本来好用的中文听写弄坏。所以两种字符各走各的路,谁也不牵连谁。
 fn type_text_with(mode: KeyMode, s: &str) -> Result<()> {
     match mode {
         KeyMode::Keys => type_text(s),
-        KeyMode::WmChar(h) => post_chars(h, s),
+        KeyMode::WmChar(h) => {
+            let mut run = String::new();
+            let mut ascii = true;
+            for ch in s.chars() {
+                let is_ascii = (ch as u32) < 0x80;
+                if is_ascii != ascii && !run.is_empty() {
+                    if ascii {
+                        post_chars(h, &run)?;
+                    } else {
+                        type_text(&run)?;
+                    }
+                    run.clear();
+                }
+                ascii = is_ascii;
+                run.push(ch);
+            }
+            if !run.is_empty() {
+                if ascii {
+                    post_chars(h, &run)?;
+                } else {
+                    type_text(&run)?;
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -383,20 +480,33 @@ mod tests {
     /// 本来就没问题的注入方式。
     #[test]
     fn key_mode_policy() {
+        const E: &str = "pebrel.exe";
+        const OTHER: &str = "notepad.exe";
         // off:永远是键盘注入
-        assert_eq!(decide_key_mode("off", 0x1234, true, true), KeyMode::Keys);
+        assert_eq!(decide_key_mode("off", 0x1234, true, true, E), KeyMode::Keys);
         // on:强制 WM_CHAR
-        assert_eq!(decide_key_mode("on", 0x1234, false, false), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("on", 0x1234, false, false, E), KeyMode::WmChar(0x1234));
         // on 但拿不到窗口句柄 → 退回键盘(有句柄才谈得上投递消息)
-        assert_eq!(decide_key_mode("on", 0, true, true), KeyMode::Keys);
+        assert_eq!(decide_key_mode("on", 0, true, true, E), KeyMode::Keys);
         // auto:输入法 + 经典文本控件才换
-        assert_eq!(decide_key_mode("auto", 0x1234, true, true), KeyMode::WmChar(0x1234));
-        assert_eq!(decide_key_mode("auto", 0x1234, true, false), KeyMode::Keys);
-        assert_eq!(decide_key_mode("auto", 0x1234, false, true), KeyMode::Keys);
-        assert_eq!(decide_key_mode("auto", 0, true, true), KeyMode::Keys);
+        assert_eq!(decide_key_mode("auto", 0x1234, true, true, E), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("auto", 0x1234, true, false, E), KeyMode::Keys);
+        assert_eq!(decide_key_mode("auto", 0x1234, false, true, E), KeyMode::Keys);
+        assert_eq!(decide_key_mode("auto", 0, true, true, E), KeyMode::Keys);
         // 没写这个键(或写错)按 auto 走
-        assert_eq!(decide_key_mode("", 0x1234, true, true), KeyMode::WmChar(0x1234));
-        assert_eq!(decide_key_mode("whatever", 0x1234, true, true), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("", 0x1234, true, true, E), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("whatever", 0x1234, true, true, E), KeyMode::WmChar(0x1234));
+        // 名单形式:只对该程序生效(自绘终端就靠它试,不牵动别的窗口)
+        assert_eq!(decide_key_mode("on:pebrel.exe", 0x1234, false, false, E), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("on:pebrel.exe", 0x1234, false, false, OTHER), KeyMode::Keys);
+        assert_eq!(decide_key_mode("on: Pebrel.EXE , zed.exe", 0x1234, false, false, E), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("on:pebrel.exe", 0x1234, true, true, OTHER), KeyMode::Keys);
+        // off 带名单:名单里的永远键盘,名单外仍享受 auto 兜底
+        assert_eq!(decide_key_mode("off:pebrel.exe", 0x1234, true, true, E), KeyMode::Keys);
+        assert_eq!(decide_key_mode("off:pebrel.exe", 0x1234, true, true, OTHER), KeyMode::WmChar(0x1234));
+        // auto 带名单:只有名单里的程序吃 auto 规则
+        assert_eq!(decide_key_mode("auto:pebrel.exe", 0x1234, true, true, OTHER), KeyMode::Keys);
+        assert_eq!(decide_key_mode("auto:pebrel.exe", 0x1234, true, true, E), KeyMode::WmChar(0x1234));
     }
 
     /// 安全阀放弃修正时,**记账必须留在屏幕上那一版**。

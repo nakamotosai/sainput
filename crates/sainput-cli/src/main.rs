@@ -67,8 +67,8 @@ fn usage() {
          --show-console         不自动收起控制台窗口\n  \
          --lazy-mic             按需开麦（默认常驻预热，避免吞掉开头）\n  \
          --max-backspace <N>    流式修正安全阀(默认 8)\n  \
-         --ime-wmchar <MODE>    上屏方式:auto(默认)/ on / off。目标窗口挂着输入法时,\n  \
-                                注入的英文字母会被它收走,这时改走 WM_CHAR\n  \
+         --ime-wmchar <MODE>    上屏方式:auto(默认)/ on / off / on:app.exe。目标窗口挂着\n  \
+                                输入法时,注入的 ASCII 会被它收走,这时改走 WM_CHAR\n  \
          --tail-ms <N>          松键后最少再收多久的尾巴音频,默认 200ms\n  \
          --tail-max-ms <N>      尾巴硬上限，默认 1200ms\n  \
          --tail-quiet-ms <N>    尾巴里连续安静这么久就收工，默认 250ms\n  \
@@ -939,14 +939,21 @@ fn cmd_config(a: &Args, root: &Path) -> Result<()> {
         }
     );
     println!("英文合并  : {}", if c.merge_terms { "开" } else { "关" });
-    println!(
-        "上屏方式  : {} (输入法吃字母时改走 WM_CHAR)",
-        match c.ime_wmchar.as_str() {
-            "on" | "wmchar" => "WM_CHAR(强制)",
-            "off" | "keys" | "input" => "键盘注入(强制)",
-            _ => "auto",
-        }
-    );
+    // 上屏方式:把原始策略原样打出来 —— 名单形式(on:pebrel.exe)光看标签看不出是谁
+    let (label, list) = match c.ime_wmchar.split_once(':') {
+        Some((h, l)) => (h.trim(), l.trim()),
+        None => (c.ime_wmchar.trim(), ""),
+    };
+    let label = match label {
+        "on" | "wmchar" => "WM_CHAR(强制)",
+        "off" | "keys" | "input" => "键盘注入(强制)",
+        _ => "auto(输入法吃字母的窗口改走 WM_CHAR)",
+    };
+    if list.is_empty() {
+        println!("上屏方式  : {label}");
+    } else {
+        println!("上屏方式  : {label},只对 {list}");
+    }
     println!("上下文偏置: {}", if c.ctx_bias { "开" } else { "关" });
     println!("渲染节拍  : {}ms", c.throttle_ms);
     {
