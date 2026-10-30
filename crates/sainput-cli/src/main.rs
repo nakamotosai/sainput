@@ -70,7 +70,8 @@ fn usage() {
          --lazy-mic             按需开麦（默认常驻预热，避免吞掉开头）\n  \
          --max-backspace <N>    流式修正安全阀(默认 8)\n  \
          --ime-wmchar <MODE>    上屏方式:auto(默认)/ on / off / on:app.exe。目标窗口挂着\n  \
-                                输入法时,注入的 ASCII 会被它收走,这时改走 WM_CHAR\n  \
+                                输入法时,注入的 ASCII 会被它收走,这时改走 WM_CHAR。\n  \
+                                名单形式是**覆盖**:名单外的窗口照旧按 auto 判\n  \
          --tail-ms <N>          松键后最少再收多久的尾巴音频,默认 200ms\n  \
          --tail-max-ms <N>      尾巴硬上限，默认 1200ms\n  \
          --tail-quiet-ms <N>    尾巴里连续安静这么久就收工，默认 250ms\n  \
@@ -975,14 +976,14 @@ fn cmd_config(a: &Args, root: &Path) -> Result<()> {
     let label = match label {
         "on" | "wmchar" => "消息通道(流式)",
         "nostream" | "final" => "消息通道(整句一次,不流式)",
-        "pebrel" | "compose" => "Pebrel 控制面(组合态缓冲层)",
+        "pebrel" | "compose" => "Pebrel 控制面(组合态缓冲层),其余窗口按 auto 判",
         "off" | "keys" | "input" => "键盘注入(强制)",
-        _ => "auto(输入法吃字母的窗口改走消息通道)",
+        _ => "auto(输入法吃字母的窗口改走消息通道:经典控件 / Qt 窗口)",
     };
     if list.is_empty() {
         println!("上屏方式  : {label}");
     } else {
-        println!("上屏方式  : {label},只对 {list}");
+        println!("上屏方式  : {label},名单 {list}(名单外按 auto 判)");
     }
     println!("上下文偏置: {}", if c.ctx_bias { "开" } else { "关" });
     println!("渲染节拍  : {}ms", c.throttle_ms);

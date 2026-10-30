@@ -78,7 +78,9 @@ hotkey = rightctrl
 # 输入法的状态读不到也改不了(跨进程 ImmGetContext 返回 NULL),所以这类窗口
 # 改走 PostMessage(WM_CHAR):消息不经过键盘那条链,输入法看不到。
 #
-#   auto = 只对「输入法 + 经典文本控件(Edit/RichEdit)」自动换;别的窗口不动
+#   auto = 只对「输入法 + 会吃字母的文本面」自动换。文本面 = 经典控件(Edit/RichEdit)
+#          **和 Qt 窗口(Qt*,微信 4.x 就是)** —— 两类都在真机上量过(字母被吃 +
+#          WM_CHAR 能落字);没量过的窗口(Chromium/终端/…)不动
 #   on   = 所有窗口都走消息通道(照常流式)
 #   off  = 老行为(全部走键盘注入)
 #   nostream = 走消息通道但**整句一次投递**(不流式,松手才出字)
@@ -86,6 +88,10 @@ hotkey = rightctrl
 #     ime_wmchar = on:pebrel.exe          # 只在 pebrel 里走消息通道(流式)
 #     ime_wmchar = nostream:pebrel.exe    # pebrel 里整句一次投递(乱序时的退路)
 #     ime_wmchar = off:notepad.exe        # notepad 永远走键盘,别的仍按 auto
+#
+#   ⚠️ 名单是**覆盖**不是开关:名单外的窗口照旧按 auto 判。写 `pebrel` / `on:x.exe`
+#      时别指望「名单外就退回键盘」—— v0.2.4 及以前是那个语义,代价是「配了 pebrel
+#      之后,微信里说英文那个词又没了」(2026-10-30 修)。
 #
 # ---- Pebrel 组合态缓冲层(不按键的那条路)----
 #     ime_wmchar = pebrel                 # 只对 Pebrel(pebrel.exe/nebula.exe)生效

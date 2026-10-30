@@ -60,3 +60,4 @@
 # release artifacts (packaging pipeline)
 dist/
 .runtime-src/
+/FROZEN-v0.2.5.md

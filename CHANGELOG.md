@@ -7,6 +7,45 @@
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-10-30
+
+### Fixed
+
+- **微信里说英文整句被吞(2026-10-30)**:现象是「在微信聊天框说话,只要带英文,那个词就没了;
+  相同的话在终端里一个字都不少」。两条独立成因,都在这轮修掉:
+  1. **配置把 auto 兜底顺手关了**(真正让用户天天踩到的那条)。`ime_wmchar = pebrel` 这条
+     策略原来的语义是「名单里走 Pebrel 控制面,**名单外一律退回键盘注入**」;而键盘注入在
+     挂着输入法的窗口上正是坏的那条路 —— 于是微信里的英文又被水杉输入法收进候选框
+     (用户截图:`O'K` → 候选 `哦*/欧*/噢*`)。现在**名单形式一律是「覆盖」而不是「开关」**:
+     名单只改名单里那几个程序怎么走,名单外的窗口继续按 `auto` 判(`off:` / `on:` /
+     `nostream:` / `pebrel:` 四种写法统一到这条规则)。
+  2. **`auto` 的判据漏了 Qt 窗口**。原来只认「经典文本控件」(类名带 `Edit`),而微信 4.x 是
+     `Weixin.exe` / `Qt51514QWindowIcon`(自绘输入框)。真机实测(同一条路径、同一个窗口):
+     `SendInput` + `KEYEVENTF_UNICODE` 打 `helloTOKENabc` → 输入框**一个字符都没有**;
+     `PostMessage(WM_CHAR)` 打同一串 → 逐字落地 `helloTOKENabc`;
+     `PostMessage(WM_KEYDOWN/UP, VK_BACK)` ×3 → `helloTOKEN`(退格认);中文混英文一字不差。
+     `class_needs_message_channel()` 现在 = `*edit*` **或** `qt*`,两者都有真机证据才写进去
+     (换通道本身有代价,没量过的窗口不动)。
+  验收:整条语音链路(`run --feed` + 右 Ctrl)真机日志打出
+  `[sainput] 上屏改用 WM_CHAR:消息通道(流式)Qt51514QWindowIcon`;`injectprobe` 在微信窗口上
+  用生产代码写完再读回,输入框内容与记账逐字一致(`" helloTOKEN混排OK"`)。
+  取证工具:`tools/probe_wechat_inject.py`(三条通道对比 + 生产代码 drive)、
+  `crates/sainput-core/examples/injectprobe.rs`(按策略决定模式并真打一遍)、
+  `tools/make_test_wav.ps1`(合成「中文夹英文单词」的素材)。
+
+### Added
+
+- **`examples/injectprobe`(2026-10-30)**:上屏方式真机探针 —— 按窗口标题抢前台 → 读
+  `target_key_mode` 的决定 → 用生产代码那条路把一段文本流式打出去(含一次退格)→ 打印记账。
+  单测只能钉住纯函数那一半(哪类窗口该换通道),这条负责回答「这个窗口上换了没有、字落没落」。
+  它就是这轮定位微信那条用的工具;顺带把 `inject::focused_window()` 暴露出来给探针用。
+- **`tools/probe_wechat_inject.py`(2026-10-30)**:自绘输入框的上屏取证脚本。三条通道
+  (`SendInput` / `WM_CHAR` / `WM_KEYDOWN+VK_BACK`)打同一串字再读回输入框;读回走
+  Ctrl+A/Ctrl+C + 剪贴板(自绘输入框答不上 `WM_GETTEXT`),读前按 Esc 收输入法组字串、
+  读后按 End 收起选择,剪贴板用完还原。
+- **`tools/make_test_wav.ps1`(2026-10-30)**:SAPI 合成「中文 + 英文单词」的 16k 单声道 WAV。
+  模型自带的 `test_wavs` 里没有这类素材,而「说到英文整句没了」的回归必须有英文音频。
+
 ## [0.2.4] - 2026-10-30
 
 ### Fixed

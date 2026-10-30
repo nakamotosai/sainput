@@ -237,7 +237,7 @@ sainput selftest inject "文字"                只测上屏路径
 | `--ctx-hotwords <FILE>` | 偏置临时热词文件（默认 `.ctx_hotwords.txt`） |
 | `--merge-terms` / `--no-merge-terms` | 英文拆字合并(默认开) |
 | `--fix-case` / `--no-fix-case` | 英文大小写修复(默认开) |
-| `--ime-wmchar auto\|on\|off\|<策略>:<exe>[,<exe>]` | 上屏方式(默认 `auto`):目标窗口挂着输入法时,注入的 ASCII 会被输入法收走,这时改走 `WM_CHAR`(汉字不受影响,仍走键盘)。`on` = 到处都用;`off` = 老行为;挂名单 = 只对这些程序生效(如 `on:pebrel.exe`)。`on` 的窗口走消息通道(字符 `WM_CHAR` + 退格 `WM_KEYDOWN/UP(VK_BACK)`,同一队列所以顺序有保证),**照常逐帧流式**;`nostream:` 才是整句一次投递;`pebrel` = 完全不发按键,整句先放进 Pebrel 自己的组合态缓冲层(光标处可改、定稿才提交,只对 `pebrel.exe`/`nebula.exe` 生效) |
+| `--ime-wmchar auto\|on\|off\|<策略>:<exe>[,<exe>]` | 上屏方式(默认 `auto`):目标窗口挂着输入法时,注入的 ASCII 会被输入法收走,这时改走 `WM_CHAR`(汉字不受影响,仍走键盘)。`on` = 到处都用;`off` = 老行为;挂名单 = 只对这些程序生效(如 `on:pebrel.exe`)。`on` 的窗口走消息通道(字符 `WM_CHAR` + 退格 `WM_KEYDOWN/UP(VK_BACK)`,同一队列所以顺序有保证),**照常逐帧流式**;`nostream:` 才是整句一次投递;`pebrel` = 完全不发按键,整句先放进 Pebrel 自己的组合态缓冲层(光标处可改、定稿才提交,只对 `pebrel.exe`/`nebula.exe` 生效)。`auto` 的判据是「该线程挂着输入法 **且** 焦点在会吃字母的文本面上」:经典控件(`*Edit*`)**和 Qt 窗口(`Qt*`,微信 4.x 就是)**,两类都有真机证据。**名单形式是覆盖不是开关**:只改名单里那几个程序,名单外照旧按 `auto` 判(2026-10-30 之前 `pebrel:` 会把名单外的 auto 兜底一起关掉,微信里的英文就没了) |
 | `--leading-space` / `--no-leading-space` | 光标前有字时补空格（默认开） |
 | `--beam` / `--no-beam` | `modified_beam_search`（更准、稍慢；热词需要它） |
 | `--threads N` | 推理线程数（默认 2） |
