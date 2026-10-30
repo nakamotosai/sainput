@@ -23,8 +23,10 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # actions/checkout 从 v5 起换成 node24;停在 v4 上每次 run 都会带一条
+      # 「Node.js 20 is deprecated」注解(它被 GitHub 强推到 node24 上跑)。
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # 默认 stable 就是 MSVC target。
       # 开发者本机可能用 GNU（.cargo/config.toml + rust-toolchain.toml），
@@ -42,8 +44,9 @@ jobs:
       - name: Unit tests (sainput-core)
         run: cargo test --release -p sainput-core
 
+      # setup-python 从 v6 起换成 node24(同上,留在 v5 会带弃用注解)。
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
