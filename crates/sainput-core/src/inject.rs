@@ -573,6 +573,18 @@ extern "system" {
     fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
 }
 
+/// 消息通道里「退格之后要等多久才补打下一个字符」。
+///
+/// 真机实测(微信 4.x / Qt 5.15,挂水杉输入法;口径见 `tools/probe_wmchar_backspace.py`):
+/// 退格之后**同一批**投出的字符 5/5 次全丢(屏幕上少一个字符 —— 用户报的
+/// 「我的验证码是903721」变成「我的验证码是03721」就是这一下);
+/// 中间隔 10ms 以上 5/5 全对。取 40ms:四倍余量,而「退格 + 补打」在真实语料里
+/// 每句只有约 5% 的帧会走到,40ms 的延迟看不出来。
+#[cfg(windows)]
+const WMCHAR_BACKSPACE_SETTLE: std::time::Duration = std::time::Duration::from_millis(40);
+#[cfg(not(windows))]
+const WMCHAR_BACKSPACE_SETTLE: std::time::Duration = std::time::Duration::from_millis(0);
+
 /// 整句是不是一个阿拉伯数字串(读验证码 / 号码那种)。
 ///
 /// 判据只看 ASCII 数字:**汉字数字已经在 ITN 那一步转成阿拉伯数字了**
@@ -1044,18 +1056,34 @@ impl StreamWriter {
         let common = common_prefix_chars(&self.injected, &want);
         let bs = self.injected.chars().count().saturating_sub(common);
         if bs > self.max_backspace {
-            return Ok(()); // 改动太大，等 final
+            return Ok(()); // 改动太大,等 final
         }
+        let tail: String = want.chars().skip(common).collect();
+        self.backspace_then_type(bs, &tail)?;
+        self.injected = want;
+        Ok(())
+    }
+
+    /// 「退格 n 次 → 补打 tail」这两步,update / finalize 共用。
+    ///
+    /// 消息通道(`WM_CHAR`)下**两步之间必须停一下**:退格走的是
+    /// `PostMessage(WM_KEYDOWN/UP, VK_BACK)`,紧接着投出去的字符会被目标程序
+    /// 当成本次按键产生的字符丢掉 —— 微信 4.x(Qt 5.15)真机实测:
+    /// 同一批消息里 `VK_BACK` 后面紧跟的那个字符 5/5 次全丢(读回少一个字符),
+    /// 中间隔 10ms 以上 5/5 全对。所以这里等 `WMCHAR_BACKSPACE_SETTLE`。
+    /// 键盘注入那条路不需要:SendInput 的事件本来就按真实的按键节奏进系统。
+    fn backspace_then_type(&mut self, bs: usize, tail: &str) -> Result<()> {
         if bs > 0 {
             backspace_with(self.mode, bs)?;
             self.backspaces += bs;
+            if self.mode.is_wmchar() && !tail.is_empty() {
+                std::thread::sleep(WMCHAR_BACKSPACE_SETTLE);
+            }
         }
-        let tail: String = want.chars().skip(common).collect();
         if !tail.is_empty() {
-            type_text_with(self.mode, &tail)?;
+            type_text_with(self.mode, tail)?;
             self.typed_chars += tail.chars().count();
         }
-        self.injected = want;
         Ok(())
     }
 
@@ -1129,15 +1157,8 @@ impl StreamWriter {
             // 也不能让记账和屏幕对不上。
             return Ok(());
         }
-        if bs > 0 {
-            backspace_with(self.mode, bs)?;
-            self.backspaces += bs;
-        }
         let tail: String = want.chars().skip(common).collect();
-        if !tail.is_empty() {
-            type_text_with(self.mode, &tail)?;
-            self.typed_chars += tail.chars().count();
-        }
+        self.backspace_then_type(bs, &tail)?;
         self.injected = want;
         Ok(())
     }

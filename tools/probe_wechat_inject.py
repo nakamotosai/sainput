@@ -7,6 +7,12 @@
 `helloTOKENabc` 一个字符都没进输入框,而 `PostMessage(WM_CHAR)` 逐字落地。
 `inject.rs` 的 `auto` 判据(`class_needs_message_channel`)靠这把尺子量出来。
 
+⛔ 安全红线(2026-10-30 踩过,用户键盘被卡住):**绝不用合成按键去触发热键**。
+   热键按下会被 sainput 的钩子吃掉,keyup 也得靠同一个钩子送达 —— 那个实例被硬杀之后
+   keyup 永久丢失,系统/目标程序就认为修饰键一直按着(用户键盘上可能根本没那个键)。
+   需要无人值守触发「按住 → 松开」请用 `SAINPUT_DIAG_AUTOSTART=<ms>`。本脚本只发窗口消息,
+   但读回要用 Ctrl+A/Ctrl+C 合成按键 —— 跑之前确认没有别的 sainput 在用这些键。
+
 读回方式:自绘输入框答不上 `WM_GETTEXT`,所以走 **Ctrl+A / Ctrl+C + 剪贴板**。
 ⚠️ 两个坑(都踩过):
   1. 读之前先按 `Esc` 收掉输入法的组字串 —— 组字态下 Ctrl+A 会被输入法截走,
@@ -138,13 +144,16 @@ def find_window(title=DEFAULT_TITLE):
 
 
 def focus(hwnd):
-    """抢前台(SetForegroundWindow 常被系统拒绝,所以带 ALT 敲门 + 验证)。"""
+    """抢前台(SetForegroundWindow 常被系统拒绝,所以带重试 + 验证)。
+
+    ⛔ 这里**故意不敲 ALT**:那种「敲门」也是合成按键,keyup 一旦丢了就是一个卡住的
+    修饰键(2026-10-30 的事故:合成的热键 keyup 丢失 → 用户键盘直接失灵)。
+    抢不到就返回 False,让人手动点一下窗口 —— 比冒键盘卡死的险划算。
+    """
     for _ in range(10):
         if u32.GetForegroundWindow() == hwnd:
             return True
         u32.ShowWindow(hwnd, 9)  # SW_RESTORE
-        send_vk(0x12, True)      # ALT
-        send_vk(0x12, False)
         u32.SetForegroundWindow(hwnd)
         time.sleep(0.35)
     return u32.GetForegroundWindow() == hwnd
