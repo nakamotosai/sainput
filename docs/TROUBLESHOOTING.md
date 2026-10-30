@@ -240,8 +240,8 @@ powershell -ExecutionPolicy Bypass -File scripts\fetch_models.ps1           # �
 | 长句重复打转 | `[raw]` 里就重复 | 模型固有行为，换档见 [`model-selection.md`](model-selection.md) |
 | 中英混说丢词 | — | 试 `-480ms` 档 |
 
-`--no-stream`(`stream = false`)**当前版本不可用**:它实际一个字都不打。
-需要逐字上屏就保持默认 `stream = true`。
+`--no-stream`（`stream = false`）**流式阶段一个字都不打**，松手定稿时整句一次性打字。
+想边说边出字就保持默认 `stream = true`。
 
 ### 组合态上屏(`ime_wmchar = pebrel`)依赖的是打过补丁的 Pebrel
 

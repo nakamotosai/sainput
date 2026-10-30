@@ -50,10 +50,21 @@ hotkey = rightctrl
 # hide_console = false
 
 # ---- 上屏 ----
-# 保持 true。设成 false（--no-stream）当前版本实际一个字都不打，暂时不要用。
+# 保持 true(默认):边说边逐字上屏,改口时退格重打。
+# 设成 false(--no-stream)则不逐字上屏 —— 流式阶段一个字都不打,松手定稿时
+# 整句一次性打字。想换更安静的观感可以用,代价是说话过程中屏幕上看不到字。
 # stream = true
 
-# 流式修正的安全阀：一次改动超过这么多字就放弃本帧，等 final。
+# 焦点守卫(默认开):目标模式只在**按下热键那一刻**决定"往哪个窗口打字",
+# 之后每次上屏注入的都是**当时的**前台窗口 —— 所以按住热键说话途中切了窗口,
+# 后半句会打进新窗口。开着它,每次上屏前会复核一次前台窗口:
+#   不一致 → **中止这一句**的注入(已经打在原窗口上的字不动,**不会**去删新窗口
+#   里的任何东西),并在控制台 + 会话日志里记一笔。下次按下重新开始。
+# 同一窗口内正常输入一点都不受影响(只有不一致时才动手)。
+# 想关掉这个保护(比如你习惯边说边切窗):
+# focus_guard = false
+
+# 流式修正的安全阀:一次改动超过这么多字就放弃本帧,等 final。
 # max_backspace = 8
 
 # ---- 文本整形 ----
@@ -164,9 +175,20 @@ hotkey = rightctrl
 # 24MB 超轻量。
 # model_dir = models/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23
 #
-# 80ms 分块（首个字最快、中文可用）—— 但它是 0.6B，比较吃 CPU，
-# 需要多线程才跟得上实时，配合下面的 threads = 8 用。
+# 80ms 分块(首个字最快、中文可用)—— 但它是 0.6B,比较吃 CPU,
+# 需要多线程才跟得上实时,配合下面的 threads = 8 用。
 # model_dir = models/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-80ms-int8-2026-06-11
+
+# ---- 二遍重打(高精度模式)----
+# 默认关。打开后:流式照旧用上面的 model_dir(首字手感不变),**松键之后**再用
+# 更准的 480ms 档模型把这一整句重解一遍,拿它的结果覆盖定稿。
+# 实测差异(体检报告 §6.4):160ms 档会把 "THE DAY AFTER TOMORROW" 听成
+# "TODAY AFTER TOMORROW",480ms 档对了;也会补回一些被丢掉的词。
+# 代价:松键到定稿之间多约 0.7~1 秒(10 秒的句子),而且会多占一份模型内存。
+# twopass = false
+
+# 二遍重打用的模型目录(只有 twopass = true 时才会传给 sidecar,也才会加载)。
+# twopass_model_dir = models/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05
 
 # ---- 后处理 ----
 # 自动标点。
@@ -214,8 +236,11 @@ hotkey = rightctrl
 # device =
 
 # ---- Python ----
-# sidecar 用的解释器；要用特定虚拟环境时填完整路径。
-# python = python
+# sidecar 用的解释器。默认**自动探测**:从 PATH 与常见安装目录里找 python,
+# 并且只用**绝对路径**启动(不再用裸 `python`,免得被当前目录里的同名假 exe 顶掉)。
+# 要用特定虚拟环境、或自动探测不到时,填完整路径:
+# python = C:\Python312\python.exe
+# 也可以用环境变量 SAINPUT_PYTHON 指定(它的优先级最高,便携版启动器走的就是它)。
 
 # ---- 安全 ----
 # ⚠️ 绝对不要用 Stop-Process -Force / 任务管理器「结束进程」杀 sainput。

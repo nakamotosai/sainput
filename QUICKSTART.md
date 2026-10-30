@@ -98,7 +98,8 @@ run.bat replay models\sherpa-onnx-x-asr-160ms-streaming-zipformer-transducer-zh-
 - **管理员权限的窗口打不进字。** 这是 Windows 的 UIPI（用户界面特权隔离）：
   普通权限进程的 `SendInput` 会被系统静默丢弃。**剪贴板 + Ctrl+V 也一样被拦**，
   没有绕过办法，除非 sainput 本身也以管理员身份运行。
-- **`--no-stream` 当前不可用（未实现）**：选了它**一个字都不会上屏**。想逐字出字就保持默认。
+- **`--no-stream`(不逐字上屏)**:流式阶段一个字都不打,松手定稿时**整句一次性打字**。
+  想要「边说边出字」就保持默认。
 - **只有 Windows 10/11 x64** 版本；macOS / Linux 跑不了。
 
 还有别的现象对不上？先看 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) 的排查手册。

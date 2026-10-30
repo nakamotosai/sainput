@@ -4,4 +4,6 @@
 # 测过：Python 3.14 (x64) + sherpa-onnx 1.13.4。
 
 sherpa-onnx==1.13.4
-numpy
+# 固定上界:体检(2026-10-31)发现 numpy 未固定版本,同一份 requirements 在不同机器
+# 装到不同 numpy 会让同一段音频的解码结果/耗时不可复现。本机实测 2.3.5 正常。
+numpy>=2.0,<3

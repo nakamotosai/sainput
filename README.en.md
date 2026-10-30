@@ -76,7 +76,9 @@ Run `sainput run` with no arguments for defaults; `sainput --help` lists every s
 `--tail-quiet-ms`, `--tail-max-ms`, `--tail-pad-ms`, `--tail-rms`, `--overlay-mode`,
 `--edge-tint`, `--log-dir`, `--show-console`, …).
 
-Note: `--no-stream` is **not implemented** — passing it currently types nothing. Do not use it.
+Note: `--no-stream` disables incremental typing — nothing is typed while you speak, and the
+whole sentence is typed in one go when you release the key. The default (streaming) is what
+you want for character-by-character output.
 
 ## Models
 
