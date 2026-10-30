@@ -112,15 +112,24 @@ def render_text(t, punct=None, use_itn=True, punct_mode="keep",
     t = repair_mod.repair(t)
     if use_itn:
         t = itn_mod.normalize(t)
-    t, dropped = punctuate_guarded(punct, t)
-    if dropped:
-        note("[sidecar] 标点模型丢了正文,本句退回未加标点的文本")
+    # 整句就是一个数字串(读验证码 / 号码):**不加标点**。
+    # 标点模型会给纯数字句补一个句号(而且纯数字没有 CJK,polish 还会把它排成英文句点),
+    # 上屏就成了「12345.」—— 用户要的是「读验证码直接贴」,多一个句点就贴不进去。
+    # 读号码本来也不是句子,断句信息没有任何价值。
+    bare_number = t.isascii() and t.isdigit()
+    if punct is not None and not bare_number:
+        t, dropped = punctuate_guarded(punct, t)
+        if dropped:
+            note("[sidecar] 标点模型丢了正文,本句退回未加标点的文本")
     t = polish_mod.polish(t)
     # 排版整形放最后:标点已经落定,才轮到「标点转空格」和「英文拆字合并」。
     # 反过来做的话,标点模型会看到被抹掉标点的句子,断句会变差。
     if merge_terms or punct_mode != "keep" or fix_case:
         t = textfix_mod.normalize(t, punct_mode, fix_case=fix_case)
-    return t
+    # 句尾空白一律砍掉:开「标点转空格」时句末的「。」会变成空格(定稿也留着),
+    # 上屏就变成「12345 」—— 用户要「读验证码直接贴」,尾巴上多一个空格就贴不进去。
+    # 流式阶段也一样:句尾那个空格下一帧还要重算,本来就不该显示。
+    return t.rstrip()
 
 
 def main():

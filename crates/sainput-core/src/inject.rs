@@ -573,6 +573,18 @@ extern "system" {
     fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
 }
 
+/// 整句是不是一个阿拉伯数字串(读验证码 / 号码那种)。
+///
+/// 判据只看 ASCII 数字:**汉字数字已经在 ITN 那一步转成阿拉伯数字了**
+/// (见 `tools/itn.py` 的 `whole_digits`),所以这里不需要再认「一二三」。
+/// 空串不算 —— 空结果表示这一句还没听出东西。
+///
+/// 为什么要这条规则:用户的原话是「我想直接读验证码能贴上去」——
+/// 前面多一个空格,数字框里就贴不进去(FROZEN-v0.2.5 之后那轮,2026-10-30)。
+fn is_bare_number(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+}
+
 fn common_prefix_chars(a: &str, b: &str) -> usize {
     a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
@@ -613,6 +625,30 @@ mod tests {
         let b = w.want("你好啊");
         assert_eq!(common_prefix_chars(&a, &b), 3);
         assert_eq!(a.chars().count() - common_prefix_chars(&a, &b), 0); // 不用退格
+    }
+
+    /// 读验证码那种「整句一个数字串」:不补前置空格,流式第一帧也不补。
+    ///
+    /// 用户要的是「读出来能直接贴进数字框」—— 前面多一个空格就贴不进去。
+    #[test]
+    fn bare_number_gets_no_leading_space() {
+        let mut w = StreamWriter::new(8, true);
+        w.set_prefix(" ");
+        assert_eq!(w.want("12345"), "12345", "纯数字句不补前置空格");
+        assert_eq!(w.want("12345个"), " 12345个", "不是纯数字句就照旧补空格");
+        assert_eq!(w.want("abc"), " abc");
+
+        // 流式:第一帧只有一位数字时也不许先补空格再退格(那会在屏幕上闪一下)
+        let mut w = StreamWriter::new(8, true);
+        w.set_prefix(" ");
+        w.set_mode(KeyMode::WmChar(0)); // 句柄 0:消息函数直接返回,只走记账
+        w.update("1").unwrap();
+        assert_eq!(w.injected, "1", "第一帧就不许带前置空格");
+        w.update("12345").unwrap();
+        assert_eq!(w.injected, "12345");
+        assert_eq!(w.backspaces, 0, "整句跑完不该出现退格");
+        w.finalize("12345", 32).unwrap();
+        assert_eq!(w.injected, "12345");
     }
 
     /// 上屏方式的选择逻辑(纯函数,不需要真窗口)。
@@ -968,9 +1004,11 @@ impl StreamWriter {
         &self.injected
     }
 
-    /// 这一句最终应该显示成什么（含前缀）。
+    /// 这一句最终应该显示成什么(含前缀)。
+    ///
+    /// 例外:**整句就是一个数字串**时不补前置空格(见 `is_bare_number`)。
     fn want(&self, target: &str) -> String {
-        if self.prefix.is_empty() {
+        if self.prefix.is_empty() || is_bare_number(target) {
             target.to_string()
         } else {
             format!("{}{}", self.prefix, target)
