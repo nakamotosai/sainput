@@ -72,22 +72,37 @@ KNOWN_TERMS = [
     ('G P U', 'GPU'), ('U I', 'UI'), ('I D', 'ID'), ('O K', 'OK'),
 ]
 
-# 通用规则：连续 ≥2 个「单字母 + 空格」再跟一个字母 —— 中间夹中文也认。
-# 用否定环视代替 \b（汉字旁 \b 不成立，这是旧代码的 bug）。
-_LETTER_GROUP = re.compile(r'(?<![A-Za-z0-9])(?:[A-Za-z] )+[A-Za-z](?![A-Za-z0-9])')
+# 通用规则:连续 ≥2 个「单字母 + 空格」再跟一个字母 —— 中间夹中文也认。
+# 用否定环视代替 \b(汉字旁 \b 不成立,这是旧代码的 bug)。
+# 末尾那个字母允许带数字:「M P 四」被 ITN 并成 `M P4` 之后仍要能收成 `MP4`。
+_LETTER_GROUP = re.compile(r'(?<![A-Za-z0-9])(?:[A-Za-z] )+[A-Za-z][0-9]*(?![A-Za-z0-9])')
+
+
+def _group_guarded(s):
+    """给 KNOWN_TERMS 的串加「整组边界」:不许是更长字母串的一部分。
+
+    2026-10-31 用户报的漏字:`S A A A I`(saaaai.com)被拆成 `SAA AI` ——
+    原因是 `t.replace('A I', 'AI')` 这种**裸子串替换**会命中长串的尾巴:
+    `S A A A I` 里那个 `A I` 被替换 → `S A A AI` → 合并规则再也读不完整串。
+    判据:左边不能是「字母 + 空格」、右边不能是「(空格)字母」,即它必须自成一组。
+    """
+    return (r'(?<![A-Za-z] )(?<![A-Za-z])' + re.escape(s) + r'(?! ?[A-Za-z])')
+
+
+_TERM_RX = [(re.compile(_group_guarded(a)), b) for a, b in KNOWN_TERMS]
 
 
 def merge_spaced_terms(t):
-    """把被拆开的英文缩写粘回去：'R E A' -> 'REA'、'A I和V P S' -> 'AI和VPS'。
+    """把被拆开的英文缩写粘回去:'R E A' -> 'REA'、'A I和V P S' -> 'AI和VPS'。
 
-    只动「全由单字母组成、用空格分隔」的组；正常英文词（hello world）不受影响，
-    因为 'hello' 不是单字母。'a b c' 这种会被粘成 'abc' —— 属可接受（语音里
-    逐字母念才会出现这种形态）。
+    只动「全由单字母组成、用空格分隔」的组;正常英文词(hello world)不受影响,
+    因为 'hello' 不是单字母。'a b c' 这种会被粘成 'abc' —— 属可接受(语音里
+    逐字母念才会出现这种形态)。
     """
     if not t:
         return t
-    for a, b in KNOWN_TERMS:
-        t = t.replace(a, b)
+    for rx, b in _TERM_RX:
+        t = rx.sub(b, t)
     return _LETTER_GROUP.sub(lambda m: m.group(0).replace(' ', ''), t)
 
 
@@ -169,14 +184,35 @@ def fix_english_case(t):
     return _ALPHA_WORD.sub(rep, t)
 
 
+# 点后面那截是「文件后缀 / 顶级域名」的白名单 —— 一律小写。
+# 动因(2026-10-31 用户实测):说「AGENTS 点 M D」要的是 `AGENTS.md`、「SAAAI 点 COM」
+# 要的是 `.com`;模型吐不出小写,ITN 把「点」换成 `.` 之后这里补上小写。
+# 仍然是「只动白名单」:不在表里的词一个字母都不改(AI/GPT/USB 这些不在表里,不会被误伤)。
+_FILE_EXT = {
+    "md", "txt", "com", "cn", "net", "org", "io", "ai", "dev", "app", "sh", "bat",
+    "ps1", "py", "rs", "js", "ts", "json", "yml", "yaml", "toml", "ini", "cfg",
+    "conf", "log", "exe", "zip", "rar", "7z", "pdf", "png", "jpg", "jpeg", "svg",
+    "html", "css", "xml", "csv", "tsv", "db", "sqlite", "dll", "so", "lock", "env",
+    "mp3", "mp4", "wav", "ttf", "otf", "woff", "ico", "bin", "onnx", "whl",
+}
+_DOT_TOKEN = re.compile(r'(?<=\.)([A-Za-z]{2,10})(?![A-Za-z0-9])')
+
+
+def lower_file_ext(t):
+    """点后面的后缀/顶级域名小写:`AGENTS.MD` -> `AGENTS.md`、`SAAAI.COM` -> `SAAAI.com`。"""
+    if not t or '.' not in t:
+        return t
+    return _DOT_TOKEN.sub(lambda m: m.group(1).lower() if m.group(1).lower() in _FILE_EXT
+                          else m.group(0), t)
+
 # ---------------------------------------------------------------- 组合入口
 
 def normalize(t, punct_mode='keep', fix_case=True):
     """按策略整形。punct_mode:
-    · 'keep'  —— 原样（默认，行为与今天完全一致）
-    · 'space' —— 中文标点转空格（保留问号）
-    英文术语合并始终执行（它只修 ASR 的拆字，不改语义）。
-    fix_case=True 时顺带把常见英文词的全大写改回小写（本仓库模型吐不出小写）。
+    · 'keep'  —— 原样(默认,行为与今天完全一致)
+    · 'space' —— 中文标点转空格(保留问号)
+    英文术语合并始终执行(它只修 ASR 的拆字,不改语义)。
+    fix_case=True 时顺带把常见英文词的全大写改回小写(本仓库模型吐不出小写)。
     """
     if not t:
         return t
@@ -185,4 +221,7 @@ def normalize(t, punct_mode='keep', fix_case=True):
     t = merge_spaced_terms(t)
     if fix_case:
         t = fix_english_case(t)
+    # 后缀小写放最后:上面的合并/大小写都定稿了,才轮到「点后面那截」
+    # (合并会先动 `M D` → `MD`,这里才认得出 `AGENTS.MD` → `AGENTS.md`)。
+    t = lower_file_ext(t)
     return t
