@@ -58,6 +58,9 @@ const MA_NOACTIVATE: isize = 3;
 
 const OVERLAY_CLASS: &str = "SainputOverlayWnd";
 
+/// `SetThreadPriority` 的 THREAD_PRIORITY_BELOW_NORMAL。
+const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+
 /// 当前屏幕的 DPI 缩放系数（1.0 = 96 DPI / 100%）。
 ///
 /// 为什么必须要有它：进程是 **per-monitor DPI aware v2** 的，
@@ -293,6 +296,13 @@ extern "system" {
     fn DeleteObject(obj: isize) -> i32;
 }
 
+#[link(name = "kernel32")]
+extern "system" {
+    /// 伪句柄(`(HANDLE)-2`),指的是"当前线程",**不需要也不能** CloseHandle。
+    fn GetCurrentThread() -> isize;
+    fn SetThreadPriority(h: isize, p: i32) -> i32;
+}
+
 #[link(name = "user32")]
 extern "system" {
     fn RegisterClassW(c: *const WndClassW) -> u16;
@@ -520,6 +530,13 @@ impl Overlay {
         std::thread::Builder::new()
             .name("sainput-overlay".into())
             .spawn(move || {
+                // 体检报告 §5.2(线程优先级):这条线程只负责显示,降优先级 ——
+                // 它晚一帧没人看得出来(悬浮条/边缘光本来就是提示性的),
+                // 而识别线程晚一帧就是掉字。放在进消息循环之前设一次即可,
+                // 优先级是线程属性,之后不会再变。
+                unsafe {
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                }
                 let hwnd = unsafe { create_window() };
                 match hwnd {
                     Some(h) => {
@@ -778,6 +795,29 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wp: usize, lp: isize) 
     }
 }
 
+/// 悬浮球的波形自**上次真正画到屏幕上**以来变没变。
+///
+/// 为什么不能拿 `seq` 当门控:波形变化**不算**「内容变化」——
+/// `push_level` 的注释解释过,若算作内容变化会让整个 HUD 每帧重新定位+重画(反而闪)。
+/// 所以只能拿「上一帧画出去的那份 levels」和现在这份比。
+/// 顺带天然地合并帧:中间漏画几拍没关系,下一帧一定把最新的画出去,不会丢。
+/// 安静时主循环会一直推同一个数(比如 0.0),40 点滑窗内容完全不变 —— 那就一帧都不画。
+fn orb_levels_changed() -> bool {
+    let cur = match state().lock() {
+        Ok(s) => s.levels.clone(),
+        Err(_) => return false,
+    };
+    LAST_ORB_LEVELS.with(|slot| {
+        let mut last = slot.borrow_mut();
+        if last.as_deref() == Some(cur.as_slice()) {
+            false
+        } else {
+            *last = Some(cur);
+            true
+        }
+    })
+}
+
 /// 从共享状态同步窗口:内容、位置、显隐。
 ///
 /// 🔴 窗口**尺寸恒定 = 整屏**,而且只在第一次 ShowWindow,之后永不 hide/show。
@@ -847,8 +887,18 @@ unsafe fn sync(hwnd: isize) {
             false
         }
     };
-    // 悬浮球的波形是逐帧变的,但它不该让窗口重新定位/重排 —— 所以单独标一个"要重画"。
-    let repaint = changed || mode == Mode::Orb || mode == Mode::Edge;
+    // 「要不要重画」——
+    //
+    // 🔴 2026-10-31(AUDIT §5.1):原来是 `changed || mode == Orb || mode == Edge`。
+    // 悬浮球的画面是 **`levels` 的纯函数**:圆底和环的几何全是常量,九根柱的高度
+    // 只由最近九个音量值决定,没有任何时间项。而主循环每 ~32ms 才推一次 levels,
+    // 按 60fps 无条件重画意味着一半以上的帧画出来**和上一帧逐像素相同**,
+    // 白付一次 D2D 绘制 + 一次整屏 `UpdateLayeredWindow`。
+    // 现在只在「levels 和上次真正画出去的那份不一样」时才画(见 `orb_levels_changed`)。
+    //
+    // 边缘光**保留逐帧**:它的呼吸(2200ms)和流动(8000ms)是连续动画,门控会看出卡顿。
+    // 降帧率是另一条(有观感代价)的选项,不在本次改动里。
+    let repaint = changed || mode == Mode::Edge || (mode == Mode::Orb && orb_levels_changed());
 
     // 这块窗口是整屏的,所以「画布坐标 == 屏幕坐标」;
     // 下面算出来的 (x,y,w,h) 是**内容在画布里的矩形**(不再是窗口的位置/尺寸)。
@@ -1037,6 +1087,23 @@ unsafe fn caret_pos(hwnd: isize, w: i32, h: i32) -> (i32, i32) {
 /// 边缘光是整块 —— 但**画布和窗口的尺寸永远不变**。
 /// `draw=false`:推一帧全透明,用来"隐藏"(窗口一直留着,只是看不见)。
 ///
+/// ## 🔴 脏矩形只清该清的(2026-10-31,AUDIT §5.1)
+///
+/// 以前这里是 `ptr::write_bytes(bits, 0, sw*sh*4)`:4K 下 33MB,文档实测 **7ms/帧**,
+/// 而且只要在录音就每 16ms 付一次 —— 相当于一个逻辑核在空转(另一个核还要跑 ASR)。
+/// 但一帧里真正非透明的只有「上一帧画过的那几块」和「本帧要画的那几块」:
+/// 边缘光是沿边的四条光带(4K 下 ≈ 6MB),细条/悬浮球是一小块(几十 KB)。
+/// 所以改成只清 **上一帧区域 ∪ 本帧区域**:
+///   · 上一帧区域必须清 —— 画布是复用的(DIB 不重建,见 `Canvas`),本帧画到别处时
+///     旧位置不会自己消失,屏幕上就留鬼影;
+///   · 本帧区域也要清 —— 那里可能残留着更早的帧(内容移动过、模式换过),
+///     不能假设它本来就透明,否则残留会一帧帧攒下去。
+/// 不变量只有一句:**画布上非透明的像素一定落在 `DIRTY` 里**。
+///
+/// 清的是「哪些」由 `content_rects` 给(和真正绘制用的是同一份几何),
+/// 窗口表面那边不用管:每帧仍把**整张**位图推给 `UpdateLayeredWindow`,
+/// 画布上透明的部分自然把它盖成透明。
+///
 /// ⚠️ 尺寸唯一真源 = 屏幕:以前这里跟着「细条/悬浮球/边缘光」算 (w,h),
 /// 于是每句话都在整屏 ↔ 小面板之间重建位图、同时窗口也跟着改尺寸 ——
 /// 那正是"一句一块 32 MiB"的来源(见 sync 的注释)。
@@ -1071,8 +1138,20 @@ unsafe fn paint(hwnd: isize, panel: &Rect, draw: bool) {
         bottom: sh,
     };
 
+    // 本帧内容会落到画布上的区域(画布坐标 = 屏幕坐标)。
+    // `draw == false` 是「隐藏」那一帧:本帧什么都不画,于是「本帧区域」是空集,
+    // 下面的并集正好退化成「只把上一帧的残留抹掉」——正是隐藏要的效果。
+    let cur = if draw {
+        content_rects(mode, panel, sw, sh)
+    } else {
+        [EMPTY_RECT; DIRTY_MAX]
+    };
+
     // 画布:按**屏幕**尺寸缓存(整进程就这一块;屏幕变了才重建)。
-    CANVAS.with(|slot| unsafe {
+    //
+    // 这里只借一下 CANVAS 把 (mem_dc, bits) 拿出来就还回去 —— 后面的清零/绘制只用这两个值。
+    // (画布本身归缓存管,拿裸指针出去不会被回收,Drop 只在尺寸变化或线程结束时跑。)
+    let canvas_slot = CANVAS.with(|slot| unsafe {
         let mut slot = slot.borrow_mut();
         if slot.as_ref().map(|c| (c.w, c.h)) != Some((sw, sh)) {
             // 先把 D2D 的绑定作废(它绑的是旧 DC),再丢旧画布
@@ -1082,50 +1161,133 @@ unsafe fn paint(hwnd: isize, panel: &Rect, draw: bool) {
                 }
             });
             *slot = Canvas::create(sw, sh);
+            // 换了一块新内存:旧账本在新画布上毫无意义,直接作废
+            // (否则下一帧会在新画布上空清一块从没画过的区域 —— 无害,但说明不清不楚)。
+            // 顺手整块清一次:屏幕尺寸变化是极罕见事件,这一次全屏清零无所谓,
+            // 换来的是不必去假设 CreateDIBSection 给的位图一定是零。
+            if let Some(c) = slot.as_ref() {
+                ptr::write_bytes(c.bits, 0, (sw * sh * 4) as usize);
+            }
+            DIRTY.with(|d| *d.borrow_mut() = [EMPTY_RECT; DIRTY_MAX]);
         }
-        let Some(c) = slot.as_ref() else {
-            return; // 画布造不出来:这一帧不画
-        };
-        let (mem_dc, bits) = (c.mem_dc, c.bits);
+        slot.as_ref().map(|c| (c.mem_dc, c.bits))
+    });
+    let Some((mem_dc, bits)) = canvas_slot else {
+        return; // 画布造不出来:这一帧不画(账本原样留着,下一帧照上面的规则继续清)
+    };
 
-        // 全透明打底(复用画布,所以每帧都要清;顺带覆盖掉上一帧的内容/位置)
-        ptr::write_bytes(bits, 0, (sw * sh * 4) as usize);
+    // 把「上一帧区域」挪出来,顺手把「本帧区域」记进去 —— 下一帧要清的正是它。
+    // 必须等确认这一帧画得成之后才动账本:提前记下而中途 return,账本就和画布对不上,
+    // 那部分残留以后再也清不掉了。
+    let prev = DIRTY.with(|d| std::mem::replace(&mut *d.borrow_mut(), cur));
+
+    // 要抹成透明的区域 = **上一帧区域 ∪ 本帧区域**,合并进复用缓冲(稳态零分配)。
+    CLEAR.with(|cs| {
+        let mut buf = cs.borrow_mut();
+        buf.clear();
+        buf.extend(prev.iter().chain(cur.iter()).copied());
+        let clear: &[Rect] = buf.as_slice();
+
+        // 全透明打底 —— 只清这几块(以前是整屏 33MB,见函数开头的「脏矩形」)。
+        for r in clear {
+            clear_rect(bits, sw, sh, r);
+        }
 
         if draw {
             match mode {
-                Mode::Bar => d2d_paint_bar(mem_dc, &canvas, &layout, offset, &text),
-                Mode::Orb => d2d_paint_orb(mem_dc, &canvas, &layout, offset, &levels),
+                Mode::Bar => d2d_paint_bar(mem_dc, &canvas, clear, &layout, offset, &text),
+                Mode::Orb => d2d_paint_orb(mem_dc, &canvas, clear, &layout, offset, &levels),
                 Mode::Edge => {
                     let lv = state().lock().map(|g| g.edge_level).unwrap_or(0.0);
-                    d2d_paint_edge(mem_dc, &canvas, &layout, offset, lv);
+                    d2d_paint_edge(mem_dc, &canvas, clear, &layout, offset, lv);
                 }
             }
         }
-
-        // 推给窗口(带 alpha)。**尺寸恒等于整屏** → 系统不需要重建窗口表面。
-        let mut pt_src = Point { x: 0, y: 0 };
-        let mut sz = Size { cx: sw, cy: sh };
-        let blend = BlendFunction {
-            blend_op: 0, // AC_SRC_OVER
-            blend_flags: 0,
-            source_constant_alpha: 255,
-            alpha_format: 1, // AC_SRC_ALPHA
-        };
-        let mut pt_dst = Point { x: 0, y: 0 }; // 窗口就摆在 (0,0),整屏
-        UpdateLayeredWindow(
-            hwnd,
-            0,
-            &mut pt_dst,
-            &mut sz,
-            mem_dc,
-            &mut pt_src,
-            0,
-            &blend,
-            2, // ULW_ALPHA
-        );
-
-        // 画布不在这里删:它归 CANVAS 缓存管(屏幕尺寸变了或线程退出时才回收)。
     });
+
+    // 推给窗口(带 alpha)。**尺寸恒等于整屏** → 系统不需要重建窗口表面。
+    let mut pt_src = Point { x: 0, y: 0 };
+    let mut sz = Size { cx: sw, cy: sh };
+    let blend = BlendFunction {
+        blend_op: 0, // AC_SRC_OVER
+        blend_flags: 0,
+        source_constant_alpha: 255,
+        alpha_format: 1, // AC_SRC_ALPHA
+    };
+    let mut pt_dst = Point { x: 0, y: 0 }; // 窗口就摆在 (0,0),整屏
+    UpdateLayeredWindow(
+        hwnd,
+        0,
+        &mut pt_dst,
+        &mut sz,
+        mem_dc,
+        &mut pt_src,
+        0,
+        &blend,
+        2, // ULW_ALPHA
+    );
+
+    // 画布不在这里删:它归 CANVAS 缓存管(屏幕尺寸变了或线程退出时才回收)。
+}
+
+/// 本帧内容会覆盖到的矩形(画布坐标 = 屏幕坐标)—— 脏矩形的「本帧区域」。
+///
+/// · 细条 / 悬浮球:整个内容面板。D2D 是把内容**平移**进这块矩形里画的
+///   (见 `with_target` 的 offset),圆角矩形/圆/文字都严格落在它内部。
+/// · 边缘光:四条光带。这里直接复用 `edge_geometry` 的 band(和 `EdgeBrushes`
+///   拿去 PushLayer 当 contentBounds 的是同一组数),几何以后改了也不会两边对不上。
+///
+/// 每块都往外放 1px:抗锯齿和驱动取整理论上都不会越出几何边界,但万一越出去,
+/// 后果是屏幕上留一条**永远清不掉**的亮线 —— 多清 1px 的成本可以忽略,不值当赌。
+///
+/// 定长 4(悬浮球/细条只用第 0 个),没用到的槽位是空矩形,由空判断统一过滤。
+fn content_rects(mode: Mode, panel: &Rect, sw: i32, sh: i32) -> [Rect; DIRTY_MAX] {
+    let mut out = [EMPTY_RECT; DIRTY_MAX];
+    match mode {
+        Mode::Bar | Mode::Orb => out[0] = pad1(panel),
+        Mode::Edge => {
+            let spread = px(EDGE_SPREAD) as f32;
+            for (i, g) in edge_geometry(sw as f32, sh as f32, spread).iter().enumerate() {
+                let (l, t, r, b) = g.4;
+                out[i] = pad1(&Rect {
+                    left: l as i32,
+                    top: t as i32,
+                    right: r as i32,
+                    bottom: b as i32,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// 往外扩 1px(见 `content_rects` 的说明)。
+fn pad1(r: &Rect) -> Rect {
+    Rect {
+        left: r.left - 1,
+        top: r.top - 1,
+        right: r.right + 1,
+        bottom: r.bottom + 1,
+    }
+}
+
+/// 把画布上的矩形 `r` 抹成全透明(按行 `write_bytes`,不是逐像素)。
+///
+/// `cw`/`ch` = 画布宽高。矩形先按画布裁一次:内容可以被屏幕边界钳过,
+/// 屏幕也可能变小过,越界的行/列必须挡住(`write_bytes` 越界是踩内存,不是画错)。
+unsafe fn clear_rect(bits: *mut u8, cw: i32, ch: i32, r: &Rect) {
+    let l = r.left.clamp(0, cw);
+    let t = r.top.clamp(0, ch);
+    let rr = r.right.clamp(0, cw);
+    let bt = r.bottom.clamp(0, ch);
+    if rr <= l || bt <= t {
+        return;
+    }
+    let row_bytes = ((rr - l) * 4) as usize;
+    for y in t..bt {
+        let off = (y as usize * cw as usize + l as usize) * 4;
+        ptr::write_bytes(bits.add(off), 0, row_bytes);
+    }
 }
 
 /// D2D 渲染目标,外加「当前绑到哪儿」——用来免得每帧都 BindDC。
@@ -1201,6 +1363,17 @@ impl Drop for Canvas {
     }
 }
 
+/// 一帧最多几块脏矩形:细条/悬浮球是 1 块,边缘光是 4 条光带。
+const DIRTY_MAX: usize = 4;
+/// 空矩形(`left == right`)—— 数组里没用到的槽位都用它,统一由空判断过滤掉,
+/// 这样「本帧不画任何东西」不用换一种数据结构来表达。
+const EMPTY_RECT: Rect = Rect {
+    left: 0,
+    top: 0,
+    right: 0,
+    bottom: 0,
+};
+
 thread_local! {
     /// D2D 渲染目标缓存(窗口线程专用;COM 对象不是 Send)。
     ///
@@ -1211,6 +1384,21 @@ thread_local! {
 
     /// 每帧画布缓存(按尺寸复用)。
     static CANVAS: std::cell::RefCell<Option<Canvas>> = const { std::cell::RefCell::new(None) };
+
+    /// 🔴 脏矩形的账本:画布上**当前还残留着非透明内容**的矩形(画布坐标 = 屏幕坐标)。
+    ///
+    /// 为什么会需要这本账:画布是**复用**的(DIB 不重建,见 `Canvas` 的注释),
+    /// 上一帧画出去的东西不会自己消失 —— 本帧若不在同一位置重画,屏幕上就留鬼影。
+    /// 完整的推导见 `paint` 里「清哪些」那段注释。
+    static DIRTY: std::cell::RefCell<[Rect; DIRTY_MAX]> =
+        const { std::cell::RefCell::new([EMPTY_RECT; DIRTY_MAX]) };
+
+    /// 「上一帧区域 ∪ 本帧区域」的复用缓冲 —— 免得每帧为这几个矩形分配一次 Vec(Vec 稳态不扩容)。
+    static CLEAR: std::cell::RefCell<Vec<Rect>> = const { std::cell::RefCell::new(Vec::new()) };
+
+    /// 上一帧**真正画到屏幕上**的悬浮球波形 —— 只在 Orb 模式下用(见 `orb_levels_changed`)。
+    static LAST_ORB_LEVELS: std::cell::RefCell<Option<Vec<f32>>> =
+        const { std::cell::RefCell::new(None) };
 
     /// 上一次 D2D 报错的时刻和内容。
     /// 窗口线程在设备丢失时会按 60fps 重试，不设限流会把控制台/日志刷爆。
@@ -1237,11 +1425,19 @@ fn log_d2d_err(stage: &str, e: &windows::core::Error) {
     });
 }
 
-/// 建一个绑到 DIB 上的 D2D render target，跑 `f`，收尾。
+/// 建一个绑到 DIB 上的 D2D render target,跑 `f`,收尾。
 ///
 /// 抽出来是因为细条和悬浮球用的是**同一套** D2D 初始化 ——
-/// 复制两遍的话，以后改 alpha 模式/像素格式要改两处，容易漏。
-fn with_target(hdc: isize, canvas: &Rect, offset: (f32, f32), f: impl FnOnce(&d2d_target::Target)) {
+/// 复制两遍的话,以后改 alpha 模式/像素格式要改两处,容易漏。
+///
+/// `clear`:本次要抹成透明的矩形(画布坐标)= 上一帧 ∪ 本帧的脏矩形,见 `paint`。
+fn with_target(
+    hdc: isize,
+    canvas: &Rect,
+    clear: &[Rect],
+    offset: (f32, f32),
+    f: impl FnOnce(&d2d_target::Target),
+) {
     use windows::core::Interface;
     use windows::Foundation::Numerics::Matrix3x2;
     use windows::Win32::Foundation::RECT;
@@ -1265,6 +1461,10 @@ fn with_target(hdc: isize, canvas: &Rect, offset: (f32, f32), f: impl FnOnce(&d2
     RT.with(|slot| unsafe {
     let mut slot = slot.borrow_mut();
     let mut dead = false;
+    // 「这一帧的目标里那份内部位图是新的、内容不可知」——要整块清一次(见下面的打底)。
+    // 两种情况都算:一种是刚建的 target,另一种是这一帧重新 BindDC 了(换了 DC 或换了绑定矩形,
+    // 对 D2D 来说内部位图同样作废)。
+    let mut fresh = slot.is_none();
     // 这一帧要绑的 DC + 矩形:和上次一样就不必再 BindDC
     // (画布缓存之后 DC 每帧都相同,所以这句大多数帧都成立)。
     let want = (hdc, canvas.left, canvas.top, canvas.right, canvas.bottom);
@@ -1320,6 +1520,8 @@ fn with_target(hdc: isize, canvas: &Rect, offset: (f32, f32), f: impl FnOnce(&d2
 
     // 只有「绑的东西变了」才重新 BindDC —— DC 和矩形都没变就不动它。
     let need_bind = slot.as_ref().and_then(|c| c.bound) != Some(want);
+    // 重新绑过之后,内部位图对这块 DC 来说是新的(内容和旧绑定无关)—— 按"新 target"处理。
+    fresh |= need_bind;
     if need_bind {
         let sub = RECT {
             left: canvas.left,
@@ -1344,7 +1546,36 @@ fn with_target(hdc: isize, canvas: &Rect, offset: (f32, f32), f: impl FnOnce(&d2
         // 消失,但语音输入一切正常」,只能重启进程。
         // 现在只要出错就丢弃缓存,下一帧用新 target 重建,最多丢一帧。
         c.target.BeginDraw();
-        c.target.Clear(Some(&color(0, 0, 0, 0.0)));
+        // 打底:把 `clear` 给的那几块抹成全透明 —— 就是「上一帧 ∪ 本帧」的脏矩形(见 paint)。
+        //
+        // 🔴 为什么不能像以前那样无条件清**整块**画布:4K 下 33MB/帧,是本次要省的主角。
+        // 裁剪(PushAxisAlignedClip)压在**设平移之前**,所以这里给的是画布坐标;
+        // 空矩形要跳过(D2D 对退化矩形会直接失败)。
+        //
+        // 刚建出来的 target 例外:它内部那份位图是新的,内容不可知,而它每帧都会
+        // (在 EndDraw 时)整块贴回 DC —— 只要里面还留着"不可知"的像素,就会一直
+        // 盖在我们的账本上。所以建新 target 的这一帧整块清一次,把
+        // 「内部位图 = 全透明」这条前提立起来;之后每帧只清脏矩形就是完备的
+        // (归纳:上一帧的非透明区域一定在 prev 里,而 prev 每帧都被清)。
+        if fresh {
+            c.target.Clear(Some(&color(0, 0, 0, 0.0)));
+        } else {
+            for r in clear {
+                if r.left >= r.right || r.top >= r.bottom {
+                    continue;
+                }
+                let clip = d2dc::D2D_RECT_F {
+                    left: r.left as f32,
+                    top: r.top as f32,
+                    right: r.right as f32,
+                    bottom: r.bottom as f32,
+                };
+                c.target
+                    .PushAxisAlignedClip(&clip, d2d::D2D1_ANTIALIAS_MODE_ALIASED);
+                c.target.Clear(Some(&color(0, 0, 0, 0.0)));
+                c.target.PopAxisAlignedClip();
+            }
+        }
         // 内容整体平移到它在画布里的位置(细条/悬浮球不贴左上角)。
         // 平移而不是"把绑定矩形挪过去" —— 见函数开头的注释。
         c.target.SetTransform(&Matrix3x2::translation(offset.0, offset.1));
@@ -1374,11 +1605,11 @@ mod d2d_target {
 /// 细条：**只有正文**，半透明圆角矩形。
 ///
 /// 用户要求撤掉「录音中…」状态行 —— 状态交给悬浮球，细条只管文字。
-fn d2d_paint_bar(hdc: isize, canvas: &Rect, rc: &Rect, offset: (f32, f32), text: &str) {
+fn d2d_paint_bar(hdc: isize, canvas: &Rect, clear: &[Rect], rc: &Rect, offset: (f32, f32), text: &str) {
     use windows::Win32::Graphics::Direct2D as d2d;
     use windows::Win32::Graphics::Direct2D::Common as d2dc;
 
-    with_target(hdc, canvas, offset, |t| unsafe {
+    with_target(hdc, canvas, clear, offset, |t| unsafe {
         let target = t.target;
         let w = (rc.right - rc.left) as f32;
         let h = (rc.bottom - rc.top) as f32;
@@ -1404,15 +1635,19 @@ fn d2d_paint_bar(hdc: isize, canvas: &Rect, rc: &Rect, offset: (f32, f32), text:
     });
 }
 
-/// 悬浮球：圆形底 + 呼吸环 + 实时波形。
+/// 悬浮球:圆形底 + 琥珀细环 + 实时波形。
+///
+/// ⚠️ 这里**没有任何时间项**:环是固定几何的(没有呼吸动画),九根柱的高度只由
+/// `levels` 决定 —— 所以「levels 没变就不用重画」这条门控是完备的(见 `orb_levels_changed`)。
+/// 以后真给球加了呼吸/旋转之类的逐帧动画,**必须**同时改那条门控,否则动画会停住。
 ///
 /// 波形是**真实音量**驱动的（见 `Overlay::push_level`），不是装饰动画 ——
 /// 用户说话时才会起伏，安静时是一条平线。
-fn d2d_paint_orb(hdc: isize, canvas: &Rect, rc: &Rect, offset: (f32, f32), levels: &[f32]) {
+fn d2d_paint_orb(hdc: isize, canvas: &Rect, clear: &[Rect], rc: &Rect, offset: (f32, f32), levels: &[f32]) {
     use windows::Win32::Graphics::Direct2D as d2d;
     use windows::Win32::Graphics::Direct2D::Common as d2dc;
 
-    with_target(hdc, canvas, offset, |t| unsafe {
+    with_target(hdc, canvas, clear, offset, |t| unsafe {
         let target = t.target;
         let d = (rc.right - rc.left) as f32;
         let c = d / 2.0;
@@ -1696,7 +1931,7 @@ impl EdgeBrushes {
 /// · 流动 = 把色带刷的几何沿边平移(`SetStartPoint`/`SetEndPoint`)
 /// · 亮度 = 蒙版刷的 `SetOpacity`
 /// · 颜色变化 = 色带刷的色标只在**建一次**时烘焙(flow=0),之后靠平移
-fn d2d_paint_edge(hdc: isize, canvas: &Rect, rc: &Rect, offset: (f32, f32), level: f32) {
+fn d2d_paint_edge(hdc: isize, canvas: &Rect, clear: &[Rect], rc: &Rect, offset: (f32, f32), level: f32) {
     use windows::core::Interface;
     use windows::Win32::Graphics::Direct2D::Common as d2dc;
 
@@ -1706,7 +1941,7 @@ fn d2d_paint_edge(hdc: isize, canvas: &Rect, rc: &Rect, offset: (f32, f32), leve
 
     let tint = edge_tint();
 
-    with_target(hdc, canvas, offset, |t| unsafe {
+    with_target(hdc, canvas, clear, offset, |t| unsafe {
         let target = t.target;
         let w = (rc.right - rc.left) as f32;
         let h = (rc.bottom - rc.top) as f32;
@@ -1926,7 +2161,7 @@ mod tests {
             };
 
             let mut drew = false;
-            with_target(mem_dc, &rc, (0.0, 0.0), |_| drew = true);
+            with_target(mem_dc, &rc, std::slice::from_ref(&rc), (0.0, 0.0), |_| drew = true);
             assert!(drew, "健康 target 应执行绘制");
             assert!(
                 RT.with(|s| s.borrow().is_some()),
@@ -1937,7 +2172,7 @@ mod tests {
             let stale = CreateCompatibleDC(0);
             assert!(stale != 0);
             DeleteDC(stale);
-            with_target(stale, &rc, (0.0, 0.0), |_| {});
+            with_target(stale, &rc, std::slice::from_ref(&rc), (0.0, 0.0), |_| {});
             assert!(
                 RT.with(|s| s.borrow().is_none()),
                 "BindDC 失败后必须丢弃缓存（旧 bug：继续复用死 target）"
@@ -1945,11 +2180,174 @@ mod tests {
 
             // 下一帧用健康 DC：必须重建并继续画
             let mut drew_again = false;
-            with_target(mem_dc, &rc, (0.0, 0.0), |_| drew_again = true);
+            with_target(mem_dc, &rc, std::slice::from_ref(&rc), (0.0, 0.0), |_| drew_again = true);
             assert!(drew_again, "缓存重建后应继续绘制");
             assert!(RT.with(|s| s.borrow().is_some()));
 
-            // 先清缓存再收尾，别让 target 绑着已删除的 DC
+            // 先清缓存再收尾,别让 target 绑着已删除的 DC
+            RT.with(|s| *s.borrow_mut() = None);
+            SelectObject(mem_dc, old_bmp);
+            DeleteObject(dib);
+            DeleteDC(mem_dc);
+        }
+    }
+
+    /// 回归:`clear_rect` 只抹给定矩形 —— 脏矩形的正确性全押在它身上。
+    ///
+    /// 关键的一条是**裁剪**:矩形可能被屏幕边界钳成负坐标或超出画布,
+    /// 越界写不是"画错"而是踩内存。
+    #[test]
+    fn clear_rect_zeroes_only_that_rect() {
+        let (w, h) = (8i32, 4i32);
+        let mut buf = vec![0xFFu8; (w * h * 4) as usize];
+        unsafe {
+            clear_rect(
+                buf.as_mut_ptr(),
+                w,
+                h,
+                &Rect { left: -2, top: 1, right: 3, bottom: 3 },
+            );
+        }
+        for y in 0..h {
+            for x in 0..w {
+                let a = buf[((y * w + x) * 4 + 3) as usize];
+                let inside = (1..3).contains(&y) && (0..3).contains(&x);
+                assert_eq!(a == 0, inside, "({x},{y}) 该清/不该清判断错了");
+            }
+        }
+        // 空矩形(账本里的"没用到的槽位")必须什么都不做
+        let mut buf2 = vec![0xFFu8; (w * h * 4) as usize];
+        unsafe { clear_rect(buf2.as_mut_ptr(), w, h, &EMPTY_RECT) };
+        assert!(buf2.iter().all(|b| *b == 0xFF));
+    }
+
+    /// 回归:`content_rects` 必须把内容**圈得住**(圈不住 = 屏幕上留残留)。
+    #[test]
+    fn content_rects_covers_drawn_area() {
+        let (sw, sh) = (1920, 1080);
+        // 细条/悬浮球:内容面板本身
+        let panel = Rect { left: 100, top: 200, right: 400, bottom: 260 };
+        let bar = content_rects(Mode::Bar, &panel, sw, sh);
+        assert!(
+            bar[0].left <= panel.left
+                && bar[0].top <= panel.top
+                && bar[0].right >= panel.right
+                && bar[0].bottom >= panel.bottom
+        );
+        assert!(
+            bar[1..].iter().all(|r| r.left >= r.right),
+            "没用到的槽位应该是空矩形"
+        );
+        let orb = content_rects(Mode::Orb, &panel, sw, sh);
+        assert_eq!(
+            (orb[0].left, orb[0].top, orb[0].right, orb[0].bottom),
+            (bar[0].left, bar[0].top, bar[0].right, bar[0].bottom)
+        );
+
+        // 边缘光:四条光带(顺序同 edge_geometry:上/右/下/左),贴边且向内延伸
+        let e = content_rects(Mode::Edge, &Rect::default(), sw, sh);
+        assert!(e[0].left <= 0 && e[0].top <= 0 && e[0].right >= sw && e[0].bottom > 0);
+        assert!(e[1].left > 0 && e[1].left < sw && e[1].right >= sw && e[1].bottom >= sh);
+        assert!(e[2].left <= 0 && e[2].right >= sw && e[2].top > 0 && e[2].bottom >= sh);
+        assert!(e[3].left <= 0 && e[3].right > 0 && e[3].top <= 0 && e[3].bottom >= sh);
+    }
+
+    /// 🔴 实测:被裁剪的 `Clear` 会不会动到画布上**没被清到**的地方。
+    ///
+    /// 这条决定了「脏矩形清零」能不能做。`ID2D1DCRenderTarget` 的官方说明是
+    /// 「先画进一张内部位图,再用 GDI 贴回 DC」,但**没说贴的范围**:
+    /// 万一它每帧把整张内部位图原样贴回来,那"只清脏矩形"就是错的 ——
+    /// 内部位图里上一帧的旧内容会被贴回来,在屏幕上留鬼影,而且会盖掉我们
+    /// 按账本刚擦干净的区域(那样只能用"整块清"或改成累计区域,方案完全不同)。
+    ///
+    /// 做法:第 1 帧在 A 画东西(此后 D2D 内部 A 处有内容);按真实流程把 A
+    /// **自己擦干净**(模拟账本里"清上一帧区域"这一步);第 2 帧只在 B 画、
+    /// 且只让 D2D 清 B —— 然后回头看 A 是不是又被贴上了内容。
+    ///
+    /// 2026-10-31 本机(Direct2D 软件路径)结果:A 保持全透明 ⇒ 没被清到的地方
+    /// 不会被 D2D 改写,裁剪清零成立(AUDIT §5.1 的前提)。
+    #[test]
+    fn clipped_clear_keeps_untouched_area() {
+        use windows::Win32::Graphics::Direct2D::Common as d2dc;
+        unsafe {
+            let n = 64;
+            let mem_dc = CreateCompatibleDC(0);
+            assert!(mem_dc != 0, "CreateCompatibleDC failed");
+            let bmi = BitmapInfo {
+                header: BitmapInfoHeader {
+                    bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+                    bi_width: n,
+                    bi_height: -n,
+                    bi_planes: 1,
+                    bi_bit_count: 32,
+                    bi_compression: 0,
+                    bi_size_image: (n * n * 4) as u32,
+                    ..Default::default()
+                },
+                colors: [0; 3],
+            };
+            let mut bits: *mut u8 = ptr::null_mut();
+            let dib = CreateDIBSection(mem_dc, &bmi, 0, &mut bits, 0, 0);
+            assert!(dib != 0 && !bits.is_null(), "CreateDIBSection failed");
+            let old_bmp = SelectObject(mem_dc, dib);
+            ptr::write_bytes(bits, 0, (n * n * 4) as usize);
+
+            let canvas = Rect {
+                left: 0,
+                top: 0,
+                right: n,
+                bottom: n,
+            };
+            let a = Rect { left: 8, top: 8, right: 24, bottom: 24 };
+            let b = Rect { left: 40, top: 40, right: 56, bottom: 56 };
+            // 画布上 (x,y) 处的 4 个字节(BGRA),第 4 个是 alpha
+            let at = |x: i32, y: i32| -> [u8; 4] {
+                let mut out = [0u8; 4];
+                for (k, slot) in out.iter_mut().enumerate() {
+                    *slot = *bits.add((y as usize * n as usize + x as usize) * 4 + k);
+                }
+                out
+            };
+            let fill = |r: &Rect, color_word: u32| {
+                with_target(mem_dc, &canvas, std::slice::from_ref(r), (0.0, 0.0), |t| {
+                    if let Ok(br) =
+                        t.target.CreateSolidColorBrush(&argb(color_word) as *const _, None)
+                    {
+                        t.target.FillRectangle(
+                            &d2dc::D2D_RECT_F {
+                                left: r.left as f32,
+                                top: r.top as f32,
+                                right: r.right as f32,
+                                bottom: r.bottom as f32,
+                            },
+                            &br,
+                        );
+                    }
+                });
+            };
+
+            // 第 1 帧:清整块(把 A 写进 D2D 的内部位图),在 A 里画一块不透明的红
+            fill(&a, 0xFF_FF0000);
+            assert!(at(16, 16)[3] > 0, "第 1 帧后 A 应该有内容,否则这条测试没有意义");
+
+            // 真实流程里「账本把上一帧区域擦掉」这一步
+            for y in a.top..a.bottom {
+                ptr::write_bytes(
+                    bits.add((y as usize * n as usize + a.left as usize) * 4),
+                    0,
+                    ((a.right - a.left) * 4) as usize,
+                );
+            }
+            assert_eq!(at(16, 16)[3], 0, "A 应该已被账本擦干净");
+
+            // 第 2 帧:只让 D2D 清 B,并在 B 里画东西(保证这一帧确实有绘制、有回贴)
+            fill(&b, 0xFF_00FF00);
+            assert_eq!(
+                at(16, 16)[3], 0,
+                "A 又被贴上了内容 —— D2D 把整张内部位图回贴了,脏矩形清零不成立"
+            );
+            assert_eq!(at(48, 48), [0, 255, 0, 255], "B 里应该画上了不透明的绿");
+
             RT.with(|s| *s.borrow_mut() = None);
             SelectObject(mem_dc, old_bmp);
             DeleteObject(dib);
