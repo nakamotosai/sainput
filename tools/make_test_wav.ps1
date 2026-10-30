@@ -10,7 +10,7 @@
 param(
   [string]$Out = "tmp/zh-en.wav",
   [string]$Zh = "我们现在就在微信里面说一句英文的 TOKEN 看看它还在不在",
-  [string]$En = "TOKEN"
+  [string]$En = "TOKEN"   # 留空 = 不加英文段
 )
 Add-Type -AssemblyName System.Speech
 $fmt = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(
@@ -28,9 +28,13 @@ function Say([string]$voice, [string]$text) {
   return $ms.ToArray()
 }
 
-$pcm = [byte[]]@((Say "Microsoft Huihui Desktop" $Zh) + (Say "Microsoft Zira Desktop" $En))
+# 英文段留空(或只给空白)就只出中文那一段 —— 纯数字串的回归要的是一段干净中文
+$parts = @(Say "Microsoft Huihui Desktop" $Zh)
+if ($En -and $En.Trim()) { $parts += Say "Microsoft Zira Desktop" $En }
+$pcm = [byte[]]@($parts)
 
-$full = [IO.Path]::GetFullPath((Join-Path (Get-Location) $Out))
+# $Out 允许绝对路径或相对仓库根:Join-Path 遇到绝对子路径会拼出畸形路径(PowerShell 5.1),
+$full = if ([IO.Path]::IsPathRooted($Out)) { [IO.Path]::GetFullPath($Out) } else { [IO.Path]::GetFullPath((Join-Path (Get-Location) $Out)) }
 $dir = Split-Path -Parent $full
 if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
 $w = New-Object System.IO.BinaryWriter([IO.File]::Create($full))
