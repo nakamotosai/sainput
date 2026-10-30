@@ -12,6 +12,10 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\make-portable.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts\make-portable.ps1 -Overwrite
 #
+# The package is gated on `cargo test --release -p sainput-core` (the same command CI
+# runs, see CONTRIBUTING.md 3.1). `cargo build` never compiles test targets, so without
+# that gate a release can be tagged while its unit tests do not even compile.
+#
 # Version always derives from Cargo.toml; never hardcode it here to avoid drift.
 # Keep this file pure ASCII (see build.bat header for the reason).
 
@@ -38,6 +42,14 @@ Write-Host "[pack] version = $Version (from Cargo.toml)"
 
 $CargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
 if ((Test-Path $CargoBin) -and ($env:PATH -notlike "*$CargoBin*")) { $env:PATH = "$CargoBin;$env:PATH" }
+
+# ---------------------------------------------------------------- tests -------
+# Gate the package on the unit tests. Run it HERE, before the layout block below
+# deletes or rewrites anything under dist\, so a failing gate leaves the previous
+# package (folder and zip) untouched.
+Write-Host "[pack] cargo test --release -p sainput-core"
+& cargo test --release -p sainput-core
+if ($LASTEXITCODE -ne 0) { throw "cargo test --release -p sainput-core failed - refusing to package" }
 
 # ---------------------------------------------------------------- layout -----
 $Dist = Join-Path $Root "dist\sainput-$Version-win64"
