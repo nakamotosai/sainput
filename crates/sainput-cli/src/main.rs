@@ -32,6 +32,13 @@ use sainput_core::{
 const DEFAULT_MODEL: &str =
     "sherpa-onnx-x-asr-160ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05";
 const DEFAULT_PUNCT: &str = "sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8";
+/// 二遍重打(高精度模式,`twopass`)用的模型:x-asr-480ms。
+///
+/// 为什么是 480ms 档:整段解码时它明显更准(体检报告 §6.4 实测:160ms 把
+/// "THE DAY AFTER TOMORROW" 听成 "TODAY AFTER TOMORROW",480ms 那版是对的),
+/// 代价是整句重解多花约 1 秒 —— 而且只花在**松键之后**,不碰 960ms 首字。
+const DEFAULT_TWOPASS_MODEL: &str =
+    "sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05";
 const CONF_NAME: &str = "sainput.conf";
 const HOTWORDS_NAME: &str = "hotwords.txt";
 
@@ -63,7 +70,7 @@ fn usage() {
          --toggle               按一下开始、再按一下结束（默认按住说话）\n  \
          --hold                 按住说话（默认）\n  \
          --device <NAME>        指定麦克风（默认系统默认设备）\n  \
-         --no-stream            当前不可用（未实现：选了它一个字都不会上屏）\n  \
+         --no-stream            不逐字上屏：流式阶段一个字都不打，松手定稿时整句一次性打字\n  \
          --overlay-mode <M>     悬浮显示：off / bar（细条）/ orb（悬浮球）/ edge（屏幕边缘光）\n  \
          --no-tray              关掉系统托盘图标\n  \
          --show-console         不自动收起控制台窗口\n  \
@@ -77,16 +84,21 @@ fn usage() {
          --tail-quiet-ms <N>    尾巴里连续安静这么久就收工，默认 250ms\n  \
          --tail-pad-ms <N>      收工时一次性补灌多少毫秒底噪（模型的右上下文），默认 480ms\n  \
          --tail-rms <F>         静音判定阈值（帧 RMS），默认 0.012\n  \
-         --feed-release-at <S>  测试用：--feed 喂到第 S 秒自动松键（吞字回归）\n  \
-         --python <EXE>         Python 解释器（默认自动探测）\n  \
+         --feed-release-at <S>  测试用:--feed 喂到第 S 秒自动松键(吞字回归)\n  \
+         --twopass              二遍重打:松键后用更准的 480ms 档整句重解一遍\n  \
+         --twopass-model-dir <DIR>  二遍重打用的模型目录(默认 models 下的 480ms 档)\n  \
+         --no-focus-guard       关掉焦点守卫(默认开:按住说话途中切了窗口就中止本句注入)\n  \
+         --python <EXE>         Python 解释器(默认按 PATH 里的绝对路径探测,\n  \
+                                 可用 SAINPUT_PYTHON 固定)\n  \
          --dry-run              不真的注入,只打印文本(replay / run 都可用;\n  \
                                  run + --feed 可离线演练完整链路,不打扰当前窗口)\n\n\
          CONFIG:\n  \
-         仓库根下的 {CONF_NAME} 可写日常偏好（key = value），命令行参数优先级更高。\n  \
-         可用键：hotkey / model_dir / punct_dir / hotwords / punct / itn / beam / toggle / tray /\n  hide_console / \
+         仓库根下的 {CONF_NAME} 可写日常偏好(key = value),命令行参数优先级更高。\n  \
+         可用键:hotkey / model_dir / punct_dir / hotwords / punct / itn / beam / toggle / tray /\n  hide_console / \
          overlay_mode / stream / lazy_mic / max_backspace / throttle_ms / threads / device /\n         \
          tail_ms / tail_max_ms / tail_quiet_ms / tail_pad_ms / tail_rms /\n         \
-         punct_mode / merge_terms / fix_case / ctx_bias / ime_wmchar",
+         punct_mode / merge_terms / fix_case / ctx_bias / ime_wmchar /\n         \
+         twopass / twopass_model_dir / focus_guard",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -191,30 +203,126 @@ fn resolve_path(root: &Path, p: &str) -> PathBuf {
     }
 }
 
-/// 找一个能用的 Python（双击 .bat 启动时 PATH 可能不含 Python 目录）。
+/// 解释器候选文件名(按优先级)。
+#[cfg(windows)]
+const PY_NAMES: [&str; 3] = ["python.exe", "python3.exe", "py.exe"];
+#[cfg(not(windows))]
+const PY_NAMES: [&str; 3] = ["python3", "python", "py"];
+
+/// 探一个解释器能不能真的跑起来(拿不到退出码就当不行)。
+fn python_works(p: &Path) -> bool {
+    std::process::Command::new(p)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// 列出**绝对路径**的候选解释器(只做存在性检查,不执行)。
 ///
-/// 优先级：环境变量 `SAINPUT_PYTHON`（非空则直接用）→ PATH 里的
-/// python / python3 / py → 兜底 `"python"`。
-fn resolve_python() -> String {
+/// 只收绝对路径是刻意的:给 `Command::new("python")` 一个裸名字时,CreateProcess
+/// 走的是 Windows 搜索顺序 —— **当前目录排在系统目录和 PATH 之前**。在仓库根丢一个
+/// 假 `python.exe`,双击启动的 sainput 就会把它当解释器跑起来(体检报告 §4.2)。
+/// 所以:空 PATH 项和相对项一律跳过(那正是「先看当前目录」那一段),
+/// `where python` 也帮不上忙 —— 它同样先搜当前目录。
+fn python_candidates() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if p.is_absolute() && p.is_file() && !out.contains(&p) {
+            out.push(p);
+        }
+    };
+
+    // 1) PATH(**只认绝对目录**)
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            if !dir.is_absolute() {
+                continue;
+            }
+            for n in PY_NAMES {
+                push(dir.join(n));
+            }
+        }
+    }
+
+    // 2) 常见安装位置(python.org 安装器 / 微软商店别名 / py 启动器的目标)。
+    //    为什么还要这一份:很多人装 Python 时没勾「Add to PATH」,上面那一条就全军覆没,
+    //    而这里列的位置就是注册表 PythonCore\InstallPath 指的那几个目录。
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let local = PathBuf::from(local);
+        for n in PY_NAMES {
+            push(local.join("Microsoft").join("WindowsApps").join(n));
+        }
+        let dir = local.join("Programs").join("Python");
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            let mut subs: Vec<PathBuf> = rd
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_dir())
+                .collect();
+            // 名字倒序 = 新版优先(Python310/311/312 的字典序恰好等于版本序)
+            subs.sort();
+            for d in subs.into_iter().rev() {
+                for n in PY_NAMES {
+                    push(d.join(n));
+                }
+            }
+        }
+    }
+    for pf in ["ProgramFiles", "PROGRAMFILES", "ProgramFiles(x86)"] {
+        if let Some(p) = std::env::var_os(pf) {
+            let dir = PathBuf::from(p).join("Python");
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                let mut subs: Vec<PathBuf> = rd
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.is_dir())
+                    .collect();
+                subs.sort();
+                for d in subs.into_iter().rev() {
+                    for n in PY_NAMES {
+                        push(d.join(n));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 找一个能用的 Python,并**固定成绝对路径**(体检报告 §4.2)。
+///
+/// 优先级:`SAINPUT_PYTHON`(非空则**原样**用它 —— 便携版启动器写进去的就是绝对路径,
+/// 必须尊重)→ 上面那份绝对路径候选表里第一个**真能跑起来**的 →
+/// 都没有就报错。**不再退回裸 `python`**:宁可起不来,也不要悄悄跑一个
+/// 可能来自当前目录的解释器。
+fn resolve_python() -> Result<String> {
     if let Ok(p) = std::env::var("SAINPUT_PYTHON") {
         let p = p.trim();
         if !p.is_empty() {
-            return p.to_string();
+            return Ok(p.to_string());
         }
     }
-    for c in ["python", "python3", "py"] {
-        let ok = std::process::Command::new(c)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            return c.to_string();
+    let cands = python_candidates();
+    for c in &cands {
+        if python_works(c) {
+            return Ok(c.display().to_string());
         }
     }
-    "python".to_string()
+    let tried = if cands.is_empty() {
+        "(没找到任何候选)".to_string()
+    } else {
+        cands
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" / ")
+    };
+    anyhow::bail!(
+        "找不到可用的 Python 解释器(只认绝对路径,已排除当前目录)。\n\
+         装一个 Python 3.8+,或在 sainput.conf 里写 `python = C:\\...\\python.exe`,\n\
+         或设环境变量 SAINPUT_PYTHON。\n探过的候选:{tried}"
+    )
 }
 
 // ------------------------------------------------- 配置：命令行 > sainput.conf > 默认
@@ -285,6 +393,13 @@ struct Cfg {
     /// PostMessage(WM_CHAR) 绕开键盘那条链;`pebrel` 则完全不发按键,把整句放进
     /// Pebrel 自己的组合态缓冲层。见 `sainput_core::inject::decide_key_mode`。
     ime_wmchar: String,
+    /// 二遍重打(高精度模式,`twopass`):松键后用更准的模型把整句重解一遍。
+    twopass: bool,
+    /// 二遍重打用的模型目录(只有 `twopass` 打开时才会传给 sidecar)。
+    twopass_model_dir: PathBuf,
+    /// 焦点守卫(`focus_guard`,默认开):目标模式下,上屏前复核前台窗口,
+    /// 和按下时不一致就中止本句注入。见 worker 里的复核与 RunOpts.focus_guard。
+    focus_guard: bool,
 }
 
 impl Cfg {
@@ -320,6 +435,13 @@ impl Cfg {
         }
         if !self.fix_case {
             v.push("--no-fix-case".to_string());
+        }
+        // 二遍重打:只有开了才传 —— sidecar 那边是「不传就**不加载**二遍模型」,
+        // 所以关着的时候启动时间和内存都跟以前一模一样。
+        if self.twopass {
+            v.push("--twopass".to_string());
+            v.push("--twopass-model-dir".to_string());
+            v.push(self.twopass_model_dir.display().to_string());
         }
         // 注意：**不能**在这里判 `extra.exists()` —— 这个文件是 run 主循环在第一句开始时
         // 才创建的，而 asr_args 是在 spawn（更早）时调的。早期判存在会让这个参数永远传不出去，
@@ -428,8 +550,22 @@ fn cfg(a: &Args) -> Result<Cfg> {
     }
     let python = match a.s("python", "--python") {
         Some(p) => PathBuf::from(p),
-        None => PathBuf::from(resolve_python()),
+        None => PathBuf::from(resolve_python()?),
     };
+
+    // 二遍重打:开了就必须能拿到模型目录,否则直接说清楚(别等 sidecar 起来才报)。
+    let twopass = a.b("twopass", "--twopass", "--no-twopass", false);
+    let twopass_model_dir = resolve_path(
+        &root,
+        &a.s("twopass_model_dir", "--twopass-model-dir")
+            .unwrap_or_else(|| format!("models/{DEFAULT_TWOPASS_MODEL}")),
+    );
+    if twopass && !twopass_model_dir.is_dir() {
+        anyhow::bail!(
+            "twopass 开着,但找不到二遍重打模型目录: {}\n提示:放好 480ms 档模型,或用 twopass_model_dir / --twopass-model-dir 指定",
+            twopass_model_dir.display()
+        );
+    }
 
     // 上下文偏置总开关：run 用它决定要不要写偏置文件，sidecar 用它决定要不要挂 per-stream 热词。
     let ctx_bias = a.b("ctx_bias", "--ctx-bias", "--no-ctx-bias", true);
@@ -461,6 +597,11 @@ fn cfg(a: &Args) -> Result<Cfg> {
             .s("ime_wmchar", "--ime-wmchar")
             .unwrap_or_else(|| "auto".to_string())
             .to_ascii_lowercase(),
+        twopass,
+        twopass_model_dir,
+        // 焦点守卫:默认**开**(它只在「按住说话途中切了窗口」时才动手,
+        // 同一窗口内正常输入的主路径一点都不受影响),所以 CLI 是 --no-focus-guard。
+        focus_guard: a.b("focus_guard", "--focus-guard", "--no-focus-guard", true),
         ctx_bias,
         // 上下文偏置的临时热词文件：默认放仓库根下 .ctx_hotwords.txt，由 run 主循环写。
         // 关掉偏置时给 None —— 这样 sidecar 连 per-stream 热词都不会去碰。
@@ -712,6 +853,9 @@ struct Ui<'a> {
     max_bs: usize,
     recording: bool,
     t0: Instant,
+    /// 焦点守卫(体检报告 §4.3):这一句的上屏目标还是不是按下时那个窗口。
+    /// false = 已经中止本句注入,**一个字都不许再打**(见 worker 里的复核)。
+    focus_ok: bool,
 }
 
 /// 换句收尾。组合态会在这一步把上一版组合串从应用里清掉(它挂着的时候应用是把
@@ -744,6 +888,10 @@ fn handle_msg(m: Msg, wr: &mut inject::StreamWriter, ui: &Ui) {
             }
             if ui.dry {
                 println!("[{ms:6}ms] partial: {text}   (渲染 {rms:.1}ms | 原文 {raw})");
+            } else if !ui.focus_ok {
+                // 焦点守卫已中止本句:一个字都不再打(见 worker 里的复核)。
+                // 屏幕上剩下的半句留在**原窗口**,这边不碰新窗口 —— 退格只会删到
+                // 别人(新窗口)自己的内容。
             } else {
                 // 只有「细条」模式才用文字更新悬浮窗；球模式保持球（波形照走）。
                 if overlay_mode() == 1 {
@@ -769,6 +917,12 @@ fn handle_msg(m: Msg, wr: &mut inject::StreamWriter, ui: &Ui) {
                 println!("[{ms:6}ms] FINAL({reason}): {text}");
                 if raw != text {
                     println!("[{ms:6}ms]   ASR 原文: {raw}");
+                }
+            } else if !ui.focus_ok {
+                // 焦点守卫已中止本句:定稿也不打了(复核由 worker 做,这里只是执行)。
+                // 留一行回执 —— 用户得知道「刚才那句话为什么没上屏」。
+                if !text.is_empty() {
+                    println!("[sainput] ✗ {} {} —— 焦点已变,本句未上屏", reason, clip(&text, 40));
                 }
             } else {
                 // 空 final 绝不能当成「把屏幕清掉」——只更新内部状态。
@@ -854,7 +1008,7 @@ fn cmd_replay(args: &[String], a: &Args) -> Result<()> {
         side.send_audio(chunk)?;
         side.drain(&mut buf);
         for m in buf.drain(..) {
-            let ui = Ui { ov, log: None, dry, max_bs, recording: true, t0 };
+            let ui = Ui { ov, log: None, dry, max_bs, recording: true, t0, focus_ok: true };
             handle_msg(m, &mut wr, &ui);
         }
         // 按采样的真实节奏喂（半速，够逼近实时又不至于太慢）
@@ -871,7 +1025,7 @@ fn cmd_replay(args: &[String], a: &Args) -> Result<()> {
                 // 只看 final 决定结束
             }
             let is_final = matches!(m, Msg::Final { .. });
-            let ui = Ui { ov, log: None, dry, max_bs, recording: false, t0 };
+            let ui = Ui { ov, log: None, dry, max_bs, recording: false, t0, focus_ok: true };
             handle_msg(m, &mut wr, &ui);
             if is_final {
                 got_final = true;
@@ -971,6 +1125,28 @@ fn cmd_config(a: &Args, root: &Path) -> Result<()> {
         }
     );
     println!("英文合并  : {}", if c.merge_terms { "开" } else { "关" });
+    println!(
+        "二遍重打  : {}",
+        if c.twopass {
+            format!(
+                "开(松键后用 {} 整句重解)",
+                c.twopass_model_dir
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            )
+        } else {
+            "关(流式一次成型)".to_string()
+        }
+    );
+    println!(
+        "焦点守卫  : {}",
+        if c.focus_guard {
+            "开(上屏前复核前台窗口,切了窗口就中止本句)"
+        } else {
+            "关"
+        }
+    );
     // 上屏方式:把原始策略原样打出来 —— 名单形式(on:pebrel.exe)光看标签看不出是谁
     let (label, list) = match c.ime_wmchar.split_once(':') {
         Some((h, l)) => (h.trim(), l.trim()),
@@ -1048,6 +1224,48 @@ fn cmd_config(a: &Args, root: &Path) -> Result<()> {
 
 
 // ---------------------------------------------------------------- 文件日志
+/// 用系统默认关联程序打开一个文件(托盘「显示日志」用)。
+///
+/// 为什么不用 `cmd /c start "" <路径>`(体检报告 §4.1):那条路要过 cmd 的解析,
+/// 路径里的 `&` / `^` / `|` 会被当成命令分隔符 —— `--log-dir 'logs&calc&x'`
+/// 就能让 sainput 替用户执行一条命令。ShellExecuteW 收到的就是一个普通路径,
+/// 没有任何解析环节。返回值 ≤ 32 是 SE_ERR_* 错误码(> 32 才算成功)。
+fn open_with_shell(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: isize,
+            lp_operation: *const u16,
+            lp_file: *const u16,
+            lp_parameters: *const u16,
+            lp_directory: *const u16,
+            n_show_cmd: i32,
+        ) -> isize;
+    }
+
+    const SW_SHOWNORMAL: i32 = 1;
+    let file: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let op: Vec<u16> = "open\0".encode_utf16().collect();
+    let r = unsafe {
+        ShellExecuteW(
+            0,
+            op.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if r <= 32 {
+        eprintln!(
+            "[sainput] 打开 {} 失败(ShellExecuteW 返回 {r};日志文件本身还在)",
+            path.display()
+        );
+    }
+}
+
 /// 把这次会话的识别原文 / 渲染结果 / 上屏动作写进文件。
 /// 用户报「吞字」「慢」这类问题时，只有拿到真实会话记录才谈得上定位。
 pub struct Logger {
@@ -1134,6 +1352,15 @@ struct RunOpts {
     /// 演练模式(`run --dry-run`):走**完全相同**的链路,但一个字都不真的上屏。
     /// 用途:离线复现 / 定位问题(尤其配合 `--feed`)时不打扰当前焦点窗口。
     dry: bool,
+    /// 焦点守卫(体检报告 §4.3,`focus_guard` 默认开):整句开始前记下前台窗口,
+    /// 每次要注入前复核;不一致就中止本句注入并记日志。
+    focus_guard: bool,
+    /// 起 sidecar 的全部参数 —— sidecar 挂掉后由 worker **原地**重新 spawn
+    /// (看门狗用它,见体检报告 §2)。
+    cfg: Cfg,
+    /// worker → 主线程的提示通道(sidecar 挂了这类事要弹托盘气泡)。
+    /// worker 手里没有 `Tray` 句柄(托盘窗口在别处),只能借主线程的 tick 去弹。
+    notify: Option<mpsc::Sender<String>>,
 }
 
 /// 松键之后还要继续喂多久的「尾巴」音频。
@@ -1277,6 +1504,39 @@ fn frame_rms(f: &[i16]) -> f32 {
     (s / f.len() as f64).sqrt() as f32
 }
 
+/// 连续多少帧写不进 sidecar 就判它已经死了(体检报告 §2)。
+///
+/// 3 帧 ≈ 100ms:单次写失败在这个链路上没有「偶发」这一说(管道写要么成、
+/// 要么对面已经没了 —— EPIPE),留一点余量只是不想因为一次系统级抖动就误判。
+const SIDE_WRITE_FAIL_LIMIT: u32 = 3;
+
+/// 喂一帧音频给 sidecar,顺便统计**连续**写失败次数。
+///
+/// 为什么不能继续 `let _ = side.send_audio(&fr)`:sidecar 一挂,这些错误全被吞掉,
+/// 音频悄悄消失,用户看到的是「按住热键、边缘光亮着、说话,屏幕上一个字都不出」
+/// —— 没有任何提示(体检报告 §2)。计数是「子进程还活着吗」之外的第二条旁证:
+/// 有些死法 `try_wait` 一时看不到,但写一定会失败。
+fn send_frame(side: &mut Sidecar, pcm: &[i16], fails: &mut u32) {
+    match side.send_audio(pcm) {
+        Ok(()) => *fails = 0,
+        Err(_) => *fails = fails.saturating_add(1),
+    }
+}
+
+/// 等到 feed 的下一帧该发的时间点(不早于 now)。
+///
+/// feed 是靠 32ms 节拍「造」音频的,`FeedState.next` 就是下一帧的到期时刻;
+/// 以前这里固定 `sleep(4ms)`,等于每帧都白醒 8 次(体检报告 §5.2)。
+fn feed_wait(fst: &FeedState) {
+    let now = Instant::now();
+    let d = match fst.next {
+        Some(t) if t > now => t - now,
+        // 文件放完(只剩静音帧)或还没起过拍:小睡一下,下一拍一定有事做
+        _ => Duration::from_millis(4),
+    };
+    std::thread::sleep(d);
+}
+
 /// 松键：不立刻 finish，改为进入「收尾巴」状态。
 fn begin_tail(tail: &mut Option<Tail>, o: &RunOpts) {
     if tail.is_some() {
@@ -1298,7 +1558,7 @@ fn begin_tail(tail: &mut Option<Tail>, o: &RunOpts) {
     });
 }
 
-/// 尾巴阶段的一拍：把能拿到的音频喂进去，够安静了（或到硬上限）就 finish。
+/// 尾巴阶段的一拍:把能拿到的音频喂进去,够安静了(或到硬上限)就 finish。
 /// 返回值 = 这一拍里 finish 了。
 fn tail_tick(
     side: &mut Sidecar,
@@ -1307,13 +1567,26 @@ fn tail_tick(
     fst: &mut FeedState,
     t: &mut Tail,
     text_idle_ms: f64,
+    fails: &mut u32,
 ) -> bool {
-    // text_idle_ms 只进日志（调参用），不参与收工判断：灌完底噪模型一定会吐字。
-    let frames = if o.feed.is_some() {
-        feed_tick(o, fst)
-    } else {
-        drain_mic(cap)
-    };
+    // text_idle_ms 只进日志(调参用),不参与收工判断:灌完底噪模型一定会吐字。
+    //
+    // 取音频(体检报告 §5.2):feed 模式按节拍吐一帧;麦克风模式**阻塞等下一帧**
+    // 再把已经到达的一并取空 —— 以前是 `drain_mic` + `sleep(4ms)` 轮询,
+    // 每帧白醒一次、每 8ms 白转一圈。
+    let mut frames: Vec<Vec<i16>> = Vec::new();
+    if o.feed.is_some() {
+        frames = feed_tick(o, fst);
+    } else if let Some(c) = cap {
+        match c.rx.recv_timeout(Duration::from_millis(audio::FRAME_MS as u64)) {
+            Ok(f) => frames.push(f),
+            // 超时/断开都只是「这一拍没有真音频」:尾巴按时间到点自己会收工
+            Err(_) => {}
+        }
+        while let Ok(f) = c.rx.try_recv() {
+            frames.push(f);
+        }
+    }
     let mut n = 0usize;
     for fr in frames {
         let rms = frame_rms(&fr);
@@ -1330,7 +1603,7 @@ fn tail_tick(
             t.quiet_frames += 1;
         }
         n += 1;
-        let _ = side.send_audio(&fr);
+        send_frame(side, &fr, fails);
     }
     let now = Instant::now();
     let quiet_ok = t.quiet >= o.tail.quiet_ms as f64;
@@ -1339,7 +1612,13 @@ fn tail_tick(
         return true;
     }
     if n == 0 {
-        std::thread::sleep(Duration::from_millis(4));
+        if o.feed.is_some() {
+            // 还没到下一帧该发的时间点:睡到那一刻(等帧即醒)
+            feed_wait(fst);
+        } else if cap.is_none() {
+            // 采集会话已经没了(设备断开那类):小睡,别空转烧 CPU
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     false
 }
@@ -1414,11 +1693,20 @@ fn worker(
         next: None,
         restart: o.feed_restart,
     };
-    // 模型最近一次吐出「新字」的时刻：尾巴要不要继续等，看的就是它。
+    // 模型最近一次吐出「新字」的时刻:尾巴要不要继续等,看的就是它。
     let mut last_text_at = Instant::now();
-    // 上下文偏置：记住刚打出去的原文，下一句开始时抽成热词喂给识别器。
-    // 喂的是自己刚发出去的原文（云端方案也是这么做的）。
+    // 上下文偏置:记住刚打出去的原文,下一句开始时抽成热词喂给识别器。
+    // 喂的是自己刚发出去的原文(云端方案也是这么做的)。
     let mut history = context::SendHistory::new();
+    // sidecar 看门狗(体检报告 §2):判死过、还没重新拉起。
+    // 判死后不再喂音频、不再等它的消息,等用户**下一次按下**热键时原地 spawn。
+    let mut side_dead = false;
+    // 连续写失败帧数(和 try_wait 互为旁证)。
+    let mut side_fails: u32 = 0;
+    // 焦点守卫(体检报告 §4.3):按下那一刻的前台窗口,整句以它为准。
+    // `focus_lost` = 中途复核发现不一致 → 本句不再注入。
+    let mut guard_hwnd: isize = 0;
+    let mut focus_lost = false;
 
     // 默认常驻预热：否则「按下热键 → 开麦」要 100ms 左右，第一个字会被吞掉。
     // feed 模式不需要麦克风，直接跳过。
@@ -1430,19 +1718,105 @@ fn worker(
     }
 
     loop {
-        // 1) 热键
-        match rx.try_recv() {
-            Ok(hotkey::HookEvent::Down) => {
-                let start = if o.toggle { !recording } else { true };
+        // 0) sidecar 看门狗(体检报告 §2)。
+        //
+        // 为什么必须有:sidecar 崩了/被杀之后,stdout 读线程碰到 EOF 就退出,
+        // 之后往 stdin 写音频全是 EPIPE —— 而以前这些错误被 `let _ =` 吞得干干净净。
+        // 用户看到的是「按住热键、边缘光亮着、说话,屏幕上一个字都不出」,
+        // 托盘图标照常,没有任何提示,只能手动退出重开。
+        // 两条判据任一命中就算死:子进程已经退出(权威)、连续 N 帧写不进去(旁证)。
+        // 判死后:提示一次(控制台 + 会话日志 + 托盘气泡)→ 丢弃当前采集会话与本句 →
+        // 下一次按下热键时重新 spawn(见 Down 分支)。
+        if !side_dead && (side_fails >= SIDE_WRITE_FAIL_LIMIT || !side.is_alive()) {
+            side_dead = true;
+            recording = false;
+            stage = Stage::Idle;
+            tail = None;
+            defer_reset = false;
+            focus_lost = true; // 这一句作废:别再往任何窗口补字
+            wr.cancel_buffer();
+            // 采集会话丢掉:留着它下次按下会立刻读到一条死流(和设备断开同一个坑)
+            cap = None;
+            ov_hide(&o.overlay);
+            let line = format!(
+                "[sainput] ✗ ASR sidecar 已退出(连续写失败 {} 帧)→ 本句丢弃;下次按下热键会自动重启它",
+                side_fails
+            );
+            println!("{line}");
+            if let Some(l) = &o.log {
+                l.line(&format!("! {line}"));
+            }
+            if let Some(tx) = &o.notify {
+                let _ = tx.send("ASR 引擎已退出 —— 下次按下热键会自动重启".to_string());
+            }
+            side_fails = 0;
+        }
+
+        // 1) 热键。
+        //
+        // 空闲时**阻塞等**(有键立刻醒,不必等下一拍);录音/收尾/等定稿时非阻塞取
+        // —— 那几个状态本来就每拍都有事做(音频帧、sidecar 消息)。
+        // 以前这里是无条件 `try_recv` + 循环末尾 `sleep(4ms)/sleep(8ms)`,
+        // 空闲时每秒白醒 125~250 次(体检报告 §5.2)。
+        let idle_wait = !recording && tail.is_none() && stage == Stage::Idle;
+        let ev = if idle_wait {
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(e) => Some(e),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        } else {
+            match rx.try_recv() {
+                Ok(e) => Some(e),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+            }
+        };
+        match ev {
+            Some(hotkey::HookEvent::Down) => {
+                let mut start = if o.toggle { !recording } else { true };
+                // 看门狗判死过:正好在用户**下一次按下**时重新拉起 sidecar。
+                // 用户不必知道 sidecar 长什么样,「按一下就好」才是他要的语义。
+                if start && side_dead {
+                    match o.cfg.spawn() {
+                        Ok(s) => {
+                            side = s;
+                            side_dead = false;
+                            side_fails = 0;
+                            let line = format!("[sainput] ASR sidecar 已重启: {}", side.model);
+                            println!("{line}");
+                            if let Some(l) = &o.log {
+                                l.line(&format!("! {line}"));
+                            }
+                        }
+                        Err(e) => {
+                            // 起不来就不能装作在录音 —— 明确说,并且不进入录音状态
+                            let line = format!("[sainput] ✗ ASR sidecar 重启失败,这一句发不出去: {e}");
+                            eprintln!("{line}");
+                            if let Some(l) = &o.log {
+                                l.line(&format!("! {line}"));
+                            }
+                            if let Some(tx) = &o.notify {
+                                let _ = tx.send("ASR 引擎重启失败,请重启 sainput".to_string());
+                            }
+                            start = false;
+                        }
+                    }
+                }
                 if start {
-                    // 上一句的尾巴还在收就又要说下一句：先把尾巴收干净再开新的，
+                    // 焦点守卫:记下按下这一刻的前台窗口,整句都以它为准。
+                    // 目标模式原来只在按下时判一次「往哪个窗口打」,之后每次上屏用的都是
+                    // **当时的**焦点窗口 —— 于是「按住说话途中切窗」会把后半句打进别的窗口。
+                    guard_hwnd = if o.focus_guard { inject::focused_window() } else { 0 };
+                    focus_lost = false;
+                    // 上一句的尾巴还在收就又要说下一句:先把尾巴收干净再开新的,
                     // 否则两句音频会混进同一个 stream。
                     if tail.is_some() {
                         for fr in drain_mic(&cap) {
-                            let _ = side.send_audio(&fr);
+                            send_frame(&mut side, &fr, &mut side_fails);
                         }
                         for fr in feed_tick(&o, &mut fst) {
-                            let _ = side.send_audio(&fr);
+                            send_frame(&mut side, &fr, &mut side_fails);
                         }
                         // 打断路径也必须补底噪再 finish —— 见 finish_with_pad 的注释：
                         // 漏掉它等于在「没收完就再按」这条路上退回吞字。
@@ -1545,26 +1919,28 @@ fn worker(
                     println!("[sainput] ● 第 {utterances} 句 开始采集");
                     // 录音中用**悬浮球**（只表示"正在听"+波形），细条留给识别出来的文字。
                     ov_record_start(&o.overlay);
-                } else {
+                } else if !side_dead {
+                    // 注意这个 `!side_dead`:sidecar 重启失败时上面那条 Err 分支
+                    // 已经把 start 置回 false,不能再走这里 —— 否则会开出
+                    // 一条永远定稿不了的尾巴(每次都往死管道里写)。
                     recording = false;
                     stage = Stage::Tail;
                     begin_tail(&mut tail, &o);
-                    println!("[sainput] ○ 松开 —— 先把尾巴收完再识别……");
-                    // 松手 = 不再听；边缘光从这里开始淡出
+                    println!("[sainput] ○ 松开 —— 先把尾巴收完再识别......");
+                    // 松手 = 不再听;边缘光从这里开始淡出
                     ov_record_end(&o.overlay);
                 }
             }
-            Ok(hotkey::HookEvent::Up) => {
+            Some(hotkey::HookEvent::Up) => {
                 if !o.toggle && recording {
                     recording = false;
                     stage = Stage::Tail;
                     begin_tail(&mut tail, &o);
-                    println!("[sainput] ○ 松开 —— 先把尾巴收完再识别……");
+                    println!("[sainput] ○ 松开 —— 先把尾巴收完再识别......");
                     ov_record_end(&o.overlay);
                 }
             }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+            None => {}
         }
 
         // 2) 采集 → sidecar（录音时喂；松键后继续喂尾巴，喂够了才 finish）
@@ -1575,9 +1951,9 @@ fn worker(
             if o.feed.is_some() {
                 for fr in feed_tick(&o, &mut fst) {
                     ov_level(&o.overlay, frame_rms(&fr) * 6.0);
-                    let _ = side.send_audio(&fr);
+                    send_frame(&mut side, &fr, &mut side_fails);
                 }
-                // 测试用：喂到指定位置就当用户松手了（和真按一下右 Ctrl 抬起等价）
+                // 测试用:喂到指定位置就当用户松手了(和真按一下右 Ctrl 抬起等价)
                 if let Some(rel) = o.feed_release {
                     let at = (rel * audio::TARGET_RATE as f64) as usize;
                     if fst.pos >= at {
@@ -1585,42 +1961,59 @@ fn worker(
                         recording = false;
                         stage = Stage::Tail;
                         begin_tail(&mut tail, &o);
-                        println!("[sainput] ○ 测试：喂到 {fed_ms:.0}ms 自动松手 —— 收尾巴……");
+                        println!("[sainput] ○ 测试:喂到 {fed_ms:.0}ms 自动松手 —— 收尾巴......");
                     }
                 }
-                std::thread::sleep(Duration::from_millis(4));
+                // 还没到下一帧:睡到那一刻(等帧即醒),别再每 4ms 空转一圈
+                if fst.next.map(|t| Instant::now() < t).unwrap_or(true) {
+                    feed_wait(&fst);
+                }
             } else if let Some(c) = &cap {
-                // 每轮把队列**取空**，而不是只取一帧。
+                // 每轮把队列**取空**,而不是只取一帧。
                 //
-                // 原写法（每轮一帧）在循环某轮变慢时会永久性落后：
-                // 长句修正要先退格再重打，那一段是同步 SendInput，
-                // 一旦耗时超过 32ms，麦克风队列就积压；
-                // 之后仍然每轮只取一帧 —— 追不上，屏幕长时间不动，
-                // 直到某轮偶然快了补上几帧，文字突然跳一大段。
-                // 用户看到的就是「卡住，松手后一次全出来」。
+                // 原写法(每轮一帧)在循环某轮变慢时会永久性落后:
+                // 长句修正要先退格再重打,那一段是同步 SendInput,
+                // 一旦耗时超过 32ms,麦克风队列就积压;
+                // 之后仍然每轮只取一帧 —— 追不上,屏幕长时间不动,
+                // 直到某轮偶然快了补上几帧,文字突然跳一大段。
+                // 用户看到的就是「卡住,松手后一次全出来」。
                 //
-                // 上限 32 帧（约 1 秒音频）：防止极端积压时单轮阻塞太久，
+                // 上限 32 帧(约 1 秒音频):防止极端积压时单轮阻塞太久,
                 // 剩下的留给下一轮。
+                //
+                // 第一帧**阻塞等**(有帧立刻醒,不再靠 `sleep(4ms)` 轮询 —— 体检报告 §5.2),
+                // 后面的用 try_recv 把已经到的取空。
                 let mut got = 0;
                 let mut disconnected = false;
                 loop {
-                    match c.rx.try_recv() {
-                        Ok(f) => {
-                            // 悬浮球波形：真实音量驱动（不是装饰动画）。
-                            // 麦克风原始 RMS 很小（正常说话 0.02~0.2），
-                            // 乘 6 再钳到 0..1，让"正常说话"能占到波形高度的 6~7 成。
-                            ov_level(&o.overlay, frame_rms(&f) * 6.0);
-                            let _ = side.send_audio(&f);
-                            got += 1;
-                            if got >= 32 {
-                                break;
+                    let next = if got == 0 {
+                        match c.rx.recv_timeout(Duration::from_millis(audio::FRAME_MS as u64)) {
+                            Ok(f) => Some(f),
+                            Err(mpsc::RecvTimeoutError::Timeout) => None,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                disconnected = true;
+                                None
                             }
                         }
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            disconnected = true;
-                            break;
+                    } else {
+                        match c.rx.try_recv() {
+                            Ok(f) => Some(f),
+                            Err(mpsc::TryRecvError::Empty) => None,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                disconnected = true;
+                                None
+                            }
                         }
+                    };
+                    let Some(f) = next else { break };
+                    // 悬浮球波形:真实音量驱动(不是装饰动画)。
+                    // 麦克风原始 RMS 很小(正常说话 0.02~0.2),
+                    // 乘 6 再钳到 0..1,让"正常说话"能占到波形高度的 6~7 成。
+                    ov_level(&o.overlay, frame_rms(&f) * 6.0);
+                    send_frame(&mut side, &f, &mut side_fails);
+                    got += 1;
+                    if got >= 32 {
+                        break;
                     }
                 }
                 if disconnected {
@@ -1644,18 +2037,17 @@ fn worker(
                         ));
                     }
                     eprintln!(
-                        "[sainput] ⚠ 麦克风流已断开 —— 本句按松手收尾，下次按下时重新打开麦克风"
+                        "[sainput] ⚠ 麦克风流已断开 —— 本句按松手收尾,下次按下时重新打开麦克风"
                     );
-                } else if got == 0 {
-                    // 没数据就小睡一下，别空转烧 CPU
-                    std::thread::sleep(Duration::from_millis(4));
                 }
+                // 没有 `got == 0` 的小睡了:第一帧本身就是带超时的阻塞等待
+                // (有帧立刻醒),队列空时它已经等过了(体检报告 §5.2)。
             }
         } else if tail.is_some() {
             let finished = {
                 let text_idle_ms = last_text_at.elapsed().as_millis() as f64;
                 let t = tail.as_mut().unwrap();
-                tail_tick(&mut side, &o, &cap, &mut fst, t, text_idle_ms)
+                tail_tick(&mut side, &o, &cap, &mut fst, t, text_idle_ms, &mut side_fails)
             };
             if finished {
                 if let Some(t) = tail.take() {
@@ -1675,22 +2067,41 @@ fn worker(
                     }
                 }
             }
+        } else if stage == Stage::AwaitFinal {
+            // 等这一句的定稿:直接等 sidecar 的消息通道 —— 它的 final 一到就醒。
+            // 以前这一支落在下面的 `sleep(8ms)` 上:定稿本来 11ms 就回来,却要按
+            // 8ms 的刻度白醒一次,闲着也是每秒醒 125 次(体检报告 §5.2)。
+            // (「什么都没在做」的空闲状态不会走到这里 —— 那种情况下循环开头
+            //  已经阻塞在热键通道上了。)
+            if let Some(c) = &cap {
+                while c.rx.try_recv().is_ok() {} // 常驻麦:这期间的帧不属于这一句,排掉防堆积
+            }
+            match side.rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(m) => buf.push(m),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // 读线程已经退出(sidecar 没了):小睡,别空转 ——
+                    // 下一拍看门狗就会判死并提示。
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
         } else if o.lazy_mic {
-            cap = None; // 按需模式：松手就释放麦克风
+            cap = None; // 按需模式:松手就释放麦克风
         } else {
             let mut errored = false;
             if let Some(c) = &cap {
-                while c.rx.try_recv().is_ok() {} // 常驻模式：空闲时排掉，防堆积
-                // 驱动报过错 = 这条流已经不可信。留着它，下次按下热键只会
-                // 收不到任何音频（用户看到「没输入」）；丢掉它，下一次
+                while c.rx.try_recv().is_ok() {} // 常驻模式:空闲时排掉,防堆积
+                // 驱动报过错 = 这条流已经不可信。留着它,下次按下热键只会
+                // 收不到任何音频(用户看到「没输入」);丢掉它,下一次
                 // audio::start 会重新打开麦克风。
                 errored = c.stats.stream_errors.load(Ordering::Relaxed) > 0;
             }
             if errored {
                 cap = None;
-                eprintln!("[sainput] ⚠ 麦克风流报过错，已释放；下次按下热键时重新打开");
+                eprintln!("[sainput] ⚠ 麦克风流报过错,已释放;下次按下热键时重新打开");
             }
-            std::thread::sleep(Duration::from_millis(8));
+            // 这里不再 `sleep(8ms)`:空闲的等待已经在循环开头
+            // (`rx.recv_timeout`)做掉了 —— 热键一来立刻醒(体检报告 §5.2)。
         }
 
         if cap_dead {
@@ -1727,10 +2138,38 @@ fn worker(
         }
 
         // 3) ASR 输出 → 上屏
+        //
+        // 焦点守卫(体检报告 §4.3):目标模式只在**按下时**判一次「往哪个窗口打」,
+        // 之后每次上屏注入的都是**当时的**前台窗口 —— 所以「按住热键说话途中切窗」
+        // 会把后半句打进别的窗口。这里在每次注入前复核一次:和按下时不一致就中止本句,
+        // 只在本句剩下的时间里生效(下一次按下会重新记录)。
+        // ⚠️ 只有不一致时才动手:同一个窗口内正常输入的主路径一点都不受影响。
+        if o.focus_guard && !focus_lost && guard_hwnd != 0 && stage != Stage::Idle {
+            let cur = inject::focused_window();
+            if cur != guard_hwnd {
+                focus_lost = true;
+                // 组合态:整句还挂在应用自己的组合串里(一个字节都没上屏),
+                // 所以可以直接把它收掉;键盘注入路已经打到**原窗口**上的字**不能**退 ——
+                // 退格打在**当前**窗口上,删的是别人的内容。那条路只做「不再继续注入」。
+                if !o.dry {
+                    wr.cancel_buffer();
+                }
+                let line = format!(
+                    "[sainput] ⚠ 说话期间前台窗口变了(0x{guard_hwnd:X} → 0x{cur:X})→ 本句中止注入,不再往新窗口里打字{}\
+                     (要关掉这个保护:focus_guard = false)",
+                    if o.dry { "〔dry-run:真实运行会中止〕" } else { "" }
+                );
+                println!("{line}");
+                if let Some(l) = &o.log {
+                    l.line(&format!("! {line}"));
+                }
+            }
+        }
+
         side.drain(&mut buf);
         for m in buf.drain(..) {
-            // 空闲状态下迟到的东西一律丢掉（别把已经上屏的字擦掉、也别让
-            // 模型把静音「听」成字打到屏幕上）
+            // 空闲状态下迟到的东西一律丢掉(别把已经上屏的字擦掉、也别让
+            // 模型把静音「听」成字打到屏幕上)
             if stage == Stage::Idle {
                 continue;
             }
@@ -1743,6 +2182,7 @@ fn worker(
                 max_bs: o.max_backspace,
                 recording,
                 t0,
+                focus_ok: !focus_lost,
             };
             if matches!(&m, Msg::Partial { .. }) {
                 last_text_at = Instant::now();
@@ -1998,10 +2438,14 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
         ));
     }
 
-    // 日志文件路径：托盘「显示日志」要用。
+    // 日志文件路径:托盘「显示日志」要用。
     // 必须在 log 被 move 进 RunOpts **之前**取。
     let log_path: Option<std::path::PathBuf> =
         log.as_ref().map(|l| std::path::PathBuf::from(l.path()));
+
+    // worker → 主线程的提示通道(现在是「sidecar 死了 / 重启了」)。
+    // worker 手里没有 `Tray` 句柄,弹气泡只能借主线程那次 tick。
+    let (notify_tx, notify_rx) = mpsc::channel::<String>();
 
     let opts = RunOpts {
         feed,
@@ -2023,6 +2467,11 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
         ime_wmchar: c.ime_wmchar.clone(),
         feed_restart: a.b("feed_restart", "--feed-restart", "--no-feed-restart", false),
         dry: a.b("dry_run", "--dry-run", "--no-dry-run", false),
+        focus_guard: c.focus_guard,
+        notify: Some(notify_tx),
+        // 注意:必须放在最后 —— 上面几项都在读 `c` 的字段(结构体字面量按书写顺序求值,
+        // 这里 move 了就不能再借了)。
+        cfg: c,
     };
     // 托盘开关要送到 worker 手里的 sidecar（side 被 worker 独占，主线程够不着）。
     // 主线程点菜单 → 这条 channel → worker 每拍取走并 send_set 给 sidecar。
@@ -2082,32 +2531,35 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
     // 通知 sidecar 立刻改用新策略（不用重开程序）。
     let conf_path = find_root().join(CONF_NAME);
     let side_tx = side_ctl_tx;
+    // 返回值里的 `human` 是**归自己所有**的 String(以前这里用 `Box::leak` 把
+    // 两个动态串变 &'static str,于是常驻进程每点一次菜单就永久泄漏一点 ——
+    // 体检报告 §4.4)。托盘菜单一秒钟也点不了几次,这里的 String 开销可以忽略。
     let apply_toggle = move |t: tray::TrayToggle| {
         use std::sync::atomic::Ordering as O;
-        let (key, val, human) = match t {
+        let (key, val, human): (&'static str, &'static str, String) = match t {
             tray::TrayToggle::PunctToSpace => {
                 let v = !PUNCT_SPACE.load(O::Relaxed);
                 PUNCT_SPACE.store(v, O::Relaxed);
                 ("punct_mode", if v { "space" } else { "keep" },
-                 if v { "标点转空格：开（问号保留）" } else { "标点策略：原样" })
+                 if v { "标点转空格:开(问号保留)" } else { "标点策略:原样" }.to_string())
             }
             tray::TrayToggle::MergeTerms => {
                 let v = !MERGE_TERMS.load(O::Relaxed);
                 MERGE_TERMS.store(v, O::Relaxed);
                 ("merge_terms", if v { "true" } else { "false" },
-                 if v { "英文连写（R E A → REA）：开" } else { "英文连写：关" })
+                 if v { "英文连写(R E A → REA):开" } else { "英文连写:关" }.to_string())
             }
             tray::TrayToggle::CtxBias => {
                 let v = !CTX_BIAS.load(O::Relaxed);
                 CTX_BIAS.store(v, O::Relaxed);
                 ("ctx_bias", if v { "true" } else { "false" },
-                 if v { "上下文偏置：开" } else { "上下文偏置：关" })
+                 if v { "上下文偏置:开" } else { "上下文偏置:关" }.to_string())
             }
             tray::TrayToggle::CtxVerbose => {
                 let v = !VERBOSE_CTX.load(O::Relaxed);
                 VERBOSE_CTX.store(v, O::Relaxed);
                 ("verbose_ctx", if v { "true" } else { "false" },
-                 if v { "偏置提示：开" } else { "偏置提示：关" })
+                 if v { "偏置提示:开" } else { "偏置提示:关" }.to_string())
             }
             tray::TrayToggle::SetSilence(sec) => {
                 SILENCE_SEC.store(sec, O::Relaxed);
@@ -2147,7 +2599,7 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
                 let v = !FIX_CASE.load(O::Relaxed);
                 FIX_CASE.store(v, O::Relaxed);
                 ("fix_case", if v { "true" } else { "false" },
-                 if v { "英文默认小写：开" } else { "英文默认小写：关" })
+                 if v { "英文默认小写:开" } else { "英文默认小写:关" }.to_string())
             }
             tray::TrayToggle::SetOverlayMode(m) => {
                 let m = m as u32;
@@ -2191,27 +2643,26 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
                     }
                 }
                 let human = match m {
-                    1 => "悬浮显示：细条".to_string(),
-                    2 => "悬浮显示：悬浮球".to_string(),
-                    3 => "悬浮显示：屏幕边缘光".to_string(),
-                    _ => "悬浮显示：不显示".to_string(),
+                    1 => "悬浮显示:细条".to_string(),
+                    2 => "悬浮显示:悬浮球".to_string(),
+                    3 => "悬浮显示:屏幕边缘光".to_string(),
+                    _ => "悬浮显示:不显示".to_string(),
                 };
                 ("overlay_mode",
                  match m { 1 => "bar", 2 => "orb", 3 => "edge", _ => "off" },
-                 // 借用 String 的生命周期：下面统一按 &str 用，这里返回 'static 保证能活
-                 Box::leak(human.into_boxed_str()) as &'static str)
+                 human)
             }
             tray::TrayToggle::LeadingSpace => {
                 let v = !LEADING_SPACE.load(O::Relaxed);
                 LEADING_SPACE.store(v, O::Relaxed);
                 ("leading_space", if v { "true" } else { "false" },
-                 if v { "前面自动加空格:开" } else { "前面自动加空格:关" })
+                 if v { "前面自动加空格:开" } else { "前面自动加空格:关" }.to_string())
             }
             tray::TrayToggle::TrailingSpace => {
                 let v = !TRAILING_SPACE.load(O::Relaxed);
                 TRAILING_SPACE.store(v, O::Relaxed);
                 ("trailing_space", if v { "true" } else { "false" },
-                 if v { "后面自动加空格:开(只补一个)" } else { "后面自动加空格:关" })
+                 if v { "后面自动加空格:开(只补一个)" } else { "后面自动加空格:关" }.to_string())
             }
             tray::TrayToggle::ReleaseKeys => {
                 // 键盘失灵时的自救：把可能卡在「按下」的修饰键全部补 keyup。
@@ -2228,10 +2679,9 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
                 // 这一项改成**打开日志文件** —— 用户点它本来就是为了看日志/报错。
                 match log_path.clone() {
                     Some(p) if p.exists() => {
-                        // 用系统默认关联程序打开（.log 通常关联记事本）
-                        let _ = std::process::Command::new("cmd")
-                            .args(["/c", "start", "", &p.to_string_lossy()])
-                            .spawn();
+                        // 走 ShellExecuteW,不经任何 shell(见 open_with_shell 的注释:
+                        // 原来的 `cmd /c start "" <path>` 会被路径里的 `&` 注入,报告 §4.1)
+                        open_with_shell(&p);
                     }
                     _ => {
                         eprintln!("[sainput] 托盘 → 找不到日志文件");
@@ -2298,7 +2748,7 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
                 }
                 println!("[sainput] 边缘光颜色 → {}", t.label());
                 ("edge_tint", t.as_conf(),
-                 Box::leak(format!("边缘光颜色：{}", t.label()).into_boxed_str()) as &'static str)
+                 format!("边缘光颜色:{}", t.label()))
             }
             tray::TrayToggle::SetHotkey(i) => {
                 let Some((conf, _)) = tray::HOTKEY_CANDIDATES.get(i) else {
@@ -2323,8 +2773,8 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
                         if let Ok(mut g) = CUR_HOTKEY.lock() {
                             *g = conf;
                         }
-                        println!("[sainput] 托盘换热键 → {}（已写入 sainput.conf，立刻生效）", t.label());
-                        ("hotkey", *conf, "")
+                        println!("[sainput] 托盘换热键 → {}(已写入 sainput.conf,立刻生效)", t.label());
+                        ("hotkey", *conf, String::new())
                     }
                     Err(e) => {
                         eprintln!("[sainput] 热键切换失败: {e}");
@@ -2359,11 +2809,18 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
         });
     };
 
-    // 50ms 的超时只是"多久检查一次托盘开关"，**不是**鼠标事件的等待时间 ——
-    // 见 run_message_loop_with_tick 的注释（用 sleep 等消息会让鼠标卡成幻灯片）。
+    // 50ms 的超时只是"多久检查一次托盘开关",**不是**鼠标事件的等待时间 ——
+    // 见 run_message_loop_with_tick 的注释(用 sleep 等消息会让鼠标卡成幻灯片)。
     hotkey::run_message_loop_with_tick(50, || {
         if let Some(t) = tray::take_toggle() {
             apply_toggle(t);
+        }
+        // worker 报上来的事(现在是「sidecar 死了 / 重启了」)顺手弹个托盘气泡:
+        // 隐藏控制台之后,那是唯一**用户看得见**的提示通道(体检报告 §2)。
+        while let Ok(msg) = notify_rx.try_recv() {
+            if let Some(t) = &tray {
+                t.balloon("sainput", &msg);
+            }
         }
     });
     hotkey::uninstall();

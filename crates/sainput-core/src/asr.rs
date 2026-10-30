@@ -114,7 +114,13 @@ impl Sidecar {
         {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+            // 线程/进程优先级(体检报告 §5.2 最后一行):sidecar 每帧要解码
+            // 26~39ms,是整条链路的实时瓶颈,而它和 overlay(录音时整屏重绘)、
+            // worker 抢同一批核 —— 争用一上来先掉的就是音频帧。
+            // 用 CreateProcess 的优先级**类**标志比事后 OpenProcess 再
+            // SetPriorityClass 干净:没有「刚起来还落在 NORMAL 里」的窗口期。
+            const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x0000_8000;
+            cmd.creation_flags(CREATE_NO_WINDOW | ABOVE_NORMAL_PRIORITY_CLASS);
         }
 
         let mut child = cmd
@@ -178,6 +184,17 @@ impl Sidecar {
             }
         }
         anyhow::bail!("等待 sidecar 就绪超时 ({timeout:?})")
+    }
+
+    /// 子进程还活着吗?(看门狗用 —— 体检报告 §2)
+    ///
+    /// 为什么必须由调用方定期问:`Child` 不会主动通知「对面没了」,stdout 读线程
+    /// 碰到 EOF 只是安静地退出,之后往 stdin 写就是 EPIPE。以前那些写错误全被
+    /// `let _ =` 吞掉,于是 sidecar 一挂,用户看到的是「按住热键、边缘光亮着、
+    /// 说话,屏幕上一个字都不出」—— 没有任何提示。
+    /// `try_wait` 会顺手把僵尸进程回收掉,所以判死之后 `Drop` 里的等待不会白等 2 秒。
+    pub fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
     }
 
     fn send(&mut self, v: serde_json::Value) -> Result<()> {
@@ -271,5 +288,58 @@ impl Drop for Sidecar {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 测试用的解释器:优先用户指定的,否则裸 `python`(测试里图省事,
+    /// 生产路径走的是 main.rs 的绝对路径探测)。
+    fn test_python() -> String {
+        std::env::var("SAINPUT_PYTHON")
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| "python".to_string())
+    }
+
+    /// 看门狗的那条判据:子进程退出之后 `is_alive()` 必须变成 false。
+    ///
+    /// 这是「sidecar 死了没人知道」那个 bug(体检报告 §2)的回归测试:没有它,
+    /// 只能靠读码相信 worker 每拍真的能发现对面已经没了。
+    #[test]
+    fn is_alive_turns_false_after_child_exit() {
+        // 故意给一个不存在的脚本:python 立刻报错退出(退出码 2)。
+        // 这正是「sidecar 崩了」的形态 —— 这里只验 is_alive(),不验协议。
+        let Ok(mut s) = Sidecar::spawn(
+            Path::new(&test_python()),
+            Path::new("__no_such_sidecar_script__.py"),
+            &[],
+        ) else {
+            return; // 这台机器没有 python:跳过
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if !s.is_alive() {
+                return; // 通过:确实发现了
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("子进程早就退出了,is_alive() 还是 true —— 看门狗会瞎");
+    }
+
+    /// 反向验证:还在跑的子进程**不能**被判死。
+    /// 假阳性比漏报更糟 —— 那会让每一句都被掐断、还每次都去重启 sidecar。
+    #[test]
+    fn is_alive_true_for_running_child() {
+        let Ok(mut s) = Sidecar::spawn(
+            Path::new(&test_python()),
+            Path::new("-c"),
+            &["import time; time.sleep(3)".to_string()],
+        ) else {
+            return; // 没有 python:跳过
+        };
+        assert!(s.is_alive(), "刚起来的子进程就被判死 —— 看门狗会误杀每一条会话");
     }
 }
