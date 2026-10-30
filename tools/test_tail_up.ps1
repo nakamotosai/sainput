@@ -26,7 +26,7 @@ $dir = "$env:TEMP\up\$Label"
 Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $extra = @(); if ($ExtraArgs.Trim()) { $extra = $ExtraArgs.Trim() -split " " | Where-Object { $_ } }
-$a = @("run","--feed",$wav,"--hotkey","rightctrl","--no-tray","--no-overlay","--no-stream","--log-dir",$dir) + $extra
+$a = @("run","--feed",$wav,"--hotkey","rightctrl","--no-tray","--no-overlay","--dry-run","--log-dir",$dir) + $extra
 $p = Start-Process -FilePath $exe -ArgumentList $a -PassThru -WindowStyle Hidden `
       -RedirectStandardOutput "$dir\out.txt" -RedirectStandardError "$dir\err.txt"
 for ($i=0; $i -lt 120; $i++) { Start-Sleep -Milliseconds 500; if ((Get-Content "$dir\out.txt" -Raw -Encoding UTF8 -ErrorAction SilentlyContinue) -match "就绪") { break } }

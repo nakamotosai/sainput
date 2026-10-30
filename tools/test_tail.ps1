@@ -30,7 +30,7 @@ function RunOne($label, $extra) {
   $dir = "$env:TEMP\tail\$label"
   Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Force -Path $dir | Out-Null
-  $a = @("run","--feed",$wav,"--feed-release-at",$Release,"--no-tray","--no-overlay","--no-stream","--log-dir",$dir) + $extra
+  $a = @("run","--feed",$wav,"--feed-release-at",$Release,"--no-tray","--no-overlay","--dry-run","--log-dir",$dir) + $extra
   $p = Start-Process -FilePath $exe -ArgumentList $a -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput "$dir\out.txt" -RedirectStandardError "$dir\err.txt"
   for ($i=0; $i -lt 120; $i++) {

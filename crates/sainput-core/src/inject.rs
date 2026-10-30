@@ -578,10 +578,17 @@ extern "system" {
 /// 真机实测(微信 4.x / Qt 5.15,挂水杉输入法;口径见 `tools/probe_wmchar_backspace.py`):
 /// 退格之后**同一批**投出的字符 5/5 次全丢(屏幕上少一个字符 —— 用户报的
 /// 「我的验证码是903721」变成「我的验证码是03721」就是这一下);
-/// 中间隔 10ms 以上 5/5 全对。取 40ms:四倍余量,而「退格 + 补打」在真实语料里
-/// 每句只有约 5% 的帧会走到,40ms 的延迟看不出来。
+/// 中间隔 10ms 以上 5/5 全对。
+///
+/// 取 15ms 而不是最初的 40ms(体检报告 §5.2,2026-10-31):
+/// - 10ms 是「5/5 全对」的实测点,而且 0ms 是必丢、10ms 起全对,阈值附近没有
+///   「偶发丢字」的中间样本,所以 10ms 本身就不贴边;15ms 是在它基础上再留 50%
+///   (1.5×)——「退格 + 补打」每句只有约 5% 的帧会走到,再往下压收益递减,
+///   一旦压进阈值就是**可见的丢字**,所以余量不能省。
+/// - 原来的 40ms 是 4× 余量,而这条路径每次白等 25~30ms(改口帧里唯一的固定开销),
+///   属于体检报告点名的「性能可压项」里最便宜的一个。
 #[cfg(windows)]
-const WMCHAR_BACKSPACE_SETTLE: std::time::Duration = std::time::Duration::from_millis(40);
+const WMCHAR_BACKSPACE_SETTLE: std::time::Duration = std::time::Duration::from_millis(15);
 #[cfg(not(windows))]
 const WMCHAR_BACKSPACE_SETTLE: std::time::Duration = std::time::Duration::from_millis(0);
 
@@ -643,7 +650,7 @@ mod tests {
     }
 
     /// 句尾空格只在**定稿**落下去:流式阶段一个退格都不许多出来
-    /// (多出来的退格在 WM_CHAR 那条路上还要白等一次 40ms)。
+    /// (多出来的退格在 WM_CHAR 那条路上还要白等一次 `WMCHAR_BACKSPACE_SETTLE`)。
     #[test]
     fn trailing_space_only_on_final() {
         let mut w = StreamWriter::new(8, true);
@@ -822,6 +829,28 @@ mod tests {
         assert_eq!(w.typed_chars, "我说到 TOKEN 的时候".chars().count());
         assert_eq!(w.backspaces, 0, "整句投递不需要退格");
         let typed = w.typed_chars;
+        w.finalize("我说到 TOKEN 的时候", 32).unwrap();
+        assert_eq!(w.typed_chars, typed, "重复 final 不该重复打一遍");
+    }
+
+    /// `--no-stream`(`StreamWriter::new(.., false)`):流式阶段一个字都不打,
+    /// **松手定稿时整句一次投递**。
+    ///
+    /// 这里用 `WmChar(0)`(句柄 0)当「不真投递」的替身:消息函数拿到 0 直接返回,
+    /// 记账照走 —— 所以测试不会真的敲键盘。改前这一支是 `injected = want; return`,
+    /// 一个字都不会上屏(即 `--no-stream` 是坏的),下面这几条断言就是钉这件事。
+    #[test]
+    fn no_stream_option_types_the_whole_sentence_on_final() {
+        let mut w = StreamWriter::new(8, false);
+        w.set_mode(KeyMode::WmChar(0));
+        w.update("我说到 TOKE").unwrap();
+        assert_eq!(w.injected, "", "`--no-stream` 的流式阶段不许上屏");
+        w.finalize("我说到 TOKEN 的时候", 32).unwrap();
+        assert_eq!(w.injected, "我说到 TOKEN 的时候", "定稿时整句一次投递");
+        assert_eq!(w.typed_chars, "我说到 TOKEN 的时候".chars().count());
+        assert_eq!(w.backspaces, 0, "整句投递不需要退格");
+        let typed = w.typed_chars;
+        // 同一句再来一次 final(比如 final 之后紧跟 finish):不许重复打一遍
         w.finalize("我说到 TOKEN 的时候", 32).unwrap();
         assert_eq!(w.typed_chars, typed, "重复 final 不该重复打一遍");
     }
@@ -1080,7 +1109,7 @@ impl StreamWriter {
     ///
     /// 为什么句尾空格只在**定稿**时补:它只是句与句之间的分隔,流式中间帧不需要;
     /// 而带上它,每一帧都得「退掉空格 → 补打新字 → 再补空格」走一遍 ——
-    /// 白多一次退格,`WM_CHAR` 那条路上还要白等一次 40ms 的退格沉淀。
+    /// 白多一次退格,`WM_CHAR` 那条路上还要白等一次退格沉淀(见 `WMCHAR_BACKSPACE_SETTLE`)。
     fn want(&self, target: &str, final_tail: bool) -> String {
         let mut s = if self.prefix.is_empty() || is_bare_number(target) {
             target.to_string()
@@ -1121,6 +1150,8 @@ impl StreamWriter {
         if !self.enabled || target.is_empty() {
             // 空结果一律当成「这次没听清」,绝不把已经上屏的字擦掉。
             // final 走 finalize(),那条路径才允许改写/清空。
+            // `!enabled`(`--no-stream`)同样在这里早退:流式阶段本就不该打字,
+            // 整句留给 finalize() 一次投递(见那里的注释)。
             return Ok(());
         }
         let want = self.want(target, false);
@@ -1166,6 +1197,8 @@ impl StreamWriter {
         if !self.enabled || target.is_empty() {
             // 空结果 = 这次没听清:不要把已经放进缓冲层的那一版擦掉,
             // 定稿或换句时才收尾。
+            // `!enabled`(`--no-stream`)时流式阶段连缓冲层都不碰:整句在
+            // finalize() 里一次提交(见那里的注释)。
             return Ok(());
         }
         let want = self.want(target, false);
@@ -1187,6 +1220,35 @@ impl StreamWriter {
     pub fn finalize(&mut self, target: &str, max_bs: usize) -> Result<()> {
         let want = self.want(target, true);
         if !self.enabled {
+            // `--no-stream`:不流式,**松手定稿时整句一次性投递**(体检报告 §7-7)。
+            //
+            // 这一支原来只有 `self.injected = want; return` —— 一个字都不打;而
+            // `update()` 在 `!enabled` 时同样早退,于是「不要逐字重打」这个开关被
+            // 实现成了「一个字都不会上屏」,等于死代码(main.rs 的帮助文本当时也
+            // 只好写着「当前不可用」)。
+            //
+            // 现在的语义就是下面 `is_final_only()`(`WmCharFinal`)那一支,只是由
+            // **用户开关**触发而不是由目标窗口决定:整句(含前置空格)一次投递,
+            // 没有退格,也就没有「记账 vs 屏幕」的偏差;代价是字等到松手才出现。
+            //
+            // `enabled` 的另一个用途(离线演练靠 `false` 抑制注入)不受影响:
+            // `--dry-run` 那条路在主循环里就绕开了 `finalize`(main.rs 的 `handle_msg`
+            // 在 dry 时只打印文本),根本走不到这里。
+            if want == self.injected {
+                return Ok(());
+            }
+            if self.mode.is_compose() {
+                // 组合态本来就是「整句一次提交」,而且一个按键都不许发
+                // (`type_text_with` 在 Pebrel 下是明确报错的)。
+                let Some(composer) = self.composer.as_mut() else {
+                    anyhow::bail!("组合态模式没有装传输层(内部接线错误)");
+                };
+                composer.commit(&want)?;
+                self.composed.clear();
+            } else {
+                type_text_with(self.mode, &want)?;
+            }
+            self.typed_chars += want.chars().count();
             self.injected = want;
             return Ok(());
         }

@@ -24,7 +24,7 @@ $wav = Join-Path $root "models\sherpa-onnx-x-asr-160ms-streaming-zipformer-trans
 $dir = "$env:TEMP\interrupt"
 Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
-$a = @("run","--feed",$wav,"--hotkey","rightctrl","--no-tray","--no-overlay","--no-stream","--log-dir",$dir)
+$a = @("run","--feed",$wav,"--hotkey","rightctrl","--no-tray","--no-overlay","--dry-run","--log-dir",$dir)
 $p = Start-Process -FilePath $exe -ArgumentList $a -PassThru -WindowStyle Hidden `
       -RedirectStandardOutput "$dir\out.txt" -RedirectStandardError "$dir\err.txt"
 for ($i=0; $i -lt 120; $i++) { Start-Sleep -Milliseconds 500; if ((Get-Content "$dir\out.txt" -Raw -Encoding UTF8 -ErrorAction SilentlyContinue) -match "就绪") { break } }
