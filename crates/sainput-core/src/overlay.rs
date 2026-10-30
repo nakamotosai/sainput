@@ -1926,7 +1926,7 @@ mod tests {
             };
 
             let mut drew = false;
-            with_target(mem_dc, &rc, |_| drew = true);
+            with_target(mem_dc, &rc, (0.0, 0.0), |_| drew = true);
             assert!(drew, "健康 target 应执行绘制");
             assert!(
                 RT.with(|s| s.borrow().is_some()),
@@ -1937,7 +1937,7 @@ mod tests {
             let stale = CreateCompatibleDC(0);
             assert!(stale != 0);
             DeleteDC(stale);
-            with_target(stale, &rc, |_| {});
+            with_target(stale, &rc, (0.0, 0.0), |_| {});
             assert!(
                 RT.with(|s| s.borrow().is_none()),
                 "BindDC 失败后必须丢弃缓存（旧 bug：继续复用死 target）"
@@ -1945,7 +1945,7 @@ mod tests {
 
             // 下一帧用健康 DC：必须重建并继续画
             let mut drew_again = false;
-            with_target(mem_dc, &rc, |_| drew_again = true);
+            with_target(mem_dc, &rc, (0.0, 0.0), |_| drew_again = true);
             assert!(drew_again, "缓存重建后应继续绘制");
             assert!(RT.with(|s| s.borrow().is_some()));
 
