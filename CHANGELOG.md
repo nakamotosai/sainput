@@ -9,20 +9,37 @@
 
 ### Fixed
 
-- **悬浮层画布与 D2D 绑定不再逐帧重建(2026-10-30)**:`paint()` 原先每帧都
-  `CreateCompatibleDC` + `CreateDIBSection(w*h*4)` + `DeleteObject`,边缘光模式下
-  `w*h*4` 就是整屏(3840x2160 = 33 MB);`with_target()` 还会拿**新的 DC** 每帧再
-  `BindDC` 一次。改成:画布按尺寸缓存(`Canvas`,收尾交给 `Drop`),`RtCache.bound`
-  记住当前绑的 DC + 矩形,真的变了才重绑。实打实的收益是 4K 下每帧省掉一次 33 MB
-  的 DIB 创建/清零 + 一次 `BindDC`。
-  ⚠️ 边界(同日晚实测,别误读):**这没有修掉「每说一句留一块 32 MB」的泄漏** ——
-  新起的一轮 57 句对 57 块(2.2 GB)。ETW 抓到的分配栈是
-  `win32u.dll → dxcore.dll → d3d11.dll → nvwgf2umx.dll → DXGKRNL`,即 **win32 分层
-  窗口的呈现路径**;配合「空按热键(无识别结果)不涨、每句涨一块」的隔离结论,
-  指向每次听写的悬浮层 **show/hide**。真要根治得把显隐改成「窗口常驻 +
-  只用 alpha 控制」,那一步还没做。
+- **「每说一句留一块 32 MB」的内存泄漏(2026-10-30)**:现象是 sainput.exe 的私有提交
+  每说一句涨一块 32 MiB(4K 下正好 2^25 字节),半天 2 GB+,最终吃光整机提交额度 →
+  DWM `STATUS_FATAL_MEMORY_EXHAUSTION` → 全屏黑 + 程序闪退(用户侧表现为"pebrel 闪退")。
+  ETW(VirtualAllocation)抓到的那次分配栈是 `win32u(分层窗口更新) → dxcore → d3d11 →
+  nvwgf2umx(NVIDIA UMD) → DXGKRNL`,即 **D2D/驱动侧的设备资源**,不是我们自己的分配点。
+  受控实验(同一进程内自跑:`run --feed <wav> --feed-restart --dry-run` + 自动热键,
+  每轮 100-150 秒):`--overlay-mode off` → 0 块;`--overlay-mode bar` → 0 块;
+  边缘光只画纯色矩形(无渐变、无图层)→ 0 块;完整绘制但跳过 `PushLayer` → 每句一块;
+  完整绘制但用纯色刷顶替色彩刷 → 每句一块。
+  ⇒ 元凶是**边缘光每帧新建渐变刷**(设备侧资源池按 32 MiB 段增长、只增不减);另有
+  `d2d_paint_edge` 把 `fbrush.clone()` 塞进 `ManuallyDrop` —— 那份 COM 引用**永远没有
+  Release**(每边每帧一个)。修法:
+  1. 新增 `EdgeBrushes`:4 条边的色带刷 + 蒙版刷 + 图层**只建一次**;「流动」改成平移渐变
+     几何、「亮度」改成 `SetOpacity` → **每帧零资源创建**(顺带省掉每帧的 DIB/BindDC 抖动);
+  2. 图层参数里的 `opacityBrush` 改成 `from_raw` **借用**(不加引用,`ManuallyDrop` 也不释放它);
+  3. 画布按屏幕尺寸常驻复用、窗口只在启动时摆一次、显隐只用 alpha
+     (`WS_EX_TRANSPARENT` 保证全屏透明层不吃鼠标点击)。
+  **实测:19 句 0 块**(修前 18 句 16 块)。复现口径留在仓库里:`run --feed <wav>
+  --feed-restart --dry-run` + `SAINPUT_DIAG_AUTOSTART=<ms>`,或
+  `overlay-demo --mode sentence --cycles N`。
 
 ### Added
+
+- **`run --dry-run`(2026-10-30)**:`run` 也支持演练模式 —— 走完全相同的链路但一个字都不上屏;
+  配合 `--feed <wav> --feed-restart` 就能在不需要麦克风、也不打扰当前焦点窗口的前提下
+  离线复现整条按句路径。另有环境变量 `SAINPUT_DIAG_AUTOSTART=<ms>`(默认关闭)自动反复
+  "按下热键 → 松开",用于无人值守跑这条链路。
+- **`overlay-demo --cycles N`(2026-10-30)**:把一轮悬浮层生命周期重复 N 次。内存泄漏只有在
+  **同一个进程里反复走同一条路径**时才看得见(短命进程一退就全回收);`--mode sentence`
+  复刻"边缘光 → 细条"的真实生命周期 —— 当初就是靠它定位上面那条泄漏的。
+
 
 - **Pebrel 组合态上屏(2026-10-28)**:新增 `ime_wmchar = pebrel` —— 对 Pebrel 一个按键
   都不发,整句先放进它自己的**组合态缓冲层**(`pane.compose`,和输入法 preedit 同一条

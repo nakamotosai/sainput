@@ -40,6 +40,8 @@ const WS_EX_TOPMOST: u32 = 0x0000_0008;
 const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
 const WS_EX_LAYERED: u32 = 0x0008_0000;
 const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+/// 鼠标穿透:窗口铺满整屏后**绝不能挡住点击**(配合 per-pixel alpha 全透明,用户看不到它)。
+const WS_EX_TRANSPARENT: u32 = 0x0000_0020;
 
 const SW_HIDE: i32 = 0;
 const SW_SHOWNOACTIVATE: i32 = 4;
@@ -495,6 +497,12 @@ pub struct Overlay {
 /// 窗口线程是否已经起来了（`start()`/`ensure()` 成功过一次就为 true）。
 static THREAD_UP: AtomicBool = AtomicBool::new(false);
 
+/// 窗口是否已经摆好。窗口**只 ShowWindow 一次**,之后永不 hide/show ——
+/// 显隐靠 alpha(见 sync 的注释:分层窗口尺寸/显隐变化会让系统重建表面,而那份表面不回收)。
+static WINDOW_PLACED: AtomicBool = AtomicBool::new(false);
+/// 上一帧是不是"有内容"的帧。隐藏时据此补一帧全透明(否则最后那帧会留在屏幕上)。
+static PAINTED: AtomicBool = AtomicBool::new(false);
+
 impl Overlay {
     /// 运行时按需启动：已经起来就直接返回句柄，没起来就起一次。
     ///
@@ -716,15 +724,21 @@ unsafe fn create_window() -> Option<isize> {
         }
     }
     let title = wide("");
+    // 窗口**一次性铺满整屏**(物理像素)并且之后永不改尺寸、永不 hide:
+    // 分层窗口的尺寸一变,系统就会重建它的表面,而那份表面在 NVIDIA 驱动上不回收
+    // (见 sync 的注释:每说一句漏一块 32 MiB)。细条/悬浮球改成画在画布内的对应位置。
+    // WS_EX_TRANSPARENT 保证这块全屏窗口不吃鼠标点击。
+    let sw = GetSystemMetrics(0).max(1);
+    let sh = GetSystemMetrics(1).max(1);
     let hwnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
         cls.as_ptr(),
         title.as_ptr(),
         WS_POPUP,
-        -4000,
-        -4000,
-        8,
-        8,
+        0,
+        0,
+        sw,
+        sh,
         0,
         0,
         inst,
@@ -764,7 +778,19 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wp: usize, lp: isize) 
     }
 }
 
-/// 从共享状态同步窗口：显示/隐藏、定位、尺寸。
+/// 从共享状态同步窗口:内容、位置、显隐。
+///
+/// 🔴 窗口**尺寸恒定 = 整屏**,而且只在第一次 ShowWindow,之后永不 hide/show。
+///
+/// 为什么必须这样(2026-10-30 实测,别改回去):原来每说一句都在
+/// 「整屏(边缘光)↔ 小面板(细条)」之间改窗口尺寸,并 hide/show 一次。
+/// 分层窗口(`WS_EX_LAYERED`)的尺寸由 `UpdateLayeredWindow` 推的那块位图决定 ——
+/// 尺寸一变,系统就要为这个窗口**重建一份表面**;实测这份表面在 NVIDIA 驱动上
+/// **不会回收**:每说一句进程里多一块 32 MiB(4K 下正好 2^25 字节)的私有提交,
+/// 半天 2 GB+,最后把整机提交额度吃光 → DWM `STATUS_FATAL_MEMORY_EXHAUSTION`
+/// → 全屏黑 + 程序闪退。ETW 抓到的分配栈:
+/// `win32u(分层窗口更新)→ DXGI/D3D11 设备路径 → nvwgf2umx(NVIDIA UMD)→ 内核`。
+/// 现在尺寸不再变、窗口不再隐藏(显隐 = alpha),那条"重建表面"的路就永远不会被走到。
 unsafe fn sync(hwnd: isize) {
     let (visible, seq, mode, status, text, at) = match state().lock() {
         Ok(s) => (
@@ -778,8 +804,8 @@ unsafe fn sync(hwnd: isize) {
         Err(_) => return,
     };
 
-    // 边缘光：先做缓动（每帧朝目标走一小步），再决定窗口要不要显示。
-    // 这段必须在 visible 判断之前 —— 淡出过程中 visible 仍是 true，
+    // 边缘光:先做缓动(每帧朝目标走一小步),再决定要不要显示。
+    // 这段必须在 visible 判断之前 —— 淡出过程中 visible 仍是 true,
     // 但亮度降到 0 之后要能自己收起来。
     let mut edge_done = false;
     if mode == Mode::Edge {
@@ -789,8 +815,8 @@ unsafe fn sync(hwnd: isize) {
         };
         let target = g.edge_target;
         let cur = g.edge_level;
-        // 每 16ms 一拍（≈60fps）。系数 0.06 → 淡入约 350ms、淡出约 500ms。
-        // 早先 40ms + 0.18，理论 200ms 就该亮完，但实测每帧要 247ms，
+        // 每 16ms 一拍(≈60fps)。系数 0.06 → 淡入约 350ms、淡出约 500ms。
+        // 早先 40ms + 0.18,理论 200ms 就该亮完,但实测每帧要 247ms,
         // 十几帧被拖成好几秒 —— 用户看到的是"啪一下出现"。帧率才是丝滑的前提。
         let next = if (target - cur).abs() < 0.006 {
             target
@@ -821,30 +847,27 @@ unsafe fn sync(hwnd: isize) {
             false
         }
     };
-    // 悬浮球的波形是逐帧变的，但它不该让窗口重新定位/重排 —— 所以单独标一个"要重画"。
+    // 悬浮球的波形是逐帧变的,但它不该让窗口重新定位/重排 —— 所以单独标一个"要重画"。
     let repaint = changed || mode == Mode::Orb || mode == Mode::Edge;
 
-    if !visible {
-        // 不管 seq 变没变都要尝试隐藏 —— 窗口可能刚被外部（或上一轮）弄成可见，
-        // 而 seq 恰好没变，就会出现「关了但还挂在屏幕上」。
-        if changed || IsWindowVisible(hwnd) != 0 {
-            ShowWindow(hwnd, SW_HIDE);
-        }
+    // 这块窗口是整屏的,所以「画布坐标 == 屏幕坐标」;
+    // 下面算出来的 (x,y,w,h) 是**内容在画布里的矩形**(不再是窗口的位置/尺寸)。
+    let sw = GetSystemMetrics(0);
+    let sh = GetSystemMetrics(1);
+    if sw <= 0 || sh <= 0 {
         return;
     }
-
-    // 计算尺寸
     let (w, h) = match mode {
         Mode::Bar => measure(&status, &text),
         Mode::Orb => orb_size(),
-        // 边缘光铺满整个屏幕（物理像素）
-        Mode::Edge => (GetSystemMetrics(0), GetSystemMetrics(1)),
+        // 边缘光铺满整个屏幕(物理像素)
+        Mode::Edge => (sw, sh),
     };
-    // 固定在屏幕**中下方**、任务栏上面一点点（用户明确要求）。
-    // 不再跟随光标/鼠标 —— 跟随会在打字时来回跳，反而更干扰。
-    // `at` 仍然保留：overlay-demo 用它把窗口摆到指定坐标做预览。
+    // 固定在屏幕**中下方**、任务栏上面一点点(用户明确要求)。
+    // 不再跟随光标/鼠标 —— 跟随会在打字时来回跳,反而更干扰。
+    // `at` 仍然保留:overlay-demo 用它把内容摆到指定坐标做预览。
     let (mut x, mut y) = match mode {
-        // 边缘光永远贴 (0,0) 铺满，不走锚点
+        // 边缘光永远贴 (0,0) 铺满,不走锚点
         Mode::Edge => (0, 0),
         _ => match at {
             Some((ax, ay)) => (ax, ay),
@@ -853,8 +876,6 @@ unsafe fn sync(hwnd: isize) {
     };
 
     // 屏幕边界钳制
-    let sw = GetSystemMetrics(0);
-    let sh = GetSystemMetrics(1);
     if x + w > sw {
         x = sw - w - 8;
     }
@@ -867,14 +888,33 @@ unsafe fn sync(hwnd: isize) {
     if y < 0 {
         y = 8;
     }
+    let panel = Rect {
+        left: x,
+        top: y,
+        right: x + w,
+        bottom: y + h,
+    };
 
-    SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
-    if changed {
+    // 窗口只在第一次摆一次(位置=(0,0)、尺寸=整屏),之后只推内容。
+    if !WINDOW_PLACED.load(Ordering::Relaxed) {
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, sw, sh, SWP_NOACTIVATE);
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        WINDOW_PLACED.store(true, Ordering::Relaxed);
     }
-    // UpdateLayeredWindow 是"推"模型：每帧主动重画，不依赖 WM_PAINT
+
+    if !visible {
+        // 「隐藏」= 推一帧全透明(alpha 全 0 等于看不见,且 WS_EX_TRANSPARENT 不吃点击)。
+        // 窗口本身留着 —— 不给系统"销毁/重建表面"的机会。
+        if PAINTED.load(Ordering::Relaxed) {
+            paint(hwnd, &panel, false);
+            PAINTED.store(false, Ordering::Relaxed);
+        }
+        return;
+    }
+    // UpdateLayeredWindow 是"推"模型:每帧主动重画,不依赖 WM_PAINT
     if repaint {
-        paint(hwnd);
+        paint(hwnd, &panel, true);
+        PAINTED.store(true, Ordering::Relaxed);
     }
 }
 
@@ -986,98 +1026,105 @@ unsafe fn caret_pos(hwnd: isize, w: i32, h: i32) -> (i32, i32) {
 /// 窗口存在、IsWindowVisible=1，但屏幕上什么都没有。
 /// WS_EX_LAYERED 窗口要么被 alpha 机制接管（UpdateLayeredWindow），要么全隐形。
 ///
-/// UpdateLayeredWindow 的做法：
-///   1. 建一个 32bpp 的 DIBSection（自己的画布，不碰屏幕 DC）
-///   2. 把 D2D 绑到这个 DIB 的 HDC 上画
-///   3. UpdateLayeredWindow 把整块位图推给窗口（带 per-pixel alpha）
-unsafe fn paint(hwnd: isize) {
-    let (mode, status, text, levels) = match state().lock() {
+/// UpdateLayeredWindow 的做法:
+///   1. 建一个 32bpp 的 DIBSection(自己的画布,不碰屏幕 DC)——**整屏一块,常驻复用**
+///   2. 把 D2D 绑到这个 DIB 的 HDC 上画(绑定矩形恒定 = 整块画布,内容用平移定位)
+///   3. UpdateLayeredWindow 把整块位图推给窗口(带 per-pixel alpha)
+///
+/// 把当前模式的内容画进**整屏画布**,再一次性推给窗口。
+///
+/// `panel`:内容在画布(= 屏幕)坐标系里的矩形。细条/悬浮球只占其中一小块,
+/// 边缘光是整块 —— 但**画布和窗口的尺寸永远不变**。
+/// `draw=false`:推一帧全透明,用来"隐藏"(窗口一直留着,只是看不见)。
+///
+/// ⚠️ 尺寸唯一真源 = 屏幕:以前这里跟着「细条/悬浮球/边缘光」算 (w,h),
+/// 于是每句话都在整屏 ↔ 小面板之间重建位图、同时窗口也跟着改尺寸 ——
+/// 那正是"一句一块 32 MiB"的来源(见 sync 的注释)。
+unsafe fn paint(hwnd: isize, panel: &Rect, draw: bool) {
+    let (mode, _status, text, levels) = match state().lock() {
         Ok(s) => (s.mode, s.status.clone(), s.text.clone(), s.levels.clone()),
         Err(_) => return,
     };
-    // 尺寸由 measure()/orb_size() 决定，**不问窗口要**。
-    //
-    // 为什么：`WS_EX_LAYERED` 窗口的尺寸是 UpdateLayeredWindow 里那份 bitmap 决定的，
-    // 而 SetWindowPos 设的尺寸在第一次 UpdateLayeredWindow 之后会被位图尺寸覆盖。
-    // 早先这里用 GetClientRect，结果永远拿到上一次的旧尺寸 ——
-    // measure 算出 520x109，窗口却一直画 231x48，看起来像"放大没生效"。
-    let (w, h) = match mode {
-        Mode::Bar => measure(&status, &text),
-        Mode::Orb => orb_size(),
-        Mode::Edge => (GetSystemMetrics(0), GetSystemMetrics(1)),
-    };
-    let rc = Rect { left: 0, top: 0, right: w, bottom: h };
+    let sw = GetSystemMetrics(0);
+    let sh = GetSystemMetrics(1);
+    if sw <= 0 || sh <= 0 {
+        return;
+    }
+    let w = (panel.right - panel.left).max(0);
+    let h = (panel.bottom - panel.top).max(0);
     if w <= 0 || h <= 0 {
         return;
     }
+    // 绘制函数按「内容自己的坐标系」画(左上角 = 0,0),位置由 with_target 里的平移给出。
+    let layout = Rect {
+        left: 0,
+        top: 0,
+        right: w,
+        bottom: h,
+    };
+    let offset = (panel.left as f32, panel.top as f32);
+    // 画布 = 整屏(窗口就铺在 (0,0)),所以画布坐标 == 屏幕坐标
+    let canvas = Rect {
+        left: 0,
+        top: 0,
+        right: sw,
+        bottom: sh,
+    };
 
-    // 1) 取画布:**按尺寸缓存**(见 Canvas 注释)。
-    //
-    // 原来这里是每帧 CreateCompatibleDC + CreateDIBSection,收尾再 DeleteObject:
-    // 边缘光模式下每帧一块 3840x2160x4 = 33 MB。实测(2026-10-30)这条路每次要
-    // 下来的块在 4K 下正好 2^25 字节,而且**进程里越攒越多** —— 一次听写留一块,
-    // 半天 2 GB,把整机提交额度吃光(DWM 被挤死 → 全屏黑 → 程序闪退)。
-    // 尺寸没变就没必要重建,留着复用;尺寸变了才重来一块。
+    // 画布:按**屏幕**尺寸缓存(整进程就这一块;屏幕变了才重建)。
     CANVAS.with(|slot| unsafe {
         let mut slot = slot.borrow_mut();
-        if slot.as_ref().map(|c| (c.w, c.h)) != Some((w, h)) {
+        if slot.as_ref().map(|c| (c.w, c.h)) != Some((sw, sh)) {
             // 先把 D2D 的绑定作废(它绑的是旧 DC),再丢旧画布
             RT.with(|rt| {
                 if let Some(c) = rt.borrow_mut().as_mut() {
                     c.bound = None;
                 }
             });
-            *slot = Canvas::create(w, h);
+            *slot = Canvas::create(sw, sh);
         }
         let Some(c) = slot.as_ref() else {
-            return; // 画布造不出来:这一帧不画(与原来"失败即 return"一致)
+            return; // 画布造不出来:这一帧不画
         };
         let (mem_dc, bits) = (c.mem_dc, c.bits);
 
-    // 2) 清零（全透明）
-    ptr::write_bytes(bits, 0, (w * h * 4) as usize);
+        // 全透明打底(复用画布,所以每帧都要清;顺带覆盖掉上一帧的内容/位置)
+        ptr::write_bytes(bits, 0, (sw * sh * 4) as usize);
 
-    // 3) D2D 画到这块 DIB 上
-    match mode {
-        Mode::Bar => d2d_paint_bar(mem_dc, &rc, &text),
-        Mode::Orb => d2d_paint_orb(mem_dc, &rc, &levels),
-        Mode::Edge => {
-            let lv = state().lock().map(|g| g.edge_level).unwrap_or(0.0);
-            d2d_paint_edge(mem_dc, &rc, lv);
+        if draw {
+            match mode {
+                Mode::Bar => d2d_paint_bar(mem_dc, &canvas, &layout, offset, &text),
+                Mode::Orb => d2d_paint_orb(mem_dc, &canvas, &layout, offset, &levels),
+                Mode::Edge => {
+                    let lv = state().lock().map(|g| g.edge_level).unwrap_or(0.0);
+                    d2d_paint_edge(mem_dc, &canvas, &layout, offset, lv);
+                }
+            }
         }
-    }
 
+        // 推给窗口(带 alpha)。**尺寸恒等于整屏** → 系统不需要重建窗口表面。
+        let mut pt_src = Point { x: 0, y: 0 };
+        let mut sz = Size { cx: sw, cy: sh };
+        let blend = BlendFunction {
+            blend_op: 0, // AC_SRC_OVER
+            blend_flags: 0,
+            source_constant_alpha: 255,
+            alpha_format: 1, // AC_SRC_ALPHA
+        };
+        let mut pt_dst = Point { x: 0, y: 0 }; // 窗口就摆在 (0,0),整屏
+        UpdateLayeredWindow(
+            hwnd,
+            0,
+            &mut pt_dst,
+            &mut sz,
+            mem_dc,
+            &mut pt_src,
+            0,
+            &blend,
+            2, // ULW_ALPHA
+        );
 
-    // 4) 推给窗口（带 alpha）
-    let mut pt_src = Point { x: 0, y: 0 };
-    let mut sz = Size { cx: w, cy: h };
-    let blend = BlendFunction {
-        blend_op: 0,   // AC_SRC_OVER
-        blend_flags: 0,
-        source_constant_alpha: 255,
-        alpha_format: 1, // AC_SRC_ALPHA
-    };
-    let mut pt_dst = Point { x: 0, y: 0 };
-    // 目标位置从窗口当前 rect 取
-    let mut wr: Rect = std::mem::zeroed();
-    GetWindowRect(hwnd, &mut wr);
-    pt_dst.x = wr.left;
-    pt_dst.y = wr.top;
-
-    UpdateLayeredWindow(
-        hwnd,
-        0,
-        &mut pt_dst,
-        &mut sz,
-        mem_dc,
-        &mut pt_src,
-        0,
-        &blend,
-        2, // ULW_ALPHA
-    );
-
-
-        // 画布不在这里删:它归 CANVAS 缓存管(尺寸变了或线程退出时才回收)。
+        // 画布不在这里删:它归 CANVAS 缓存管(屏幕尺寸变了或线程退出时才回收)。
     });
 }
 
@@ -1194,12 +1241,19 @@ fn log_d2d_err(stage: &str, e: &windows::core::Error) {
 ///
 /// 抽出来是因为细条和悬浮球用的是**同一套** D2D 初始化 ——
 /// 复制两遍的话，以后改 alpha 模式/像素格式要改两处，容易漏。
-fn with_target(hdc: isize, rc: &Rect, f: impl FnOnce(&d2d_target::Target)) {
+fn with_target(hdc: isize, canvas: &Rect, offset: (f32, f32), f: impl FnOnce(&d2d_target::Target)) {
     use windows::core::Interface;
+    use windows::Foundation::Numerics::Matrix3x2;
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct2D as d2d;
     use windows::Win32::Graphics::Direct2D::Common as d2dc;
     use windows::Win32::Graphics::Gdi::HDC;
+
+    // 绑定矩形 = **整块画布**(恒定,由 paint 传进来)。
+    //
+    // 🔴 为什么绑整块画布、而不是绑内容所在的那块小矩形:绑定矩形一变,
+    // Direct2D/驱动就要为新的绑定重新准备内部表面(4K 下 33 MB 一份),而且旧的
+    // 不会回收 —— 实测一次听写漏一块。绑死整块画布、用平移把内容挪过去,绑定从不变。
 
     // 🔴 性能关键：factory 和 render target **必须复用**。
     //
@@ -1213,7 +1267,7 @@ fn with_target(hdc: isize, rc: &Rect, f: impl FnOnce(&d2d_target::Target)) {
     let mut dead = false;
     // 这一帧要绑的 DC + 矩形:和上次一样就不必再 BindDC
     // (画布缓存之后 DC 每帧都相同,所以这句大多数帧都成立)。
-    let want = (hdc, rc.left, rc.top, rc.right, rc.bottom);
+    let want = (hdc, canvas.left, canvas.top, canvas.right, canvas.bottom);
     if slot.is_none() {
         let factory: d2d::ID2D1Factory =
             match d2d::D2D1CreateFactory(d2d::D2D1_FACTORY_TYPE_SINGLE_THREADED, None) {
@@ -1245,10 +1299,10 @@ fn with_target(hdc: isize, rc: &Rect, f: impl FnOnce(&d2d_target::Target)) {
         };
 
         let sub = RECT {
-            left: rc.left,
-            top: rc.top,
-            right: rc.right,
-            bottom: rc.bottom,
+            left: canvas.left,
+            top: canvas.top,
+            right: canvas.right,
+            bottom: canvas.bottom,
         };
         if let Err(e) = rt.BindDC(HDC(hdc), &sub) {
             log_d2d_err("BindDC(create)", &e);
@@ -1268,10 +1322,10 @@ fn with_target(hdc: isize, rc: &Rect, f: impl FnOnce(&d2d_target::Target)) {
     let need_bind = slot.as_ref().and_then(|c| c.bound) != Some(want);
     if need_bind {
         let sub = RECT {
-            left: rc.left,
-            top: rc.top,
-            right: rc.right,
-            bottom: rc.bottom,
+            left: canvas.left,
+            top: canvas.top,
+            right: canvas.right,
+            bottom: canvas.bottom,
         };
         if let Err(e) = slot.as_ref().unwrap().rt.BindDC(HDC(hdc), &sub) {
             log_d2d_err("BindDC", &e);
@@ -1291,6 +1345,9 @@ fn with_target(hdc: isize, rc: &Rect, f: impl FnOnce(&d2d_target::Target)) {
         // 现在只要出错就丢弃缓存,下一帧用新 target 重建,最多丢一帧。
         c.target.BeginDraw();
         c.target.Clear(Some(&color(0, 0, 0, 0.0)));
+        // 内容整体平移到它在画布里的位置(细条/悬浮球不贴左上角)。
+        // 平移而不是"把绑定矩形挪过去" —— 见函数开头的注释。
+        c.target.SetTransform(&Matrix3x2::translation(offset.0, offset.1));
         f(&d2d_target::Target { target: &c.target });
         if let Err(e) = c.target.EndDraw(None, None) {
             log_d2d_err("EndDraw", &e);
@@ -1317,11 +1374,11 @@ mod d2d_target {
 /// 细条：**只有正文**，半透明圆角矩形。
 ///
 /// 用户要求撤掉「录音中…」状态行 —— 状态交给悬浮球，细条只管文字。
-fn d2d_paint_bar(hdc: isize, rc: &Rect, text: &str) {
+fn d2d_paint_bar(hdc: isize, canvas: &Rect, rc: &Rect, offset: (f32, f32), text: &str) {
     use windows::Win32::Graphics::Direct2D as d2d;
     use windows::Win32::Graphics::Direct2D::Common as d2dc;
 
-    with_target(hdc, rc, |t| unsafe {
+    with_target(hdc, canvas, offset, |t| unsafe {
         let target = t.target;
         let w = (rc.right - rc.left) as f32;
         let h = (rc.bottom - rc.top) as f32;
@@ -1351,11 +1408,11 @@ fn d2d_paint_bar(hdc: isize, rc: &Rect, text: &str) {
 ///
 /// 波形是**真实音量**驱动的（见 `Overlay::push_level`），不是装饰动画 ——
 /// 用户说话时才会起伏，安静时是一条平线。
-fn d2d_paint_orb(hdc: isize, rc: &Rect, levels: &[f32]) {
+fn d2d_paint_orb(hdc: isize, canvas: &Rect, rc: &Rect, offset: (f32, f32), levels: &[f32]) {
     use windows::Win32::Graphics::Direct2D as d2d;
     use windows::Win32::Graphics::Direct2D::Common as d2dc;
 
-    with_target(hdc, rc, |t| unsafe {
+    with_target(hdc, canvas, offset, |t| unsafe {
         let target = t.target;
         let d = (rc.right - rc.left) as f32;
         let c = d / 2.0;
@@ -1440,27 +1497,207 @@ fn color(r: u8, g: u8, b: u8, a: f32) -> windows::Win32::Graphics::Direct2D::Com
     }
 }
 
-/// 屏幕边缘光：四条边各画一道从边缘向内的渐变。
+thread_local! {
+    /// 边缘光的笔刷/图层缓存(窗口线程专用;COM 对象不是 Send)。
+    static EDGE_BRUSHES: std::cell::RefCell<Option<EdgeBrushes>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 把 `windows` crate 的 D2D 类型收一收,免得字段写成天书。
+mod d2d_brush {
+    pub use windows::Win32::Graphics::Direct2D::{
+        ID2D1Layer as Layer, ID2D1LinearGradientBrush as LinearBrush,
+    };
+}
+
+/// 边缘光的 D2D 对象集合:**整个进程只建一次**(画布尺寸或色调变了才重建)。
+///
+/// 🔴 为什么必须缓存(2026-10-30 实测,别改回去):`d2d_paint_edge` 原来**每帧**都
+/// `CreateGradientStopCollection` + `CreateLinearGradientBrush`(4 条边 + 4 个蒙版),
+/// 外加 `CreateLayer`。渐变刷/图层要占 **D2D+驱动侧的设备资源**,而设备侧资源池是
+/// **按 32 MiB 段增长、只增不减**的 —— 实测每说一句话就长一段(4K 下正好 2^25 字节),
+/// 半天 2 GB+,最后把整机提交额度吃光 → DWM 被 `STATUS_FATAL_MEMORY_EXHAUSTION`
+/// 打死 → 全屏黑 + 程序闪退。受控实验口径(100 秒 / 10-12 句,同一进程内复现):
+///   · 只画纯色矩形(无渐变、无图层)      → 0 块
+///   · 完整绘制但跳过 PushLayer           → 每句一块
+///   · 完整绘制但用纯色刷顶替色彩刷        → 每句一块
+/// ⇒ 元凶是**每帧新建渐变刷**;图层与窗口尺寸都被证伪。
+/// 现在:对象只建一次 —— **流动** = 平移色带刷的渐变几何,**亮度** = `SetOpacity`,
+/// 于是每帧零资源创建。
+struct EdgeBrushes {
+    w: i32,
+    h: i32,
+    tint: u8,
+    /// 四条边(上/右/下/左)。数组顺序与 `edge_geometry()` 一致。
+    color: [d2d_brush::LinearBrush; 4],
+    fade: [d2d_brush::LinearBrush; 4],
+    layer: d2d_brush::Layer,
+    /// 色带刷的几何基线(已按 ±1 个周长延长),每帧在此基础上平移。
+    start: [(f32, f32); 4],
+    end: [(f32, f32); 4],
+    /// t 增大的方向(单位向量);平移量 = flow * per * dir。
+    dir: [(f32, f32); 4],
+    /// 每条边的光带矩形。
+    band: [(f32, f32, f32, f32); 4],
+}
+
+/// 四条边的几何(与绘制顺序一致):起点、终点、t 区间、光带矩形、向内渐变起止、方向。
+#[allow(clippy::type_complexity)]
+fn edge_geometry(w: f32, h: f32, spread: f32) -> [((f32, f32), (f32, f32), f32, f32, (f32, f32, f32, f32), (f32, f32), (f32, f32), (f32, f32)); 4] {
+    let per = 2.0 * (w + h);
+    let tw = w / per;
+    let th = h / per;
+    [
+        // 上(左→右)
+        ((0.0, 0.0), (w, 0.0), 0.0, tw,
+         (0.0, 0.0, w, spread), (0.0, 0.0), (0.0, spread), (1.0, 0.0)),
+        // 右(上→下)
+        ((w, 0.0), (w, h), tw, tw + th,
+         (w - spread, 0.0, w, h), (w, 0.0), (w - spread, 0.0), (0.0, 1.0)),
+        // 下(右→左)
+        ((w, h), (0.0, h), tw + th, tw + th + tw,
+         (0.0, h - spread, w, h), (0.0, h), (0.0, h - spread), (-1.0, 0.0)),
+        // 左(下→上)
+        ((0.0, h), (0.0, 0.0), tw + th + tw, 1.0,
+         (0.0, 0.0, spread, h), (0.0, 0.0), (spread, 0.0), (0.0, -1.0)),
+    ]
+}
+
+impl EdgeBrushes {
+    /// 建一整套。任何一步失败返回 None(悬浮层降级成"不画",绝不影响主功能)。
+    unsafe fn create(
+        target: &windows::Win32::Graphics::Direct2D::ID2D1RenderTarget,
+        w: f32,
+        h: f32,
+        tint: EdgeTint,
+    ) -> Option<EdgeBrushes> {
+        use windows::Win32::Graphics::Direct2D as d2d;
+        use windows::Win32::Graphics::Direct2D::Common as d2dc;
+
+        let per = 2.0 * (w + h);
+        let spread = px(EDGE_SPREAD) as f32;
+
+        // 蒙版色标:边缘不透明 → 向内透明。**alpha 烘焙成 1**,
+        // 整体亮度每帧用 SetOpacity 给 —— 这样这条色标集合是常量,只建一次。
+        let fade_stops = [
+            d2dc::D2D1_GRADIENT_STOP {
+                position: 0.0,
+                color: d2dc::D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+            },
+            d2dc::D2D1_GRADIENT_STOP {
+                position: 1.0,
+                color: d2dc::D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.0 },
+            },
+        ];
+        let fade_coll = target
+            .CreateGradientStopCollection(
+                &fade_stops,
+                d2d::D2D1_GAMMA_2_2,
+                d2d::D2D1_EXTEND_MODE_CLAMP,
+            )
+            .ok()?;
+
+        let mut colors = Vec::with_capacity(4);
+        let mut fades = Vec::with_capacity(4);
+        let mut starts = [(0.0f32, 0.0f32); 4];
+        let mut ends = [(0.0f32, 0.0f32); 4];
+        let mut dirs = [(0.0f32, 0.0f32); 4];
+        let mut bands = [(0.0f32, 0.0f32, 0.0f32, 0.0f32); 4];
+
+        for (i, g) in edge_geometry(w, h, spread).iter().enumerate() {
+            let (s, e, t0, t1, band, f0, f1, dir) = *g;
+
+            // 色带刷:色标覆盖 t ∈ [t0-1, t1+1](±1 个周长)—— 平移几何时颜色不会滑出边界。
+            // flow 烘焙成 0,流动完全交给几何平移。
+            const N: usize = 3 * 17;
+            let span = (t1 - t0) + 2.0;
+            let mut stops: [d2dc::D2D1_GRADIENT_STOP; N] = [d2dc::D2D1_GRADIENT_STOP {
+                position: 0.0,
+                color: d2dc::D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+            }; N];
+            for (k, slot) in stops.iter_mut().enumerate() {
+                let u = k as f32 / (N - 1) as f32;
+                let (r, gg, b) = edge_color_at(tint, (t0 - 1.0) + span * u, 0.0);
+                slot.position = u;
+                slot.color = d2dc::D2D1_COLOR_F { r, g: gg, b, a: 1.0 };
+            }
+            let ccoll = target
+                .CreateGradientStopCollection(
+                    &stops,
+                    d2d::D2D1_GAMMA_2_2,
+                    d2d::D2D1_EXTEND_MODE_CLAMP,
+                )
+                .ok()?;
+
+            // 几何按 ±1 个周长延长:1 个 t 单位 = per 像素(与边长的比例关系对四条边都成立)
+            let sx = s.0 - dir.0 * per;
+            let sy = s.1 - dir.1 * per;
+            let ex = e.0 + dir.0 * per;
+            let ey = e.1 + dir.1 * per;
+            let color = target
+                .CreateLinearGradientBrush(
+                    &d2d::D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                        startPoint: d2dc::D2D_POINT_2F { x: sx, y: sy },
+                        endPoint: d2dc::D2D_POINT_2F { x: ex, y: ey },
+                    },
+                    None,
+                    &ccoll,
+                )
+                .ok()?;
+
+            // 蒙版刷:几何固定(边缘 → 向内)
+            let fade = target
+                .CreateLinearGradientBrush(
+                    &d2d::D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                        startPoint: d2dc::D2D_POINT_2F { x: f0.0, y: f0.1 },
+                        endPoint: d2dc::D2D_POINT_2F { x: f1.0, y: f1.1 },
+                    },
+                    None,
+                    &fade_coll,
+                )
+                .ok()?;
+
+            colors.push(color);
+            fades.push(fade);
+            starts[i] = (sx, sy);
+            ends[i] = (ex, ey);
+            dirs[i] = dir;
+            bands[i] = band;
+        }
+
+        let layer = target.CreateLayer(None).ok()?;
+        Some(EdgeBrushes {
+            w: w as i32,
+            h: h as i32,
+            tint: tint_code(tint),
+            color: colors.try_into().ok()?,
+            fade: fades.try_into().ok()?,
+            layer,
+            start: starts,
+            end: ends,
+            dir: dirs,
+            band: bands,
+        })
+    }
+}
+
+/// 屏幕边缘光:四条边各画一道从边缘向内的渐变。
 ///
 /// ## 怎么做出「流动的彩色」
 ///
-/// 难点：颜色要**沿边缘**变化（彩虹），亮度要**向内**衰减（光带）——
-/// 这两个方向互相垂直，一个线性渐变刷做不到。
+/// 难点:颜色要**沿边缘**变化(彩虹),亮度要**向内**衰减(光带)——
+/// 这两个方向互相垂直,一个线性渐变刷做不到。
 ///
-/// 做法是 **PushLayer + opacityBrush**：
-///   1. 用一个「边缘不透明 → 向内全透明」的渐变当**蒙版**压入图层
-///   2. 在图层里用**沿边缘的多色标渐变**填满整块矩形
-///   3. PopLayer —— 彩虹被蒙版裁成光带形状
+/// 做法是 **PushLayer + opacityBrush**(蒙版):先用「边缘不透明 → 向内全透明」的渐变
+/// 压入图层,再在图层里用**沿边缘的色带刷**填满整块矩形,最后 PopLayer。
 ///
-/// 这比"画很多层半透明矩形"干净得多，也没有层间接缝。
+/// ## 每帧只改属性,不建对象(见 EdgeBrushes 的注释)
 ///
-/// ## 周长连续
-///
-/// 四条边的色相按**周长比例**分配（不是每条边固定 0.25）：
-/// 屏幕宽高不等时，按长度切才能让流动速度均匀。
-/// 再叠加 `phase` 让整条彩虹沿周长滑动 —— 这就是"会动的彩色"。
-fn d2d_paint_edge(hdc: isize, rc: &Rect, level: f32) {
-    use windows::Win32::Graphics::Direct2D as d2d;
+/// · 流动 = 把色带刷的几何沿边平移(`SetStartPoint`/`SetEndPoint`)
+/// · 亮度 = 蒙版刷的 `SetOpacity`
+/// · 颜色变化 = 色带刷的色标只在**建一次**时烘焙(flow=0),之后靠平移
+fn d2d_paint_edge(hdc: isize, canvas: &Rect, rc: &Rect, offset: (f32, f32), level: f32) {
+    use windows::core::Interface;
     use windows::Win32::Graphics::Direct2D::Common as d2dc;
 
     if level <= 0.001 {
@@ -1469,18 +1706,17 @@ fn d2d_paint_edge(hdc: isize, rc: &Rect, level: f32) {
 
     let tint = edge_tint();
 
-    with_target(hdc, rc, |t| unsafe {
+    with_target(hdc, canvas, offset, |t| unsafe {
         let target = t.target;
         let w = (rc.right - rc.left) as f32;
         let h = (rc.bottom - rc.top) as f32;
         let spread = px(EDGE_SPREAD) as f32;
 
-        // 呼吸：0.86~1.0 之间缓慢起伏。
-        // 相位都在 0..1，见 edge_clock（用绝对时间会丢精度）。
+        // 呼吸:0.86~1.0 之间缓慢起伏。相位都在 0..1,见 edge_clock。
         let (breath_ph, flow_ph) = edge_clock();
         let breath = 0.86 + 0.14 * (breath_ph * std::f32::consts::TAU).sin();
 
-        // 饱和色比白色"显眼"得多，所以不用提 alpha 就能看清 —— 反而要略降。
+        // 饱和色比白色"显眼"得多,所以不用提 alpha 就能看清 —— 反而要略降。
         let tint_boost = match tint {
             EdgeTint::White => 1.0,
             _ => 0.92,
@@ -1490,142 +1726,63 @@ fn d2d_paint_edge(hdc: isize, rc: &Rect, level: f32) {
             return;
         }
 
-        // ---- 光带蒙版：边缘处不透明 → 向内全透明 ----
-        let fade_stops = [
-            d2dc::D2D1_GRADIENT_STOP {
-                position: 0.0,
-                color: d2dc::D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: peak },
-            },
-            d2dc::D2D1_GRADIENT_STOP {
-                position: 1.0,
-                color: d2dc::D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.0 },
-            },
-        ];
-        let Ok(fade_coll) = target.CreateGradientStopCollection(
-            &fade_stops,
-            d2d::D2D1_GAMMA_2_2,
-            d2d::D2D1_EXTEND_MODE_CLAMP,
-        ) else {
-            return;
-        };
-
-        // ---- 画一条边 ----
-        let draw_edge = |p0: d2dc::D2D_POINT_2F,
-                         p1: d2dc::D2D_POINT_2F,
-                         t0: f32,
-                         t1: f32,
-                         rect: d2dc::D2D_RECT_F,
-                         fade_from: d2dc::D2D_POINT_2F,
-                         fade_to: d2dc::D2D_POINT_2F| {
-            // 颜色色标：沿边缘取 N 个采样点。
-            // N 越大过渡越细，但色标太多也会慢 —— 17 在 4K 下已经看不出色带。
-            const N: usize = 17;
-            let mut stops: [d2dc::D2D1_GRADIENT_STOP; N] = [d2dc::D2D1_GRADIENT_STOP {
-                position: 0.0,
-                color: d2dc::D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
-            }; N];
-            for (k, slot) in stops.iter_mut().enumerate() {
-                let u = k as f32 / (N - 1) as f32;
-                let tt = t0 + (t1 - t0) * u;
-                let (r, g, b) = edge_color_at(tint, tt, flow_ph);
-                slot.position = u;
-                slot.color = d2dc::D2D1_COLOR_F { r, g, b, a: 1.0 };
+        EDGE_BRUSHES.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let stale = match slot.as_ref() {
+                Some(b) => b.w != w as i32 || b.h != h as i32 || b.tint != tint_code(tint),
+                None => true,
+            };
+            if stale {
+                *slot = EdgeBrushes::create(target, w, h, tint);
             }
-            let Ok(ccoll) = target.CreateGradientStopCollection(
-                &stops,
-                d2d::D2D1_GAMMA_2_2,
-                d2d::D2D1_EXTEND_MODE_CLAMP,
-            ) else {
-                return;
-            };
-            let Ok(cbrush) = target.CreateLinearGradientBrush(
-                &d2d::D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
-                    startPoint: p0,
-                    endPoint: p1,
-                },
-                None,
-                &ccoll,
-            ) else {
-                return;
-            };
-            let Ok(fbrush) = target.CreateLinearGradientBrush(
-                &d2d::D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
-                    startPoint: fade_from,
-                    endPoint: fade_to,
-                },
-                None,
-                &fade_coll,
-            ) else {
-                return;
+            let Some(b) = slot.as_ref() else {
+                return; // 建不出来:这一帧不画边缘光(降级,不影响主功能)
             };
 
-            // 压入带蒙版的图层 → 画彩虹 → 弹出
-            let Ok(layer) = target.CreateLayer(None) else {
-                return;
-            };
-            let brush: d2d::ID2D1Brush = fbrush.clone().into();
-            let params = d2d::D2D1_LAYER_PARAMETERS {
-                contentBounds: rect,
-                geometricMask: std::mem::ManuallyDrop::new(None),
-                maskAntialiasMode: d2d::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                maskTransform: windows::Foundation::Numerics::Matrix3x2::identity(),
-                opacity: 1.0,
-                opacityBrush: std::mem::ManuallyDrop::new(Some(brush)),
-                layerOptions: d2d::D2D1_LAYER_OPTIONS_NONE,
-            };
-            target.PushLayer(&params, &layer);
-            target.FillRectangle(&rect, &cbrush);
-            target.PopLayer();
-        };
+            let per = 2.0 * (w + h);
+            let off = flow_ph * per; // 流动量(像素)
+            for i in 0..4 {
+                let (dx, dy) = b.dir[i];
+                b.color[i].SetStartPoint(d2dc::D2D_POINT_2F {
+                    x: b.start[i].0 - dx * off,
+                    y: b.start[i].1 - dy * off,
+                });
+                b.color[i].SetEndPoint(d2dc::D2D_POINT_2F {
+                    x: b.end[i].0 - dx * off,
+                    y: b.end[i].1 - dy * off,
+                });
+                b.fade[i].SetOpacity(peak);
+            }
 
-        // 周长参数按**长度比例**分配，流动速度才均匀
-        let per = 2.0 * (w + h);
-        let tw = w / per;
-        let th = h / per;
-
-        // 上边（左→右）
-        draw_edge(
-            d2dc::D2D_POINT_2F { x: 0.0, y: 0.0 },
-            d2dc::D2D_POINT_2F { x: w, y: 0.0 },
-            0.0,
-            tw,
-            d2dc::D2D_RECT_F { left: 0.0, top: 0.0, right: w, bottom: spread },
-            d2dc::D2D_POINT_2F { x: 0.0, y: 0.0 },
-            d2dc::D2D_POINT_2F { x: 0.0, y: spread },
-        );
-        // 右边（上→下）
-        draw_edge(
-            d2dc::D2D_POINT_2F { x: w, y: 0.0 },
-            d2dc::D2D_POINT_2F { x: w, y: h },
-            tw,
-            tw + th,
-            d2dc::D2D_RECT_F { left: w - spread, top: 0.0, right: w, bottom: h },
-            d2dc::D2D_POINT_2F { x: w, y: 0.0 },
-            d2dc::D2D_POINT_2F { x: w - spread, y: 0.0 },
-        );
-        // 下边（右→左）
-        draw_edge(
-            d2dc::D2D_POINT_2F { x: w, y: h },
-            d2dc::D2D_POINT_2F { x: 0.0, y: h },
-            tw + th,
-            tw + th + tw,
-            d2dc::D2D_RECT_F { left: 0.0, top: h - spread, right: w, bottom: h },
-            d2dc::D2D_POINT_2F { x: 0.0, y: h },
-            d2dc::D2D_POINT_2F { x: 0.0, y: h - spread },
-        );
-        // 左边（下→上）
-        draw_edge(
-            d2dc::D2D_POINT_2F { x: 0.0, y: h },
-            d2dc::D2D_POINT_2F { x: 0.0, y: 0.0 },
-            tw + th + tw,
-            1.0,
-            d2dc::D2D_RECT_F { left: 0.0, top: 0.0, right: spread, bottom: h },
-            d2dc::D2D_POINT_2F { x: 0.0, y: 0.0 },
-            d2dc::D2D_POINT_2F { x: spread, y: 0.0 },
-        );
+            for i in 0..4 {
+                let (l, tp, r, bt) = b.band[i];
+                let rect = d2dc::D2D_RECT_F { left: l, top: tp, right: r, bottom: bt };
+                let params = windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS {
+                    contentBounds: rect,
+                    geometricMask: std::mem::ManuallyDrop::new(None),
+                    maskAntialiasMode:
+                        windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                    maskTransform: windows::Foundation::Numerics::Matrix3x2::identity(),
+                    opacity: 1.0,
+                    // ⚠️ 这里是**借用一个裸指针**,不是交出所有权:
+                    // `opacityBrush` 在 C 结构里只是个指针,D2D 不会接管引用。
+                    // 老代码写的是 `fbrush.clone().into()` —— clone 加的引用**永远没人 Release**
+                    // (每边每帧一个),这正是「每说一句长一段 32 MiB 设备侧资源」的两个来源之一
+                    // (另一个是每帧新建渐变刷,见 EdgeBrushes 的注释)。
+                    // 这里用 from_raw 借一下:不加引用,ManuallyDrop 也不会去释放它。
+                    opacityBrush: std::mem::ManuallyDrop::new(Some(unsafe {
+                        windows::Win32::Graphics::Direct2D::ID2D1Brush::from_raw(b.fade[i].as_raw())
+                    })),
+                    layerOptions: windows::Win32::Graphics::Direct2D::D2D1_LAYER_OPTIONS_NONE,
+                };
+                // 图层对象复用:每帧只 Push/Pop,不再 CreateLayer
+                target.PushLayer(&params, &b.layer);
+                target.FillRectangle(&rect, &b.color[i]);
+                target.PopLayer();
+            }
+        });
     });
 }
-
 /// 按周长参数 `t`（0..1）和流动相位 `flow`（0..1）取颜色。
 ///
 /// 单色方案忽略 `t`（整条边一个色）；彩虹/极光沿 `t` 连续变化，

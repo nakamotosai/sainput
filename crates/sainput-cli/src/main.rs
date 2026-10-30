@@ -78,7 +78,8 @@ fn usage() {
          --tail-rms <F>         静音判定阈值（帧 RMS），默认 0.012\n  \
          --feed-release-at <S>  测试用：--feed 喂到第 S 秒自动松键（吞字回归）\n  \
          --python <EXE>         Python 解释器（默认自动探测）\n  \
-         --dry-run              replay 时不真的注入，只打印文本\n\n\
+         --dry-run              不真的注入,只打印文本(replay / run 都可用;\n  \
+                                 run + --feed 可离线演练完整链路,不打扰当前窗口)\n\n\
          CONFIG:\n  \
          仓库根下的 {CONF_NAME} 可写日常偏好（key = value），命令行参数优先级更高。\n  \
          可用键：hotkey / model_dir / punct_dir / hotwords / punct / itn / beam / toggle / tray /\n  hide_console / \
@@ -1126,6 +1127,9 @@ struct RunOpts {
     feed_restart: bool,
     /// 上屏方式策略(`ime_wmchar`):每句开始时按目标窗口重新决定。
     ime_wmchar: String,
+    /// 演练模式(`run --dry-run`):走**完全相同**的链路,但一个字都不真的上屏。
+    /// 用途:离线复现 / 定位问题(尤其配合 `--feed`)时不打扰当前焦点窗口。
+    dry: bool,
 }
 
 /// 松键之后还要继续喂多久的「尾巴」音频。
@@ -1728,7 +1732,7 @@ fn worker(
             let ui = Ui {
                 ov: o.overlay.as_ref(),
                 log: o.log.as_ref(),
-                dry: false,
+                dry: o.dry,
                 max_bs: o.max_backspace,
                 recording,
                 t0,
@@ -2006,6 +2010,7 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
         verbose_ctx: a.b("verbose_ctx", "--verbose-ctx", "--quiet-ctx", false),
         ime_wmchar: c.ime_wmchar.clone(),
         feed_restart: a.b("feed_restart", "--feed-restart", "--no-feed-restart", false),
+        dry: a.b("dry_run", "--dry-run", "--no-dry-run", false),
     };
     // 托盘开关要送到 worker 手里的 sidecar（side 被 worker 独占，主线程够不着）。
     // 主线程点菜单 → 这条 channel → worker 每拍取走并 send_set 给 sidecar。
@@ -2018,6 +2023,29 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
     });
 
     Tray::note_main_thread();
+    // 【诊断/回归专用】`SAINPUT_DIAG_AUTOSTART=<ms>`:无人值守地反复"按下热键 → 松开",
+    // 让整条按句链路自己跑起来。配合 `run --feed <wav> --feed-restart --dry-run`,
+    // 就能在一个进程里复现 N 句话的完整路径(采集/侧车/上屏/悬浮层/日志),
+    // 不需要麦克风、也不需要真的往谁窗口里打字 —— 这是定位
+    // 「每说一句留一块 32 MB」那类泄漏时唯一可复现的口径(见 CHANGELOG 2026-10-30)。
+    // 默认关闭:不设这个环境变量时这段完全不生效。
+    if let Some(ms) = std::env::var("SAINPUT_DIAG_AUTOSTART")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| *ms >= 500)
+    {
+        let press_tx = tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            loop {
+                let _ = press_tx.send(hotkey::HookEvent::Down);
+                std::thread::sleep(Duration::from_millis(ms));
+                let _ = press_tx.send(hotkey::HookEvent::Up);
+                std::thread::sleep(Duration::from_millis(1500));
+            }
+        });
+        println!("[sainput] 【诊断】自动热键已开启:按住 {ms}ms / 间隔 1500ms");
+    }
     hotkey::install(trigger, tx)?;
     println!(
         "[sainput] ✅ 就绪。{} [{}] {}。",
@@ -2323,64 +2351,97 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
 
 
 // ------------------------------------------------------ overlay-demo
-/// 预览光标旁的状态条（调试/验收用，不影响正常录音）。
+/// 预览光标旁的状态条(调试/验收用,不影响正常录音)。
+///
+/// `--cycles N`:把一轮生命周期重复 N 次。**它是找内存泄漏的关键工具** ——
+/// 「每说一句留一块 32 MB」这类 bug 只有在**同一个进程里反复走这条路径**时才看得见
+/// (进程一退,攒下的东西随地址空间一起消失,所以短命进程永远看着"干净")。
+/// 三种可对比的口径:
+///   · `--mode edge`     —— 边缘光:整屏、尺寸恒定、不画文字
+///   · `--mode bar`      —— 细条:小面板、尺寸随文字变、画 DirectWrite 文字
+///   · `--mode sentence` —— 边缘光→细条:一次听写的真实生命周期(尺寸从整屏变到小面板)
+/// 2026-10-30 用它定位到:泄漏跟着 **尺寸变化** 走(edge 恒定尺寸循环不涨,
+/// sentence 循环每轮涨一块 32 MB),与 show/hide、整屏绘制本身无关。
 fn cmd_overlay_demo(a: &Args) -> Result<()> {
     let secs = a.u("seconds", "--seconds", 10)? as u64;
+    let cycles = a.u("cycles", "--cycles", 1)?.max(1);
     let ov = Overlay::start().ok_or_else(|| anyhow::anyhow!("悬浮窗起不来"))?;
     let mode = a.s("mode", "--mode").unwrap_or_else(|| "bar".to_string());
 
-    if mode == "edge" {
-        // 屏幕边缘光：亮 2.5 秒 → 淡出，完整走一遍录音的生命周期
-        if let Some(t) = a.s("tint", "--tint") {
-            let tint = EdgeTint::from_conf(&t);
-            sainput_core::overlay::set_edge_tint(tint);
-            println!("[sainput] overlay-demo: 边缘光 · {}", tint.label());
-        } else {
-            println!("[sainput] overlay-demo: 屏幕边缘光（亮起 2.5s 后淡出）");
-        }
-        ov.show_edge();
-        std::thread::sleep(Duration::from_millis(2500));
-        ov.fade_edge();
-        std::thread::sleep(Duration::from_millis(1200));
-        ov.hide();
-        println!("[sainput] overlay-demo 结束");
-        return Ok(());
-    }
-
-    if mode == "orb" {
-        // 悬浮球：喂一段模拟音量（由小到大再回落），看波形动不动。
-        ov.show_orb();
-        println!("[sainput] overlay-demo: 悬浮球（模拟音量，{secs}s）");
-        let step = (secs * 1000 / 60).max(40);
-        for i in 0..60u32 {
-            // 用一个正弦包络模拟说话起伏，明显能看出波形在变
-            let t = i as f32 / 60.0;
-            let env = (t * std::f32::consts::PI * 3.0).sin().abs();
-            // 叠一点随机，别看起来像机器
-            let jitter = ((i * 7919) % 100) as f32 / 100.0 * 0.25;
-            ov.push_level((env * 0.75 + jitter).min(1.0));
-            std::thread::sleep(Duration::from_millis(step));
-        }
-        ov.hide();
-        println!("[sainput] overlay-demo 结束");
-        return Ok(());
-    }
-
-    // 细条：只显示文字，逐段变长
+    // 细条:只显示文字,逐段变长(宽度会变 → 尺寸变化)
     let frames: [&str; 4] = [
         "今天下午",
         "今天下午三点十五分开会",
-        "今天下午三点十五分开会，讨论一下这个方案",
-        "今天下午3点15分开会，讨论一下这个方案，顺便把合同带过来。",
+        "今天下午三点十五分开会,讨论一下这个方案",
+        "今天下午3点15分开会,讨论一下这个方案,顺便把合同带过来。",
     ];
-    let step = (secs * 1000 / frames.len() as u64).max(400);
-    println!("[sainput] overlay-demo: 细条（只显示文字，{secs}s）");
-    for tx in frames {
-        ov.show_bar(tx);
-        std::thread::sleep(Duration::from_millis(step));
+
+    match mode.as_str() {
+        "edge" => {
+            if let Some(t) = a.s("tint", "--tint") {
+                let tint = EdgeTint::from_conf(&t);
+                sainput_core::overlay::set_edge_tint(tint);
+                println!("[sainput] overlay-demo: 边缘光 · {} ×{cycles} 轮", tint.label());
+            } else {
+                println!("[sainput] overlay-demo: 屏幕边缘光 ×{cycles} 轮(尺寸恒定)");
+            }
+        }
+        "sentence" => println!(
+            "[sainput] overlay-demo: 边缘光→细条 ×{cycles} 轮(一次听写的完整生命周期)"
+        ),
+        "orb" => println!("[sainput] overlay-demo: 悬浮球(模拟音量,{secs}s)×{cycles} 轮"),
+        _ => println!("[sainput] overlay-demo: 细条(只显示文字,{secs}s)×{cycles} 轮"),
     }
-    ov.hide();
-    println!("[sainput] overlay-demo 结束");
+
+    let step = (secs * 1000 / frames.len() as u64).max(400);
+    for _ in 0..cycles {
+        match mode.as_str() {
+            "edge" => {
+                // 亮 2.5 秒 → 淡出:窗口一直铺满整屏,尺寸不变
+                ov.show_edge();
+                std::thread::sleep(Duration::from_millis(2500));
+                ov.fade_edge();
+                std::thread::sleep(Duration::from_millis(1200));
+                ov.hide();
+            }
+            "sentence" => {
+                // 按下:亮起边缘光
+                ov.show_edge();
+                std::thread::sleep(Duration::from_millis(1200));
+                ov.fade_edge();
+                // 定稿前后逐段上屏:整屏 → 小面板(尺寸变化就发生在这一步)
+                for tx in frames {
+                    ov.show_bar(tx);
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                ov.hide();
+            }
+            "orb" => {
+                ov.show_orb();
+                let step = (secs * 1000 / 60).max(40);
+                for i in 0..60u32 {
+                    // 用一个正弦包络模拟说话起伏,明显能看出波形在变
+                    let t = i as f32 / 60.0;
+                    let env = (t * std::f32::consts::PI * 3.0).sin().abs();
+                    // 叠一点随机,别看起来像机器
+                    let jitter = ((i * 7919) % 100) as f32 / 100.0 * 0.25;
+                    ov.push_level((env * 0.75 + jitter).min(1.0));
+                    std::thread::sleep(Duration::from_millis(step));
+                }
+                ov.hide();
+            }
+            _ => {
+                for tx in frames {
+                    ov.show_bar(tx);
+                    std::thread::sleep(Duration::from_millis(step));
+                }
+                ov.hide();
+            }
+        }
+        // 轮间隔:让窗口线程把"隐藏"这一帧推完
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    println!("[sainput] overlay-demo 结束({cycles} 轮)");
     Ok(())
 }
 
