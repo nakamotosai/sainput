@@ -52,6 +52,8 @@ const ID_CTX_BIAS: usize = 12;
 const ID_CTX_VERBOSE: usize = 13;
 const ID_LEADING_SPACE: usize = 14;
 const ID_FIX_CASE: usize = 15;
+/// 句尾补一个空格(和 ID_LEADING_SPACE 成对:一个管前面、一个管后面)
+const ID_TRAILING_SPACE: usize = 16;
 /// 静音断句子菜单的基址（5/10/15/30/不断句）
 const ID_SILENCE_BASE: usize = 200;
 /// 把隐藏的控制台再叫出来（双击启动时控制台是自动收起的）
@@ -81,6 +83,8 @@ pub enum TrayToggle {
     CtxVerbose,
     /// 光标前有字时在前面补一个空格
     LeadingSpace,
+    /// 句尾补一个空格(下一句接上来不会粘在一起)
+    TrailingSpace,
     /// 英文大小写修复（模型吐不出小写）
     FixCase,
     /// 静音多少秒算一句说完
@@ -126,6 +130,7 @@ static FLAGS: std::sync::Mutex<TrayFlags> = std::sync::Mutex::new(TrayFlags {
     ctx_bias: true,
     ctx_verbose: false,
     leading_space: true,
+    trailing_space: true,
     fix_case: true,
     silence_sec: 15,
     overlay_mode: 0,
@@ -143,6 +148,8 @@ pub struct TrayFlags {
     pub ctx_verbose: bool,
     /// 光标前有字时补一个前置空格。
     pub leading_space: bool,
+    /// 句尾补一个空格(只补一个)。
+    pub trailing_space: bool,
     /// 英文大小写修复。
     pub fix_case: bool,
     /// 当前静音断句门槛（秒；0 = 不断句）。
@@ -680,6 +687,7 @@ unsafe fn show_menu(hwnd: isize) {
         ctx_bias: true,
         ctx_verbose: false,
         leading_space: true,
+        trailing_space: true,
         fix_case: true,
         silence_sec: 15,
         overlay_mode: 0,
@@ -698,6 +706,7 @@ unsafe fn show_menu(hwnd: isize) {
     let ctx = wide("上下文偏置（记住刚打的词）");
     let ctxv = wide("显示偏置提示");
     let lead = wide("前面自动加空格");
+    let trail = wide("后面自动加空格");
     // 悬浮显示方式：三选一互斥（用户要求"一次最多只能显示一个或者完全不显示"）
     let MODES: [&str; 4] = [
         "不显示",
@@ -741,8 +750,10 @@ unsafe fn show_menu(hwnd: isize) {
     AppendMenuW(menu, MF_STRING | tick(f.merge_terms), ID_MERGE_TERMS, merge.as_ptr());
     AppendMenuW(menu, MF_STRING | tick(f.ctx_bias), ID_CTX_BIAS, ctx.as_ptr());
     AppendMenuW(menu, MF_STRING | tick(f.ctx_verbose), ID_CTX_VERBOSE, ctxv.as_ptr());
-    // 前置空格放最后一组 —— 它是"上屏形态"类开关，和上面三个"文本内容"类分开
+    // 前置空格放最后一组 —— 它是"上屏形态"类开关,和上面三个"文本内容"类分开
     AppendMenuW(menu, MF_STRING | tick(f.leading_space), ID_LEADING_SPACE, lead.as_ptr());
+    // 句尾空格紧跟其后:一个管前面、一个管后面,放一起最好找
+    AppendMenuW(menu, MF_STRING | tick(f.trailing_space), ID_TRAILING_SPACE, trail.as_ptr());
     if ovl_menu != 0 {
         for (i, name) in MODES.iter().enumerate() {
             let l = wide(name);
@@ -821,6 +832,7 @@ fn queue_toggle(id: usize) {
         ID_CTX_BIAS => Some(TrayToggle::CtxBias),
         ID_CTX_VERBOSE => Some(TrayToggle::CtxVerbose),
         ID_LEADING_SPACE => Some(TrayToggle::LeadingSpace),
+        ID_TRAILING_SPACE => Some(TrayToggle::TrailingSpace),
         ID_FIX_CASE => Some(TrayToggle::FixCase),
         ID_SHOW_CONSOLE => Some(TrayToggle::ShowConsole),
         ID_AUTOSTART => Some(TrayToggle::AutoStart),

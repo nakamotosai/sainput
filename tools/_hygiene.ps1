@@ -37,6 +37,26 @@ function Initialize-TestHygiene {
 
     Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
 
+    # 0) 所有 tools\*.ps1 必须带 UTF-8 BOM。
+    #    为什么(踩过,而且很贵):PS 5.1 读**没有 BOM** 的 .ps1 时按系统 ANSI(中文机 = GBK)解码。
+    #    中文注释的 UTF-8 字节被当 GBK 读,一个双字节字符会把**换行吃掉** ——
+    #    于是下一行代码静默变成上一行注释的一部分(那一行不执行,也不报错)。
+    #    症状是「变量莫名是空的 / 参数传不进去」,我为此绕了一大圈。
+    #    修法: python -c "import pathlib;p=pathlib.Path('tools/x.ps1');p.write_bytes(b'\xef\xbb\xbf'+p.read_bytes())"
+    $noBom = @()
+    foreach ($f in @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter *.ps1 -ErrorAction SilentlyContinue)) {
+        try {
+            $fs = [System.IO.File]::OpenRead($f.FullName)
+            $b = New-Object byte[] 3
+            [void]$fs.Read($b, 0, 3)
+            $fs.Close()
+            if (-not ($b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)) { $noBom += $f.Name }
+        } catch {}
+    }
+    if ($noBom.Count -gt 0) {
+        Write-Warning ("这些 .ps1 缺 UTF-8 BOM,中文注释会吞掉下一行代码(可能静默不执行): " + ($noBom -join ', '))
+    }
+
     # 1) 存剪贴板。
     #    局限（照实说）：只存**文本**。图片/富文本/HTML 等非文本格式这里救不回来，
     #    要保全格式得走 EnumClipboardFormats + GetClipboardData（本项目暂未实现）。

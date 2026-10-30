@@ -611,20 +611,64 @@ mod tests {
     #[test]
     fn want_includes_prefix() {
         let mut w = StreamWriter::new(8, true);
-        assert_eq!(w.want("你好"), "你好");
+        assert_eq!(w.want("你好", false), "你好");
         w.set_prefix(" ");
-        assert_eq!(w.want("你好"), " 你好");
+        assert_eq!(w.want("你好", false), " 你好");
         w.set_prefix("");
-        assert_eq!(w.want("你好"), "你好");
+        assert_eq!(w.want("你好", false), "你好");
     }
 
-    /// reset 要同时清掉前缀 —— 前缀是"这一句"的决策，换句要重新判断。
+    /// 句尾空格(托盘「后面自动加空格」):定稿才补,而且**只补一个**。
+    #[test]
+    fn want_has_single_trailing_space() {
+        let mut w = StreamWriter::new(8, true);
+        // 关着的时候一个字都不动(默认状态)
+        assert_eq!(w.want("你好", true), "你好");
+        w.set_trailing_space(true);
+        // 流式中间帧不补 —— 补了每一帧都要「退空格→补新字→再补空格」
+        assert_eq!(w.want("你好", false), "你好");
+        // 定稿才补,而且是**一个**
+        assert_eq!(w.want("你好", true), "你好 ");
+        // 已经是空格结尾(标点转空格那条路的尾巴)就不再补
+        assert_eq!(w.want("你好 ", true), "你好 ", "不许出现两个空格");
+        // 和前置空格共存:两边各一个
+        w.set_prefix(" ");
+        assert_eq!(w.want("你好", true), " 你好 ");
+        // 纯数字句两边都不补 —— 和前置空格同一个理由(要能贴进数字框)
+        assert_eq!(w.want("903721", true), "903721");
+        // 空结果仍然是空:不能被补成一个空格(那会被当成一次上屏)
+        let mut w2 = StreamWriter::new(8, true);
+        w2.set_trailing_space(true);
+        assert_eq!(w2.want("", true), "");
+    }
+
+    /// 句尾空格只在**定稿**落下去:流式阶段一个退格都不许多出来
+    /// (多出来的退格在 WM_CHAR 那条路上还要白等一次 40ms)。
+    #[test]
+    fn trailing_space_only_on_final() {
+        let mut w = StreamWriter::new(8, true);
+        w.set_trailing_space(true);
+        w.set_mode(KeyMode::WmChar(0)); // 句柄 0:不真投递,只走记账
+        w.update("你好").unwrap();
+        assert_eq!(w.injected, "你好", "流式帧不带句尾空格");
+        w.update("你好啊").unwrap();
+        assert_eq!(w.injected, "你好啊");
+        assert_eq!(w.backspaces, 0, "流式阶段不该出现退格");
+        w.finalize("你好啊", 32).unwrap();
+        assert_eq!(w.injected, "你好啊 ", "定稿补一个空格");
+        assert_eq!(w.backspaces, 0, "定稿只是往后补一个空格,不退格");
+        // 同样文本再定稿一次:不许又补一个
+        w.finalize("你好啊", 32).unwrap();
+        assert_eq!(w.injected, "你好啊 ");
+    }
+
+    /// reset 要同时清掉前缀 —— 前缀是"这一句"的决策,换句要重新判断。
     #[test]
     fn reset_clears_prefix() {
         let mut w = StreamWriter::new(8, true);
         w.set_prefix(" ");
         w.reset().unwrap();
-        assert_eq!(w.want("下一句"), "下一句");
+        assert_eq!(w.want("下一句", false), "下一句");
     }
 
     /// 前缀变化不能影响"公共前缀"的正确性:
@@ -633,8 +677,8 @@ mod tests {
     fn prefix_participates_in_common_prefix() {
         let mut w = StreamWriter::new(8, true);
         w.set_prefix(" ");
-        let a = w.want("你好");
-        let b = w.want("你好啊");
+        let a = w.want("你好", false);
+        let b = w.want("你好啊", false);
         assert_eq!(common_prefix_chars(&a, &b), 3);
         assert_eq!(a.chars().count() - common_prefix_chars(&a, &b), 0); // 不用退格
     }
@@ -646,9 +690,9 @@ mod tests {
     fn bare_number_gets_no_leading_space() {
         let mut w = StreamWriter::new(8, true);
         w.set_prefix(" ");
-        assert_eq!(w.want("12345"), "12345", "纯数字句不补前置空格");
-        assert_eq!(w.want("12345个"), " 12345个", "不是纯数字句就照旧补空格");
-        assert_eq!(w.want("abc"), " abc");
+        assert_eq!(w.want("12345", false), "12345", "纯数字句不补前置空格");
+        assert_eq!(w.want("12345个", false), " 12345个", "不是纯数字句就照旧补空格");
+        assert_eq!(w.want("abc", false), " abc");
 
         // 流式:第一帧只有一位数字时也不许先补空格再退格(那会在屏幕上闪一下)
         let mut w = StreamWriter::new(8, true);
@@ -924,6 +968,13 @@ pub struct StreamWriter {
     /// 下一帧算前缀就会错位，退格数算错 → 删到用户自己的字。
     /// 所以空格作为 `prefix` 进入同一条算术：`injected` 始终等于 prefix + 逻辑文本。
     prefix: String,
+    /// 这一句要不要在**句尾**补一个空格(托盘「后面自动加空格」)。
+    ///
+    /// 和 `prefix` 同一个理由:空格必须进同一条算术
+    /// (`injected` = prefix + 正文 + 句尾空格),只多敲一个空格而不记账,
+    /// 下一帧算公共前缀就会错位、退格数算错。
+    /// 只补**一个** —— 已经是空格结尾(标点转空格那条路的尾巴)就不再补。
+    trailing_space: bool,
     /// 这一句用哪种方式上屏(每句开始时按目标窗口决定,见 `decide_key_mode`)。
     /// 默认是键盘注入;只有「输入法会吃字母」的窗口才切成 WM_CHAR。
     mode: KeyMode,
@@ -944,6 +995,7 @@ impl StreamWriter {
             max_backspace,
             enabled,
             prefix: String::new(),
+            trailing_space: false,
             mode: KeyMode::Keys,
             composer: None,
             composed: String::new(),
@@ -955,6 +1007,11 @@ impl StreamWriter {
     /// 设定这一句的前缀(`" "` 或 `""`)。**每句开始时**由调用方按光标上下文决定一次。
     pub fn set_prefix(&mut self, p: &str) {
         self.prefix = p.to_string();
+    }
+
+    /// 设定这一句的**句尾**要不要补一个空格。和 `set_prefix` 一样,每句开始时定一次。
+    pub fn set_trailing_space(&mut self, on: bool) {
+        self.trailing_space = on;
     }
 
     /// 设定这一句的上屏方式。**每句开始时**决定一次:目标窗口可能已经换了。
@@ -994,8 +1051,9 @@ impl StreamWriter {
 
     pub fn reset(&mut self) -> Result<()> {
         self.injected.clear();
-        // 前缀属于"这一句"的决策，换句要重新决定（光标位置可能已经变了）
+        // 前缀属于"这一句"的决策,换句要重新决定(光标位置可能已经变了)
         self.prefix.clear();
+        self.trailing_space = false;
         if self.composed.is_empty() {
             return Ok(());
         }
@@ -1016,15 +1074,31 @@ impl StreamWriter {
         &self.injected
     }
 
-    /// 这一句最终应该显示成什么(含前缀)。
+    /// 这一句该显示成什么(含前置空格;`final_tail` 时还含句尾空格)。
     ///
-    /// 例外:**整句就是一个数字串**时不补前置空格(见 `is_bare_number`)。
-    fn want(&self, target: &str) -> String {
-        if self.prefix.is_empty() || is_bare_number(target) {
+    /// 例外:**整句就是一个数字串**时两边都不补空格(见 `is_bare_number`)。
+    ///
+    /// 为什么句尾空格只在**定稿**时补:它只是句与句之间的分隔,流式中间帧不需要;
+    /// 而带上它,每一帧都得「退掉空格 → 补打新字 → 再补空格」走一遍 ——
+    /// 白多一次退格,`WM_CHAR` 那条路上还要白等一次 40ms 的退格沉淀。
+    fn want(&self, target: &str, final_tail: bool) -> String {
+        let mut s = if self.prefix.is_empty() || is_bare_number(target) {
             target.to_string()
         } else {
             format!("{}{}", self.prefix, target)
+        };
+        // 句尾**只补一个**空格:标点转空格那条路本来就会把结尾标点变成空格,
+        // 已经是空格结尾就不再补(用户口径:「只允许加一个就可以了」)。
+        // 纯数字句不补 —— 和前置空格同一个理由:读出来的号码要能直接贴进数字框。
+        if final_tail
+            && self.trailing_space
+            && !s.is_empty()
+            && !s.ends_with(' ')
+            && !is_bare_number(target)
+        {
+            s.push(' ');
         }
+        s
     }
 
     /// 用 partial 结果更新屏幕。失败不致命,交给下一帧。
@@ -1049,7 +1123,7 @@ impl StreamWriter {
             // final 走 finalize(),那条路径才允许改写/清空。
             return Ok(());
         }
-        let want = self.want(target);
+        let want = self.want(target, false);
         if want == self.injected {
             return Ok(());
         }
@@ -1094,7 +1168,7 @@ impl StreamWriter {
             // 定稿或换句时才收尾。
             return Ok(());
         }
-        let want = self.want(target);
+        let want = self.want(target, false);
         if want == self.composed {
             return Ok(());
         }
@@ -1111,7 +1185,7 @@ impl StreamWriter {
     ///
     /// 走和 `update` **完全相同**的前缀算术（含 `prefix`），否则屏幕与 `injected` 会错位。
     pub fn finalize(&mut self, target: &str, max_bs: usize) -> Result<()> {
-        let want = self.want(target);
+        let want = self.want(target, true);
         if !self.enabled {
             self.injected = want;
             return Ok(());

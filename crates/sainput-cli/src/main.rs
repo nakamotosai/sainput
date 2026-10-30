@@ -110,8 +110,11 @@ static PUNCT_SPACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 static MERGE_TERMS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static CTX_BIAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static VERBOSE_CTX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// 光标前有字时，在前面补一个空格（默认开 —— 用户明确要的）。
+/// 光标前有字时,在前面补一个空格(默认开 —— 用户明确要的)。
 static LEADING_SPACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// 句尾补一个空格(默认开)。**只补一个** —— 标点转空格那条路的结尾空格会复用,
+/// 不会出现两个空格。默认开的理由和前置空格一样:用户要的就是「下一句别粘上来」。
+static TRAILING_SPACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 /// 英文大小写修复（默认开：本仓库模型吐不出小写）。
 static FIX_CASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 /// 静音多少秒算一句说完（0 = 不断句，只认松手）。托盘可选 5/10/15/30。
@@ -1481,6 +1484,9 @@ fn worker(
                     } else {
                         wr.set_prefix("");
                     }
+                    // 句尾空格:和前置空格一样,每句开始时定一次(托盘点一下立刻生效)。
+                    // 只管"补不补" —— 具体补几个由 writer 的 `want()` 去重(只补一个)。
+                    wr.set_trailing_space(TRAILING_SPACE.load(std::sync::atomic::Ordering::Relaxed));
                     // 上屏方式:①目标窗口挂着输入法时,注入的字母会被输入法当成它自己的
                     // 输入(掉进组字串、弹出候选面板,程序一个字都收不到),中文却不受影响
                     // —— 这就是「说英文它就被吃掉」。②输入法状态读不到也改不了(跨进程
@@ -1785,8 +1791,11 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
     // 开关的**实时**状态：从配置初始化（不是硬编码默认），
     // 之后托盘菜单改一次就更新一次，worker 每句读它 → 改了立刻生效。
     let verbose_ctx_init = a.b("verbose_ctx", "--verbose-ctx", "--quiet-ctx", false);
-    // 前置空格：默认开（用户明确要「光标前有字就插空格」）
+    // 前置空格:默认开(用户明确要「光标前有字就插空格」)
     let leading_space_init = a.b("leading_space", "--leading-space", "--no-leading-space", true);
+    // 句尾空格:默认开(用户要「后面也自动加空格」;只补一个)
+    let trailing_space_init =
+        a.b("trailing_space", "--trailing-space", "--no-trailing-space", true);
     // 悬浮条默认**关**：文字已经逐字上屏，再显示一遍是重复信息（用户指出）。
     // 悬浮显示方式：配置里 `overlay` 兼容老写法（true=细条、false=关），
     // 新增 `overlay_mode = bar|orb|edge|off` 表达四态。
@@ -1820,6 +1829,7 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
         CTX_BIAS.store(c.ctx_bias, O::Relaxed);
         VERBOSE_CTX.store(verbose_ctx_init, O::Relaxed);
         LEADING_SPACE.store(leading_space_init, O::Relaxed);
+        TRAILING_SPACE.store(trailing_space_init, O::Relaxed);
         FIX_CASE.store(c.fix_case, O::Relaxed);
         SILENCE_SEC.store(c.rule2.round() as u32, O::Relaxed);
         OVERLAY_MODE.store(overlay_mode_init, O::Relaxed);
@@ -1834,6 +1844,7 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
             ctx_bias: c.ctx_bias,
             ctx_verbose: verbose_ctx_init,
             leading_space: leading_space_init,
+            trailing_space: trailing_space_init,
             fix_case: c.fix_case,
             silence_sec: c.rule2.round() as u32,
             overlay_mode: overlay_mode_init as usize,
@@ -2122,6 +2133,7 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
                     ctx_bias: CTX_BIAS.load(O::Relaxed),
                     ctx_verbose: VERBOSE_CTX.load(O::Relaxed),
                     leading_space: LEADING_SPACE.load(O::Relaxed),
+                    trailing_space: TRAILING_SPACE.load(O::Relaxed),
                     fix_case: FIX_CASE.load(O::Relaxed),
                     silence_sec: sec,
                     overlay_mode: overlay_mode() as usize,
@@ -2193,7 +2205,13 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
                 let v = !LEADING_SPACE.load(O::Relaxed);
                 LEADING_SPACE.store(v, O::Relaxed);
                 ("leading_space", if v { "true" } else { "false" },
-                 if v { "前面自动加空格：开" } else { "前面自动加空格：关" })
+                 if v { "前面自动加空格:开" } else { "前面自动加空格:关" })
+            }
+            tray::TrayToggle::TrailingSpace => {
+                let v = !TRAILING_SPACE.load(O::Relaxed);
+                TRAILING_SPACE.store(v, O::Relaxed);
+                ("trailing_space", if v { "true" } else { "false" },
+                 if v { "后面自动加空格:开(只补一个)" } else { "后面自动加空格:关" })
             }
             tray::TrayToggle::ReleaseKeys => {
                 // 键盘失灵时的自救：把可能卡在「按下」的修饰键全部补 keyup。
@@ -2239,6 +2257,7 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
                     ctx_bias: CTX_BIAS.load(O::Relaxed),
                     ctx_verbose: VERBOSE_CTX.load(O::Relaxed),
                     leading_space: LEADING_SPACE.load(O::Relaxed),
+                    trailing_space: TRAILING_SPACE.load(O::Relaxed),
                     fix_case: FIX_CASE.load(O::Relaxed),
                     silence_sec: SILENCE_SEC.load(O::Relaxed),
                     overlay_mode: overlay_mode() as usize,
@@ -2330,6 +2349,7 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
             ctx_bias: CTX_BIAS.load(O::Relaxed),
             ctx_verbose: VERBOSE_CTX.load(O::Relaxed),
             leading_space: LEADING_SPACE.load(O::Relaxed),
+            trailing_space: TRAILING_SPACE.load(O::Relaxed),
             fix_case: FIX_CASE.load(O::Relaxed),
             silence_sec: SILENCE_SEC.load(O::Relaxed),
             overlay_mode: overlay_mode() as usize,

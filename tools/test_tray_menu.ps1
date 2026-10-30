@@ -1,8 +1,10 @@
-﻿# 托盘开关的**行为**回归：直接给托盘窗口发菜单命令，验证开关真的生效 + 落盘。
+﻿# 托盘开关的**行为**回归:直接给托盘窗口发菜单命令,验证开关真的生效 + 落盘。
 #
-# 为什么不用截图：截图只能看长相，验证不了「点了之后配置文件有没有改、控制台有没有响应」。
-# 这里模拟用户点菜单项：给 SainputTrayWnd 发 WM_COMMAND(id)。
+# 为什么不用截图:截图只能看长相,验证不了「点了之后配置文件有没有改、控制台有没有响应」。
+# 这里模拟用户点菜单项:给 SainputTrayWnd 发 WM_COMMAND(id)。
 #   ID_PUNCT_SPACE=10 / ID_MERGE_TERMS=11 / ID_CTX_BIAS=12 / ID_CTX_VERBOSE=13
+#   ID_LEADING_SPACE=14 / ID_FIX_CASE=15 / ID_TRAILING_SPACE=16
+# 每个开关都点**两次**(切走再切回),这样不管用户原本怎么设的,跑完都回到原值。
 param([string]$Conf = "")
 $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $PSScriptRoot
@@ -65,14 +67,20 @@ Click-Item 11 "英文连写"
 Write-Output ("  之后 merge_terms = " + (Get-ConfValue 'merge_terms') + "  （期望 false，因为默认 true 被切了）")
 
 Click-Item 12 "上下文偏置"
-Write-Output ("  之后 ctx_bias = " + (Get-ConfValue 'ctx_bias') + "  （期望 false）")
+Write-Output ("  之后 ctx_bias = " + (Get-ConfValue 'ctx_bias') + "  (期望 false)")
 
-# 切回默认，别把用户配置留在被改动状态
+# 句尾空格:本来没这个键 → 点一下写 false,再点一下写 true(等于默认值)
+Click-Item 16 "后面自动加空格"
+Write-Output ("  之后 trailing_space = " + (Get-ConfValue 'trailing_space') + "  (期望 false)")
+Click-Item 16 "后面自动加空格(切回)"
+Write-Output ("  之后 trailing_space = " + (Get-ConfValue 'trailing_space') + "  (期望 true)")
+
+# 切回默认,别把用户配置留在被改动状态
 Click-Item 10 "标点转空格(切回)"
 Click-Item 11 "英文连写(切回)"
 Click-Item 12 "上下文偏置(切回)"
 Write-Output "--- 切回后 ---"
-foreach ($k in @('punct_mode','merge_terms','ctx_bias')) {
+foreach ($k in @('punct_mode','merge_terms','ctx_bias','trailing_space')) {
   Write-Output ("  {0} = {1}" -f $k, (Get-ConfValue $k))
 }
 Write-Output "done"

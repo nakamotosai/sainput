@@ -68,9 +68,16 @@ hotkey = rightctrl
 # merge_terms = true
 
 # 英文大小写:默认把所有全大写英文改回小写(本仓库模型的词表里没有小写字母,
-# 吐出来的英文一律全大写)。技术缩写(AI / API / VPS …)与专有名词(GitHub / Python …)
+# 吐出来的英文一律全大写)。技术缩写(AI / API / VPS ...)与专有名词(GitHub / Python ...)
 # 按 tools/textfix.py 的两张表保留/还原;两张表是数据,想改直接改那里。
 # fix_case = true
+
+# 上屏形态:光标前有字时,在前面(leading)/ 句尾(trailing)补一个空格。
+#   默认都是 true。句尾那个是「下一句别粘上来」——标点转空格(punct_mode = space)时
+#   句尾标点本来就会被吃掉,补一个空格正好补上这个缺;
+#   两边都**只补一个**:左边已经是空白就不补,右边已经是空格也不补。
+# leading_space = true
+# trailing_space = true
 
 # 上屏方式(2026-10-28 加):auto(默认)/ on / off。
 #
