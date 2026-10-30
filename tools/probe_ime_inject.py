@@ -14,6 +14,9 @@
      打一串字母,再用 WM_CHAR 打一遍,分别读回内容 —— 一眼看出这个窗口吃哪一种。
      读不到内容的窗口(自绘/终端)只能看它自己出不出来字。
 
+自绘输入框(微信 / Qt 窗口)那一路的现场取证在 `tools/probe_wechat_inject.py` ——
+那边多了「读回自绘输入框(Ctrl+A/Ctrl+C + 剪贴板)」和「三条通道打同一串字」两件事。
+
 跑法:
   python tools/probe_ime_inject.py                       # 隐藏窗口自检
   python tools/probe_ime_inject.py --hwnd 0x000000 --selftest-input "hello TOKEN"
