@@ -1011,31 +1011,28 @@ unsafe fn paint(hwnd: isize) {
         return;
     }
 
-    // 1) 建 32bpp DIB
-    let mut bits: *mut u8 = ptr::null_mut();
-    let bmi = BitmapInfo {
-        header: BitmapInfoHeader {
-            bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
-            bi_width: w,
-            bi_height: -h,          // 负 = 自上而下
-            bi_planes: 1,
-            bi_bit_count: 32,
-            bi_compression: 0,      // BI_RGB
-            bi_size_image: (w * h * 4) as u32,
-            ..Default::default()
-        },
-        colors: [0; 3],
-    };
-    let mem_dc = CreateCompatibleDC(0);
-    if mem_dc == 0 {
-        return;
-    }
-    let dib = CreateDIBSection(mem_dc, &bmi, 0, &mut bits, 0, 0);
-    if dib == 0 || bits.is_null() {
-        DeleteDC(mem_dc);
-        return;
-    }
-    let old_bmp = SelectObject(mem_dc, dib);
+    // 1) 取画布:**按尺寸缓存**(见 Canvas 注释)。
+    //
+    // 原来这里是每帧 CreateCompatibleDC + CreateDIBSection,收尾再 DeleteObject:
+    // 边缘光模式下每帧一块 3840x2160x4 = 33 MB。实测(2026-10-30)这条路每次要
+    // 下来的块在 4K 下正好 2^25 字节,而且**进程里越攒越多** —— 一次听写留一块,
+    // 半天 2 GB,把整机提交额度吃光(DWM 被挤死 → 全屏黑 → 程序闪退)。
+    // 尺寸没变就没必要重建,留着复用;尺寸变了才重来一块。
+    CANVAS.with(|slot| unsafe {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().map(|c| (c.w, c.h)) != Some((w, h)) {
+            // 先把 D2D 的绑定作废(它绑的是旧 DC),再丢旧画布
+            RT.with(|rt| {
+                if let Some(c) = rt.borrow_mut().as_mut() {
+                    c.bound = None;
+                }
+            });
+            *slot = Canvas::create(w, h);
+        }
+        let Some(c) = slot.as_ref() else {
+            return; // 画布造不出来:这一帧不画(与原来"失败即 return"一致)
+        };
+        let (mem_dc, bits) = (c.mem_dc, c.bits);
 
     // 2) 清零（全透明）
     ptr::write_bytes(bits, 0, (w * h * 4) as usize);
@@ -1080,18 +1077,93 @@ unsafe fn paint(hwnd: isize) {
     );
 
 
-    SelectObject(mem_dc, old_bmp);
-    DeleteObject(dib);
-    DeleteDC(mem_dc);
+        // 画布不在这里删:它归 CANVAS 缓存管(尺寸变了或线程退出时才回收)。
+    });
+}
+
+/// D2D 渲染目标,外加「当前绑到哪儿」——用来免得每帧都 BindDC。
+struct RtCache {
+    factory: windows::Win32::Graphics::Direct2D::ID2D1Factory,
+    rt: windows::Win32::Graphics::Direct2D::ID2D1DCRenderTarget,
+    target: windows::Win32::Graphics::Direct2D::ID2D1RenderTarget,
+    /// 当前绑定:(hdc, left, top, right, bottom)。None = 还没绑/需要重绑。
+    bound: Option<(isize, i32, i32, i32, i32)>,
+}
+
+/// 一帧画布:32bpp DIB + 装着它的内存 DC。
+///
+/// 🔴 为什么必须缓存(2026-10-30 实测):原来**每帧**都
+/// `CreateCompatibleDC` + `CreateDIBSection(w*h*4)` + `DeleteObject`。
+/// 边缘光模式下 w*h*4 就是整块屏幕(3840x2160 = 33 MB),60fps 下每帧
+/// 都要系统给一块屏幕大小的内存再还回去;实测这一路上每次给的块在
+/// 4K 下正好是 2^25 字节,而且**进程里会越攒越多**(一次听写一块,半天
+/// 涨到 2 GB 以上,把整机提交额度吃光 —— 用户报的"pebrel 闪退 + 黑屏"
+/// 就是它把 DWM 挤死的)。尺寸没变就没必要重建,留着复用。
+struct Canvas {
+    w: i32,
+    h: i32,
+    mem_dc: isize,
+    dib: isize,
+    bits: *mut u8,
+    /// CreateCompatibleDC 自带的那张 1x1 位图,收尾时要换回去。
+    old_bmp: isize,
+}
+
+impl Canvas {
+    /// 造一块 w×h 的 32bpp 画布;任一步失败都自己清理干净并返回 None。
+    unsafe fn create(w: i32, h: i32) -> Option<Canvas> {
+        let bmi = BitmapInfo {
+            header: BitmapInfoHeader {
+                bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+                bi_width: w,
+                bi_height: -h, // 负 = 自上而下
+                bi_planes: 1,
+                bi_bit_count: 32,
+                bi_compression: 0, // BI_RGB
+                bi_size_image: (w * h * 4) as u32,
+                ..Default::default()
+            },
+            colors: [0; 3],
+        };
+        let mem_dc = CreateCompatibleDC(0);
+        if mem_dc == 0 {
+            return None;
+        }
+        let mut bits: *mut u8 = ptr::null_mut();
+        let dib = CreateDIBSection(mem_dc, &bmi, 0, &mut bits, 0, 0);
+        if dib == 0 || bits.is_null() {
+            DeleteDC(mem_dc);
+            return None;
+        }
+        let old_bmp = SelectObject(mem_dc, dib);
+        Some(Canvas { w, h, mem_dc, dib, bits, old_bmp })
+    }
+
+    /// 放掉画布。**绝不能**在 D2D 还绑着这个 DC 的时候调用 ——
+    /// 调用的地方(尺寸变化/线程退出)都先丢了 RT 缓存。
+    unsafe fn free(&self) {
+        SelectObject(self.mem_dc, self.old_bmp);
+        DeleteObject(self.dib);
+        DeleteDC(self.mem_dc);
+    }
+}
+
+impl Drop for Canvas {
+    fn drop(&mut self) {
+        unsafe { self.free() };
+    }
 }
 
 thread_local! {
-    /// D2D 渲染目标缓存（窗口线程专用；COM 对象不是 Send）。
-    static RT: std::cell::RefCell<Option<(
-        windows::Win32::Graphics::Direct2D::ID2D1Factory,
-        windows::Win32::Graphics::Direct2D::ID2D1DCRenderTarget,
-        windows::Win32::Graphics::Direct2D::ID2D1RenderTarget,
-    )>> = const { std::cell::RefCell::new(None) };
+    /// D2D 渲染目标缓存(窗口线程专用;COM 对象不是 Send)。
+    ///
+    /// `bound` 记住**当前绑的是哪个 DC、哪个矩形**:DC 和矩形都没变就不必
+    /// 再 `BindDC`(画布缓存之后 DC 每帧都一样了)。Direct2D 每次 BindDC
+    /// 都会为绑上的 DC 重新准备一份内部表面,能省就省。
+    static RT: std::cell::RefCell<Option<RtCache>> = const { std::cell::RefCell::new(None) };
+
+    /// 每帧画布缓存(按尺寸复用)。
+    static CANVAS: std::cell::RefCell<Option<Canvas>> = const { std::cell::RefCell::new(None) };
 
     /// 上一次 D2D 报错的时刻和内容。
     /// 窗口线程在设备丢失时会按 60fps 重试，不设限流会把控制台/日志刷爆。
@@ -1139,6 +1211,9 @@ fn with_target(hdc: isize, rc: &Rect, f: impl FnOnce(&d2d_target::Target)) {
     RT.with(|slot| unsafe {
     let mut slot = slot.borrow_mut();
     let mut dead = false;
+    // 这一帧要绑的 DC + 矩形:和上次一样就不必再 BindDC
+    // (画布缓存之后 DC 每帧都相同,所以这句大多数帧都成立)。
+    let want = (hdc, rc.left, rc.top, rc.right, rc.bottom);
     if slot.is_none() {
         let factory: d2d::ID2D1Factory =
             match d2d::D2D1CreateFactory(d2d::D2D1_FACTORY_TYPE_SINGLE_THREADED, None) {
@@ -1186,36 +1261,42 @@ fn with_target(hdc: isize, rc: &Rect, f: impl FnOnce(&d2d_target::Target)) {
                 return;
             }
         };
-        *slot = Some((factory, rt, target));
+        *slot = Some(RtCache { factory, rt, target, bound: Some(want) });
     }
 
-    // 复用缓存；每帧只需要重新 BindDC（尺寸/位置可能变）
-    let (factory, rt, target) = slot.as_ref().unwrap();
-    let _ = factory;
-    let sub = RECT {
-        left: rc.left,
-        top: rc.top,
-        right: rc.right,
-        bottom: rc.bottom,
-    };
-    // 🔴 设备丢失的唯一出口。
-    //
-    // GPU 驱动报错 / 睡眠唤醒后，Direct2D 设备会被重置：旧 target 的
-    // EndDraw 返回 D2DERR_RECREATE_TARGET（BindDC 也可能直接失败）。
-    // 以前这里只打印一行、继续用同一个死 target —— 之后每一帧都画进
-    // 不存在的设备，DIB 保持全透明，用户看到的就是「彩虹边缘光突然
-    // 消失，但语音输入一切正常」，只能重启进程。
-    // 现在只要出错就丢弃缓存，下一帧用新 target 重建，最多丢一帧。
-    if let Err(e) = rt.BindDC(HDC(hdc), &sub) {
-        log_d2d_err("BindDC", &e);
-        dead = true;
-    } else {
-        target.BeginDraw();
-        target.Clear(Some(&color(0, 0, 0, 0.0)));
-        f(&d2d_target::Target { target });
-        if let Err(e) = target.EndDraw(None, None) {
+    // 只有「绑的东西变了」才重新 BindDC —— DC 和矩形都没变就不动它。
+    let need_bind = slot.as_ref().and_then(|c| c.bound) != Some(want);
+    if need_bind {
+        let sub = RECT {
+            left: rc.left,
+            top: rc.top,
+            right: rc.right,
+            bottom: rc.bottom,
+        };
+        if let Err(e) = slot.as_ref().unwrap().rt.BindDC(HDC(hdc), &sub) {
+            log_d2d_err("BindDC", &e);
+            dead = true;
+        }
+    }
+
+    if !dead {
+        let c = slot.as_ref().unwrap();
+        // 🔴 设备丢失的唯一出口。
+        //
+        // GPU 驱动报错 / 睡眠唤醒后,Direct2D 设备会被重置:旧 target 的
+        // EndDraw 返回 D2DERR_RECREATE_TARGET(BindDC 也可能直接失败)。
+        // 以前这里只打印一行、继续用同一个死 target —— 之后每一帧都画进
+        // 不存在的设备,DIB 保持全透明,用户看到的就是「彩虹边缘光突然
+        // 消失,但语音输入一切正常」,只能重启进程。
+        // 现在只要出错就丢弃缓存,下一帧用新 target 重建,最多丢一帧。
+        c.target.BeginDraw();
+        c.target.Clear(Some(&color(0, 0, 0, 0.0)));
+        f(&d2d_target::Target { target: &c.target });
+        if let Err(e) = c.target.EndDraw(None, None) {
             log_d2d_err("EndDraw", &e);
             dead = true;
+        } else {
+            slot.as_mut().unwrap().bound = Some(want);
         }
     }
     if dead {

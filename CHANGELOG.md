@@ -7,6 +7,21 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **悬浮层画布与 D2D 绑定不再逐帧重建(2026-10-30)**:`paint()` 原先每帧都
+  `CreateCompatibleDC` + `CreateDIBSection(w*h*4)` + `DeleteObject`,边缘光模式下
+  `w*h*4` 就是整屏(3840x2160 = 33 MB);`with_target()` 还会拿**新的 DC** 每帧再
+  `BindDC` 一次。改成:画布按尺寸缓存(`Canvas`,收尾交给 `Drop`),`RtCache.bound`
+  记住当前绑的 DC + 矩形,真的变了才重绑。实打实的收益是 4K 下每帧省掉一次 33 MB
+  的 DIB 创建/清零 + 一次 `BindDC`。
+  ⚠️ 边界(同日晚实测,别误读):**这没有修掉「每说一句留一块 32 MB」的泄漏** ——
+  新起的一轮 57 句对 57 块(2.2 GB)。ETW 抓到的分配栈是
+  `win32u.dll → dxcore.dll → d3d11.dll → nvwgf2umx.dll → DXGKRNL`,即 **win32 分层
+  窗口的呈现路径**;配合「空按热键(无识别结果)不涨、每句涨一块」的隔离结论,
+  指向每次听写的悬浮层 **show/hide**。真要根治得把显隐改成「窗口常驻 +
+  只用 alpha 控制」,那一步还没做。
+
 ### Added
 
 - **Pebrel 组合态上屏(2026-10-28)**:新增 `ime_wmchar = pebrel` —— 对 Pebrel 一个按键
