@@ -130,6 +130,13 @@ pub fn backspace(n: usize) -> Result<()> {
 // open/conversion 状态,输入法照样把字母收走。所以对这类窗口改走
 // **PostMessage(WM_CHAR)**:消息不经过键盘那条链,输入法看不到,
 // 实测在经典文本控件上「无焦点也能完整落字 + 退格照常」。
+//
+// 2026-10-30 补:Qt 窗口是同一类现场(`class_needs_message_channel` 的 `qt*`),
+// 微信 4.x = `Weixin.exe` / `Qt51514QWindowIcon` 实测:
+//   SendInput 的 `helloTOKENabc` → 输入框**一个字符都没有**(字母全进了水杉输入法的
+//   候选面板,用户截图里就是「O'K → 哦*/欧*/噢*」);剪贴板读回是空的。
+//   同一窗口 `PostMessage(WM_CHAR)` → 逐字落地 `helloTOKENabc`;
+//   `WM_KEYDOWN/UP VK_BACK` ×3 → `helloTOKEN`(退格认);中文混英文也一字不差。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyMode {
     /// SendInput + KEYEVENTF_UNICODE(默认路径,绝大多数窗口都对)
@@ -180,26 +187,31 @@ pub fn describe_target(mode: KeyMode) -> String {
 
 /// 该给这个窗口用哪种上屏方式。纯函数,好测。
 ///
-/// `policy` 是配置里的 `ime_wmchar`,四种写法:
+/// `policy` 是配置里的 `ime_wmchar`,写法:
 ///   `off` / `keys`            —— 永远走键盘注入(老行为)
 ///   `on`  / `wmchar`          —— 永远走 WM_CHAR(拿不到窗口句柄时退回键盘)
-///   `on:pebrel.exe,zed.exe`   —— **只对这几个程序**走消息通道(流式),别的窗口照旧
-///   `off:some.exe`            —— 这几个程序永远走键盘注入,别的按 auto
+///   `on:pebrel.exe,zed.exe`   —— **只对这几个程序**走消息通道(流式)
+///   `off:some.exe`            —— 这几个程序永远走键盘注入
 ///   `nostream[:<exe>,...]`    —— 走消息通道但**整句一次投递**(连消息退格都不认的程序用)
 ///   `pebrel[:<exe>,...]`      —— 走 Pebrel 控制面的**组合态缓冲层**(一个按键都不发)。
 ///                               端点在本机只有一份,所以不写名单时只对 Pebrel 自己的
-///                               程序名(pebrel.exe / nebula.exe)生效;名单外照旧走键盘。
-///   `auto`(默认,等于没写)   —— 目标线程挂着输入法 **且** 焦点是经典文本控件时走
-///                              WM_CHAR。只对「已实测字母会被吃掉、而 WM_CHAR 已验证
-///                              能落字」的这一类生效,免得在别的窗口上把本来好用的
-///                              注入方式换掉。
+///                               程序名(pebrel.exe / nebula.exe)生效。
+///   `auto`(默认,等于没写)   —— 目标线程挂着输入法 **且** 焦点是「输入法会吃掉注入
+///                              字母」的那类文本面时走 WM_CHAR。只对「已实测字母会被
+///                              吃掉、而 WM_CHAR 已验证能落字」的这一类生效,免得在别的
+///                              窗口上把本来好用的注入方式换掉。
+///
+/// **名单是「覆盖」而不是「开关」**:名单形式只改名单里那几个程序怎么走,
+/// 名单外的窗口一律按 `auto` 判 —— 把兜底一起关掉是最隐形的坑
+/// (2026-10-30:配置写成 `ime_wmchar = pebrel` 之后,微信里的英文又被输入法吃掉,
+/// 根因就是这个「名单外走键盘」把 auto 兜底顺手关了)。
 ///
 /// `exe` 是目标进程的可执行文件名(小写,含 `.exe`),用来匹配名单。
 pub fn decide_key_mode(
     policy: &str,
     hwnd: isize,
     thread_has_ime: bool,
-    classic_control: bool,
+    needs_channel: bool,
     exe: &str,
 ) -> KeyMode {
     let exe = exe.to_ascii_lowercase();
@@ -227,35 +239,69 @@ pub fn decide_key_mode(
             KeyMode::Keys
         }
     };
+    // `auto` 的判据:目标线程挂着输入法 **且** 焦点是那类文本面。名单外的窗口按它判。
+    let auto_mode = || wmchar(thread_has_ime && needs_channel);
     match head {
-        "nostream" | "final" => wmchar_final(!only_listed || listed(list)),
+        "nostream" | "final" => {
+            if !only_listed || listed(list) {
+                wmchar_final(true)
+            } else {
+                auto_mode()
+            }
+        }
         "pebrel" | "compose" => {
             // 组合态那条路走的是 Pebrel 的控制面(发现文件只有一份),所以「不写名单」
             // = 只对 Pebrel 自己的程序名生效,而不是「对所有窗口生效」。
-            // 名单外仍旧走键盘:静默换成别的程序的控制面是最难查的错误。
+            // 名单外**不换控制面**(静默把别的程序的文本塞进它的缓冲层是最难查的错误),
+            // 但也**不再一律走键盘** —— 按 auto 判,否则就是「配了 pebrel 之后
+            // 微信里的英文又被输入法吃掉」。
             const PEBREL_EXES: [&str; 2] = ["pebrel.exe", "nebula.exe"];
             let want = if only_listed { listed(list) } else { PEBREL_EXES.contains(&exe.as_str()) };
             if want {
                 KeyMode::Pebrel
             } else {
-                KeyMode::Keys
+                auto_mode()
             }
         }
         "off" | "keys" | "input" => {
             // `off:foo.exe`:名单里的程序永远走键盘;名单外的按 auto,免得把兜底关掉
             if only_listed && !listed(list) {
-                wmchar(thread_has_ime && classic_control)
+                auto_mode()
             } else {
                 KeyMode::Keys
             }
         }
-        "on" | "wmchar" => wmchar(!only_listed || listed(list)),
+        "on" | "wmchar" => {
+            if !only_listed || listed(list) {
+                wmchar(true)
+            } else {
+                auto_mode()
+            }
+        }
         _ => {
-            // auto(以及任何写错的值):经典文本控件 + 输入法才换;带名单时只对名单生效
+            // auto(以及任何写错的值):输入法 + 那类文本面才换;
+            // 带名单时**只有名单里的程序**吃这条规则(写 `auto:foo.exe` 就是在收紧它)
             let allow = !only_listed || listed(list);
-            wmchar(allow && thread_has_ime && classic_control)
+            if allow {
+                auto_mode()
+            } else {
+                KeyMode::Keys
+            }
         }
     }
+}
+
+/// 窗口类名 → 「输入法会吃掉注入字母、要走 WM_CHAR」的那类文本面。纯函数,好测。
+///
+/// 只有两类(都是**在真机上实测过**字母被吃掉 + WM_CHAR 能落字的):
+///   - `*edit*`:经典文本控件(Edit / RichEdit / RichEdit20W…);
+///   - `qt*`    :Qt 窗口(Qt5/Qt6 的 `QWindow`,微信 4.x 就是 `Qt51514QWindowIcon`)。
+///
+/// 反馈闭环决定这里**故意写窄**:`auto` 是「只在有证据的窗口上换通道」的策略,
+/// 想对某个具体程序强开,用配置里的名单形式(`ime_wmchar = on:foo.exe`)。
+pub fn class_needs_message_channel(class: &str) -> bool {
+    let c = class.to_ascii_lowercase();
+    c.contains("edit") || c.starts_with("qt")
 }
 
 #[cfg(windows)]
@@ -288,11 +334,19 @@ mod target {
         fn ImmIsIME(hkl: isize) -> i32;
     }
 
-    /// 「经典文本控件」= Edit / RichEdit 这一族。
+    /// 目标窗口是不是「输入法会吃掉注入字母」的那类文本面。
     ///
-    /// 判据是类名里带 `Edit`(大小写不敏感):这一类窗口把自己收到的按键交给输入法
-    /// 处理(IMM32 那条链),注入的字母才会被吃掉;而 WM_CHAR 正好绕开它。
-    fn is_classic_text_control(hwnd: isize) -> bool {
+    /// 判据是**窗口类名**(见 `class_needs_message_channel`):
+    ///   - `*Edit*`:经典文本控件(Edit / RichEdit);
+    ///   - `Qt*`   :Qt 窗口(Qt5/Qt6 的 QWindow)。2026-10-30 在微信 4.x
+    ///              (`Weixin.exe`,`Qt51514QWindowIcon`)上实测:SendInput 的字母
+    ///              **一个都不落** —— 全被水杉输入法收进候选框(用户看到的就是
+    ///              「英文跳到输入法的候选面板上」);而 `PostMessage(WM_CHAR)` 逐字
+    ///              落地、`WM_KEYDOWN/UP VK_BACK` 退格也认。
+    ///
+    /// 只加**已实测过**的这一类:换通道本身有代价,拿没验证过的窗口去换,
+    /// 换掉的可能本来就是好用的注入方式。
+    fn needs_message_channel(hwnd: isize) -> bool {
         if hwnd == 0 {
             return false;
         }
@@ -301,8 +355,7 @@ mod target {
         if n <= 0 {
             return false;
         }
-        let name = String::from_utf16_lossy(&buf[..n as usize]).to_ascii_lowercase();
-        name.contains("edit")
+        super::class_needs_message_channel(&String::from_utf16_lossy(&buf[..n as usize]))
     }
 
     /// 目标窗口所在线程挂的是不是输入法(IME)。
@@ -388,7 +441,7 @@ mod target {
             policy,
             hwnd,
             thread_uses_ime(hwnd),
-            is_classic_text_control(hwnd),
+            needs_message_channel(hwnd),
             &exe_name(hwnd),
         )
     }
@@ -428,6 +481,11 @@ pub use target::key_mode as target_key_mode;
 /// 前台窗口所属进程 pid(拿不到就 0)。
 pub fn focused_pid() -> u32 {
     target::focused_pid()
+}
+
+/// 焦点窗口(拿不到就 0)。给探针/日志用 —— 上屏方式就是按它决定的。
+pub fn focused_window() -> isize {
+    target::focused_hwnd()
 }
 
 /// 按当前方式打一段文本。
@@ -560,8 +618,8 @@ mod tests {
     /// 上屏方式的选择逻辑(纯函数,不需要真窗口)。
     ///
     /// 这里钉的是**只在该换的时候换**:`auto` 只在「目标线程挂着输入法 + 焦点是
-    /// 经典文本控件」时用 WM_CHAR —— 别的窗口照着老路走,不拿没验证过的路去换掉
-    /// 本来就没问题的注入方式。
+    /// 那类会被输入法吃字母的文本面」时用 WM_CHAR —— 别的窗口照着老路走,
+    /// 不拿没验证过的路去换掉本来就没问题的注入方式。
     #[test]
     fn key_mode_policy() {
         const E: &str = "pebrel.exe";
@@ -572,7 +630,7 @@ mod tests {
         assert_eq!(decide_key_mode("on", 0x1234, false, false, E), KeyMode::WmChar(0x1234));
         // on 但拿不到窗口句柄 → 退回键盘(有句柄才谈得上投递消息)
         assert_eq!(decide_key_mode("on", 0, true, true, E), KeyMode::Keys);
-        // auto:输入法 + 经典文本控件才换
+        // auto:输入法 + 那类文本面才换
         assert_eq!(decide_key_mode("auto", 0x1234, true, true, E), KeyMode::WmChar(0x1234));
         assert_eq!(decide_key_mode("auto", 0x1234, true, false, E), KeyMode::Keys);
         assert_eq!(decide_key_mode("auto", 0x1234, false, true, E), KeyMode::Keys);
@@ -582,18 +640,18 @@ mod tests {
         assert_eq!(decide_key_mode("whatever", 0x1234, true, true, E), KeyMode::WmChar(0x1234));
         // 名单形式:只对该程序生效(自绘终端就靠它试,不牵动别的窗口)
         assert_eq!(decide_key_mode("on:pebrel.exe", 0x1234, false, false, E), KeyMode::WmChar(0x1234));
-        assert_eq!(decide_key_mode("on:pebrel.exe", 0x1234, false, false, OTHER), KeyMode::Keys);
         assert_eq!(decide_key_mode("on: Pebrel.EXE , zed.exe", 0x1234, false, false, E), KeyMode::WmChar(0x1234));
-        assert_eq!(decide_key_mode("on:pebrel.exe", 0x1234, true, true, OTHER), KeyMode::Keys);
+        assert_eq!(decide_key_mode("on:pebrel.exe", 0x1234, true, true, OTHER), KeyMode::WmChar(0x1234));
         // off 带名单:名单里的永远键盘,名单外仍享受 auto 兜底
         assert_eq!(decide_key_mode("off:pebrel.exe", 0x1234, true, true, E), KeyMode::Keys);
         assert_eq!(decide_key_mode("off:pebrel.exe", 0x1234, true, true, OTHER), KeyMode::WmChar(0x1234));
-        // auto 带名单:只有名单里的程序吃 auto 规则
+        // auto 带名单:只有名单里的程序吃 auto 规则(写名单 = 收紧这条规则)
         assert_eq!(decide_key_mode("auto:pebrel.exe", 0x1234, true, true, OTHER), KeyMode::Keys);
         assert_eq!(decide_key_mode("auto:pebrel.exe", 0x1234, true, true, E), KeyMode::WmChar(0x1234));
-        // nostream:只对名单生效,走「整句一次投递」
+        // nostream:名单里走「整句一次投递」,名单外按 auto(不是一律键盘)
         assert_eq!(decide_key_mode("nostream:pebrel.exe", 0x1234, false, false, E), KeyMode::WmCharFinal(0x1234));
-        assert_eq!(decide_key_mode("nostream:pebrel.exe", 0x1234, false, false, OTHER), KeyMode::Keys);
+        assert_eq!(decide_key_mode("nostream:pebrel.exe", 0x1234, true, true, OTHER), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("nostream:pebrel.exe", 0x1234, true, false, OTHER), KeyMode::Keys);
         assert_eq!(decide_key_mode("nostream", 0x1234, false, false, E), KeyMode::WmCharFinal(0x1234));
         // pebrel:组合态缓冲层。**不写名单 = 只对 Pebrel 自己的程序名生效** ——
         // 控制面在这台机上只有一份,把别的程序的文本塞进它的缓冲层是最难查的错误。
@@ -603,16 +661,41 @@ mod tests {
             KeyMode::Pebrel,
             "旧程序名 nebula.exe 也认"
         );
-        assert_eq!(decide_key_mode("pebrel", 0x1234, false, false, OTHER), KeyMode::Keys);
         assert_eq!(
             decide_key_mode("pebrel:psql.exe", 0x1234, false, false, "psql.exe"),
             KeyMode::Pebrel
         );
+        // ⚠️ 回归(2026-10-30 微信「英文全被输入法吃掉」的现场):配了 `pebrel` 之后,
+        // 名单外的窗口**必须继续按 auto 判** —— 用户日常配置就是 `ime_wmchar = pebrel`,
+        // 一旦这里退回「一律键盘」,微信里说英文就又没了。
         assert_eq!(
-            decide_key_mode("pebrel:psql.exe", 0x1234, false, false, OTHER),
-            KeyMode::Keys,
-            "名单外不许静默换通道"
+            decide_key_mode("pebrel", 0x1234, true, true, OTHER),
+            KeyMode::WmChar(0x1234),
+            "配了 pebrel 也要保住名单外窗口的 auto 兜底"
         );
+        assert_eq!(decide_key_mode("pebrel", 0x1234, true, false, OTHER), KeyMode::Keys, "没输入法就不用换");
+        assert_eq!(
+            decide_key_mode("pebrel:psql.exe", 0x1234, true, true, OTHER),
+            KeyMode::WmChar(0x1234),
+            "名单外也不许静默换控制面,但要保住 auto 兜底"
+        );
+    }
+
+    /// 哪些窗口类算「输入法会吃掉注入字母」的那类文本面。
+    #[test]
+    fn class_needs_message_channel_covers_edit_and_qt() {
+        // 经典控件(2026-10-28 实测的那一类)
+        assert!(class_needs_message_channel("Edit"));
+        assert!(class_needs_message_channel("RichEdit20W"));
+        assert!(class_needs_message_channel("EDIT"));
+        // Qt 窗口(2026-10-30 微信实测的那一类)
+        assert!(class_needs_message_channel("Qt51514QWindowIcon"));
+        assert!(class_needs_message_channel("Qt6QWindowIcon"));
+        // 别的自绘窗口:不动它(没实测过,保留原来的注入方式)
+        assert!(!class_needs_message_channel("Zed::Window"));
+        assert!(!class_needs_message_channel("ConsoleWindowClass"));
+        assert!(!class_needs_message_channel("Chrome_WidgetWin_1"));
+        assert!(!class_needs_message_channel(""));
     }
 
     /// 消息通道默认**照常流式**(退格走 PostMessage(WM_KEYDOWN/UP, VK_BACK))。
