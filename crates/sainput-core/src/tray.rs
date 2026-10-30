@@ -710,7 +710,7 @@ unsafe fn show_menu(hwnd: isize) {
         MODES.get(f.overlay_mode).copied().unwrap_or("不显示")
     ));
     let ovl_menu = CreatePopupMenu();
-    let fixc = wide("英文小写修复");
+    let fixc = wide("英文默认小写");
     let showcon = wide("显示日志窗口");
     let autost = wide("开机自启");
     let sil_title = wide(&format!(

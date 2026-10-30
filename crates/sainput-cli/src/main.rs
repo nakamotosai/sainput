@@ -2135,7 +2135,7 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
                 let v = !FIX_CASE.load(O::Relaxed);
                 FIX_CASE.store(v, O::Relaxed);
                 ("fix_case", if v { "true" } else { "false" },
-                 if v { "英文小写修复：开" } else { "英文小写修复：关" })
+                 if v { "英文默认小写：开" } else { "英文默认小写：关" })
             }
             tray::TrayToggle::SetOverlayMode(m) => {
                 let m = m as u32;

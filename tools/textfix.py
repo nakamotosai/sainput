@@ -108,32 +108,63 @@ def merge_spaced_terms(t):
 
 # ---------------------------------------------------------------- 大小写修复
 
-# 为什么需要：本仓库的默认几个 x-asr 模型**词表里根本没有小写字母** ——
-# 实测 tokens.txt 里纯字母 token 231 个，全部大写开头，小写零个；
-# 用户日志里 56 个英文词有 55 个是全大写（连 TODAY / IS / AFTER 这种普通词都是）。
-# 也就是说模型**物理上吐不出小写**，不是渲染层的 bug。
-# 唯一能根治的是换模型（Nemotron 那个有 689 个小写 token），但它 0.6B 更吃算力。
-# 所以这里做代码层的补救：把**确定该小写的常见词**改回小写。
+# 为什么需要:本仓库的默认几个 x-asr 模型**词表里根本没有小写字母** ——
+# 实测 tokens.txt 里纯字母 token 231 个,全部大写开头,小写零个;
+# 用户日志里 56 个英文词有 55 个是全大写(连 TODAY / IS / AFTER 这种普通词都是)。
+# 也就是说模型**物理上吐不出小写**,不是渲染层的 bug。
+# 唯一能根治的是换模型(Nemotron 那个有 689 个小写 token),但它 0.6B 更吃算力。
 #
-# 🔴 设计红线：**只动白名单，绝不猜**。
-# 随便把大写词变小写会毁掉技术词（AI / API / VPS / CPU 变小写就错了）。
-# 所以：
-#   · 常见英文词（且不是技术缩写）→ 小写
-#   · 技术缩写白名单 → 保持大写
-#   · **不在任何名单里的词 → 原样保留**（宁可留大写，也不猜错）
+# 🔴 设计红线(2026-10-31 按用户口径改):**默认小写**。
+# 用户原话:「我现在为止出现过的所有英文几乎全应该是小写的」——
+# 所以不再做「只把白名单词改回小写、其余原样保留」那种玩法(它的产物是「满屏大写里
+# 夹几个小写词」),而是反过来:
+#   · 技术缩写白名单(`KEEP_UPPER`)      → 保持全大写(AI / API / VPS ...)
+#   · 专有名词表(`PROPER`)              → 规范混合写法(GITHUB → GitHub)
+#   · 其余全大写词                       → 一律小写
+#   · 已经是混合大小写的词               → 不动(人写的文本里别改)
+#   · 「名字.后缀」整体                  → 见 `_dotted`(域名全小写;文件名的**名字那截保持原样**,
+#                                          因为仓库里的 `AGENTS.md` / `README.md` 本来就是大写)
 
-# 明确要保持全大写的（技术缩写 / 专有缩写）
+# 明确要保持全大写的(技术缩写 / 专有缩写;这些词没有「规范混合写法」)
 KEEP_UPPER = {
     "AI", "API", "URL", "URI", "CPU", "GPU", "RAM", "ROM", "SSD", "HDD", "USB",
-    "ASR", "TTS", "LLM", "GPU", "VPS", "DNS", "HTTP", "HTTPS", "TCP", "UDP", "IP",
+    "ASR", "TTS", "LLM", "VPS", "DNS", "HTTP", "HTTPS", "TCP", "UDP", "IP",
     "MAC", "VPN", "SSH", "CLI", "GUI", "OS", "PC", "UI", "UX", "ID", "OK", "PDF",
     "JSON", "XML", "HTML", "CSS", "SQL", "SDK", "IDE", "GPT", "RAG", "NLP", "OCR",
     "CUDA", "ONNX", "GGUF", "IOT", "WASM", "UTF", "ASCII", "REGEX", "TODO", "FIXME",
-    "REA", "CODEX", "CLAUDE", "GITHUB", "WINDOWS", "LINUX", "MACOS", "ANDROID",
+    "README", "LICENSE", "CHANGELOG", "MAKEFILE", "DOCKERFILE",
+    "REA", "OMP", "CPA", "MCP", "ITN", "TSF", "IME", "D2D",
+    "MP", "TV", "GPS",       # MP3 / MP4 这类型号:大写是常规写法(数字那截不受影响)
 }
 
-# 常见英文词 → 小写形态（只要在句子里以全大写出现，就改回小写）
-# 只收「常见、无歧义、改了不会错」的词。技术词放在 KEEP_UPPER 里被排除。
+# 专有名词 / 品牌 / 工具:全大写出现时还原成规范写法(键一律小写)
+PROPER = {
+    "github": "GitHub", "gitlab": "GitLab", "gitea": "Gitea", "git": "Git",
+    "windows": "Windows", "linux": "Linux", "macos": "macOS", "mac": "Mac",
+    "android": "Android", "ios": "iOS", "ubuntu": "Ubuntu", "debian": "Debian",
+    "codex": "Codex", "claude": "Claude", "openai": "OpenAI", "chatgpt": "ChatGPT",
+    "deepseek": "DeepSeek", "gemini": "Gemini", "grok": "Grok", "kimi": "Kimi",
+    "python": "Python", "rust": "Rust", "javascript": "JavaScript",
+    "typescript": "TypeScript", "powershell": "PowerShell", "bash": "Bash",
+    "docker": "Docker", "kubernetes": "Kubernetes", "nodejs": "Node.js",
+    "npm": "npm", "yarn": "Yarn", "bun": "Bun", "deno": "Deno",
+    "react": "React", "vue": "Vue", "svelte": "Svelte", "vite": "Vite",
+    "pytorch": "PyTorch", "numpy": "NumPy", "pandas": "pandas", "jupyter": "Jupyter",
+    "obsidian": "Obsidian", "notion": "Notion", "telegram": "Telegram",
+    "discord": "Discord", "slack": "Slack", "wechat": "WeChat", "weixin": "WeChat",
+    "tailscale": "Tailscale", "cloudflare": "Cloudflare", "vercel": "Vercel",
+    "huggingface": "HuggingFace", "openrouter": "OpenRouter", "photoshop": "Photoshop",
+    "blender": "Blender", "godot": "Godot", "unity": "Unity", "unreal": "Unreal",
+    "wifi": "WiFi", "iphone": "iPhone", "ipad": "iPad", "macbook": "MacBook",
+    "youtube": "YouTube", "whatsapp": "WhatsApp", "onedrive": "OneDrive",
+    "chrome": "Chrome", "chromium": "Chromium", "firefox": "Firefox", "safari": "Safari",
+    "ipv": "IPv", "vtuber": "VTuber", "whisper": "Whisper", "luma": "Luma",
+    "obs": "OBS", "wireshark": "Wireshark", "virtualbox": "VirtualBox", "vmware": "VMware",
+    "ytdlp": "yt-dlp", "ffmpeg": "FFmpeg", "ollama": "Ollama", "llama": "LLaMA",
+}
+
+# 常见英文词表 —— ⚠️ 现在**不再**用于大小写判断(改口径后全大写一律小写),
+# 但 `itn.py` 的「型号 / 版本」规则要用它区分「MP/V/GPT 这种名字」和 hello/world 这种普通词。
 COMMON_WORDS = {
     "the", "and", "for", "you", "not", "but", "all", "can", "her", "was", "one",
     "our", "out", "day", "get", "has", "him", "his", "how", "its", "new", "now",
@@ -164,10 +195,10 @@ _ALPHA_WORD = re.compile(r'(?<![A-Za-z])[A-Za-z]{2,}(?![A-Za-z])')
 
 
 def fix_english_case(t):
-    """把"本该是小写却是全大写"的常见英文词改回小写。
+    """全大写英文 → 默认小写;技术缩写保持大写,专有名词还原规范写法。
 
-    只认 `COMMON_WORDS`；`KEEP_UPPER` 里的技术缩写不动；**名单外的词一律原样保留**。
-    这样即使判断不了也不会改错 —— 与 itn.py「宁可少改，不可改错」同一条原则。"""
+    口径(2026-10-31 用户钦定):「我出现过的所有英文几乎全应该是小写的」。
+    `KEEP_UPPER` / `PROPER` 是**数据**,觉得不对直接改这两张表,不用改代码。"""
     if not t:
         return t
 
@@ -175,35 +206,59 @@ def fix_english_case(t):
         w = m.group(0)
         if w in KEEP_UPPER:
             return w
-        low = w.lower()
-        if low in COMMON_WORDS:
-            return low
-        # 名单外：原样（可能是人名、技术词、或我们没收录的普通词）
-        return w
+        canon = PROPER.get(w.lower())
+        if canon is not None:
+            return canon
+        if w.isupper():
+            return w.lower()
+        return w    # 已经是混合大小写(人写的文本 / 之前还原过的)→ 不动
 
     return _ALPHA_WORD.sub(rep, t)
 
 
-# 点后面那截是「文件后缀 / 顶级域名」的白名单 —— 一律小写。
-# 动因(2026-10-31 用户实测):说「AGENTS 点 M D」要的是 `AGENTS.md`、「SAAAI 点 COM」
-# 要的是 `.com`;模型吐不出小写,ITN 把「点」换成 `.` 之后这里补上小写。
-# 仍然是「只动白名单」:不在表里的词一个字母都不改(AI/GPT/USB 这些不在表里,不会被误伤)。
-_FILE_EXT = {
-    "md", "txt", "com", "cn", "net", "org", "io", "ai", "dev", "app", "sh", "bat",
-    "ps1", "py", "rs", "js", "ts", "json", "yml", "yaml", "toml", "ini", "cfg",
-    "conf", "log", "exe", "zip", "rar", "7z", "pdf", "png", "jpg", "jpeg", "svg",
-    "html", "css", "xml", "csv", "tsv", "db", "sqlite", "dll", "so", "lock", "env",
-    "mp3", "mp4", "wav", "ttf", "otf", "woff", "ico", "bin", "onnx", "whl",
+# ---------------------------------------------------------------- 「名字.后缀」
+
+_TLD = {
+    "com", "cn", "net", "org", "io", "ai", "dev", "app", "me", "co", "jp", "us",
+    "uk", "de", "fr", "xyz", "top", "site", "online", "tech", "store", "shop",
+    "live", "tv", "cc", "info", "biz", "pro", "club", "art", "blog", "wiki",
+    "cloud", "space", "fun", "run", "page", "host", "link", "email", "group",
 }
-_DOT_TOKEN = re.compile(r'(?<=\.)([A-Za-z]{2,10})(?![A-Za-z0-9])')
+_FILE_EXT = {
+    "md", "txt", "json", "yml", "yaml", "toml", "ini", "cfg", "conf", "log",
+    "py", "rs", "js", "ts", "sh", "bat", "ps1", "exe", "dll", "so", "lock",
+    "zip", "rar", "7z", "pdf", "png", "jpg", "jpeg", "svg", "ico", "webp",
+    "html", "css", "xml", "csv", "tsv", "db", "sqlite", "env", "bin", "onnx",
+    "whl", "mp3", "mp4", "wav", "ttf", "otf", "woff", "pem", "key", "bak",
+}
+# 「名字.后缀」整体:`AGENTS.MD` / `SAAAI.COM`。只在后缀在两张表里时才处理。
+_DOTTED = re.compile(r'(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]*)\.([A-Za-z]{2,10})(?![A-Za-z0-9])')
 
 
-def lower_file_ext(t):
-    """点后面的后缀/顶级域名小写:`AGENTS.MD` -> `AGENTS.md`、`SAAAI.COM` -> `SAAAI.com`。"""
+def dotted_names(t, hold):
+    """域名整段小写;文件名只小写后缀、**名字那截保持原样**。
+
+    · `SAAAI.COM`  → `saaaai.com`(顶级域名:整段小写 —— 用户报的 saaaai.com 就是这个)
+    · `AGENTS.MD`  → `AGENTS.md`(配置文件:仓库里本来就写作 `AGENTS.md`,名字别动)
+    `hold` 是占位符表:文件名的名字那截会换成一个不含字母的哨兵串,
+    等大小写处理完再换回来(所以「默认小写」碰不到它)。
+    """
     if not t or '.' not in t:
         return t
-    return _DOT_TOKEN.sub(lambda m: m.group(1).lower() if m.group(1).lower() in _FILE_EXT
-                          else m.group(0), t)
+
+    def rep(m):
+        name, ext = m.group(1), m.group(2)
+        low = ext.lower()
+        if low in _TLD:
+            return (name + '.' + ext).lower()
+        if low in _FILE_EXT:
+            k = '\x01%d\x02' % len(hold)
+            hold[k] = name + '.' + low
+            return k
+        return m.group(0)
+
+    return _DOTTED.sub(rep, t)
+
 
 # ---------------------------------------------------------------- 组合入口
 
@@ -219,9 +274,12 @@ def normalize(t, punct_mode='keep', fix_case=True):
     if punct_mode == 'space':
         t = cjk_punct_to_space(t)
     t = merge_spaced_terms(t)
+    # 顺序:先合并(`M D` → `MD`),再处理「名字.后缀」,最后才动大小写 ——
+    # 文件名的名字那截这时已被换成占位符,不会被「默认小写」误伤。
+    hold = {}
+    t = dotted_names(t, hold)
     if fix_case:
         t = fix_english_case(t)
-    # 后缀小写放最后:上面的合并/大小写都定稿了,才轮到「点后面那截」
-    # (合并会先动 `M D` → `MD`,这里才认得出 `AGENTS.MD` → `AGENTS.md`)。
-    t = lower_file_ext(t)
+    for k, v in hold.items():
+        t = t.replace(k, v)
     return t

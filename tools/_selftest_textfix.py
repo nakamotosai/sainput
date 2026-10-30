@@ -27,20 +27,24 @@ def pipeline(raw):
 # A) textfix 单件
 CASES_TEXTFIX = [
     ("MONDAY TODAY IS THE DAY", "monday today is the day"),
+    ("HELLO WORLD", "hello world"),                      # 默认小写(2026-10-31 用户口径)
+    ("SOMETHINGUNKNOWN 这个词", "somethingunknown 这个词"),   # 名单外也小写:全大写就是模型的锅
+    ("GITHUB 上看的 PYTHON 和 RUST", "GitHub 上看的 Python 和 Rust"),  # 专有名词表
+    ("VPS 上跑的 CODEX", "VPS 上跑的 Codex"),
+    ("README.MD 和 DOCKERFILE 都在", "README.md 和 DOCKERFILE 都在"),  # 文件名:名字那截保留
     ("我用 API 调的", "我用 API 调的"),
-    ("VPS 上跑的 CODEX", "VPS 上跑的 CODEX"),
-    ("HELLO WORLD", "hello world"),
     ("这个 AI 和 API 都要", "这个 AI 和 API 都要"),
     ("AFTER TWO DAYS", "after two days"),
-    ("Random Person Name", "Random Person Name"),   # 名单外 -> 原样
-    ("我CODEX还在做R E A任务", "我CODEX还在做REA任务"),
+    ("我CODEX还在做R E A任务", "我Codex还在做REA任务"),
+    ("Random Person Name", "Random Person Name"),    # 已经是混合大小写 → 一律不动
+    ("S A A A I", "saaai"),                          # 全大写 → 小写(域名里也一样)
     # 2026-10-31:已知缩写表里的「A I」不再把长串切碎
-    ("S A A A I", "SAAAI"),
-    ("S A A A I.COM", "SAAAI.com"),
-    ("S A A A I 点 COM", "SAAAI 点 COM"),            # 「点」归 ITN 管,这一层不动(见 B 段)
+    ("S A A A I", "saaai"),
+    ("S A A A I.COM", "saaai.com"),
+    ("S A A A I 点 COM", "saaai 点 com"),            # 「点」归 ITN 管,这一层不动(见 B 段)
     # 后缀 / 顶级域名小写(白名单内才动)
     ("AGENTS.MD", "AGENTS.md"),
-    ("SAAAI.COM", "SAAAI.com"),
+    ("SAAAI.COM", "saaai.com"),
     ("看 AI.GPT 那个", "看 AI.GPT 那个"),            # 名单外 -> 原样
 ]
 
@@ -54,10 +58,10 @@ CASES_PIPELINE = [
     ("MP 三", "MP3"),
     ("M P 四", "MP4"),                              # 拆开念的字母:先并数字,再收拢字母组
     ("AGENTS 点 M D", "AGENTS.md"),
-    ("S A A A I 点 COM", "SAAAI.com"),
+    ("S A A A I 点 COM", "saaai.com"),
     ("甚至这个四个 A", "甚至这个四个 A"),
     # --- 2026-10-31 用户实测:重复的字被吞 ---
-    ("AAAA", "AAAA"),
+    ("AAAA", "aaaa"),                              # 全大写 → 小写(不丢字才是重点)
     ("saaaai", "saaaai"),
     ("等等等类似的话题", "等等等类似的话题"),
     ("来来来你试试", "来来来你试试"),
