@@ -135,6 +135,10 @@ KEEP_UPPER = {
     "README", "LICENSE", "CHANGELOG", "MAKEFILE", "DOCKERFILE",
     "REA", "OMP", "CPA", "MCP", "ITN", "TSF", "IME", "D2D",
     "MP", "TV", "GPS",       # MP3 / MP4 这类型号:大写是常规写法(数字那截不受影响)
+    # 2026-10-31 体检 §3.3 补的常用缩写(原本被一律小写化:NASA→nasa / VS CODE→vs code)。
+    # 只收「全大写才是规范写法、且不会跟普通英文词撞车」的 —— US 故意不收:
+    # 它有代词 us 的歧义,模型吐 `LET US GO` 时会被保成 `let US go`。
+    "NASA", "USA", "EU", "ISO", "VS", "ML", "CI", "CD", "JS", "TS",
 }
 
 # 专有名词 / 品牌 / 工具:全大写出现时还原成规范写法(键一律小写)
@@ -193,14 +197,28 @@ COMMON_WORDS = {
 # 全大写的「词 + 空格 + 词」序列（用于整段判断，尽量别把连写缩写切碎）
 _ALPHA_WORD = re.compile(r'(?<![A-Za-z])[A-Za-z]{2,}(?![A-Za-z])')
 
+# 多词专有名词(2026-10-31 体检 §3.3)。
+# 为什么单独一层:逐词查表会走样 —— `GITHUB ACTIONS` 里 GITHUB 能还原成 GitHub,
+# 但 ACTIONS 只会被「默认小写」压成 actions,拼出 `GitHub actions`。
+# 只在**整段全大写**时生效(人写的 `Github actions` 这类混合写法一律不动),
+# 并且只收真正成对、写法唯一的专有名 —— 多收一条就是替用户定一次写法。
+_PHRASES = [
+    (re.compile(r'(?<![A-Za-z])GITHUB ACTIONS(?![A-Za-z])'), 'GitHub Actions'),
+    (re.compile(r'(?<![A-Za-z])VS CODE(?![A-Za-z])'), 'VS Code'),
+    (re.compile(r'(?<![A-Za-z])USA TODAY(?![A-Za-z])'), 'USA Today'),
+    (re.compile(r'(?<![A-Za-z])GO LANG(?![A-Za-z])'), 'Go lang'),
+]
+
 
 def fix_english_case(t):
     """全大写英文 → 默认小写;技术缩写保持大写,专有名词还原规范写法。
 
     口径(2026-10-31 用户钦定):「我出现过的所有英文几乎全应该是小写的」。
-    `KEEP_UPPER` / `PROPER` 是**数据**,觉得不对直接改这两张表,不用改代码。"""
+    `KEEP_UPPER` / `PROPER` / `_PHRASES` 是**数据**,觉得不对直接改这几张表,不用改代码。"""
     if not t:
         return t
+    for rx, canon in _PHRASES:
+        t = rx.sub(canon, t)
 
     def rep(m):
         w = m.group(0)

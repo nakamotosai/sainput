@@ -20,6 +20,12 @@ _NEVER_DOUBLE = set(
 # 笑声/语气词：连着多个是正常的，压到 2 个
 _LAUGH = set("哈嘿呵嘻嗯哦")
 
+# 称呼 / 叠词字:连着排多少个都**压不得**。
+# 2026-10-31 体检 §3.4:旧的「中文 4 连以上压成一个」把 `妈妈妈妈` 吃成 `妈`、
+# `谢谢谢谢` 吃成 `谢` —— 可这是孩子在叫人 / 连声道谢,不是解码打转。
+# 单列一张表,不掺进 `_NEVER_DOUBLE`(那张表是「两连即算打转」的判据,语义不同)。
+_KEEP_RUN = set("妈爸哥姐弟妹爷奶叔姨舅姑婆娃宝谢")
+
 _CJK = re.compile(r"[\u4e00-\u9fff]")
 _RE_ANY_RUN = re.compile(r"(.)\1+")         # 任意字符的连续段(统一在这里判,别拆成三条规则互相打架)
 _RE_BLOCK3 = re.compile(r"(.{3,10}?)\1+")   # 3 字以上片段重复 2 次即算打转
@@ -46,6 +52,8 @@ def _collapse_runs(t):
         n = len(m.group(0))
         if not _CJK.match(ch):
             return m.group(0)              # 拉丁 / 数字 / 标点:绝不塌缩
+        if ch in _KEEP_RUN:
+            return m.group(0)              # 称呼/叠词(妈妈妈妈 / 谢谢谢谢):多少个都保留
         if n >= 4:
             return ch * (2 if ch in _LAUGH else 1)
         if n == 2 and ch in _NEVER_DOUBLE:
@@ -63,8 +71,14 @@ def repair(t):
 
     # 2) 片段原样重复:3 字以上重复 2 次、2 字重复 3 次以上才压。
     #    只对含中文的片段生效 —— 「ALWAYS ALWAYS」「很多很多」这种正常内容不许动。
+    #    整段都是称呼/叠词字的(`妈妈妈妈妈妈`)也不许动,见 `_KEEP_RUN`。
     def _block(m):
-        return m.group(1) if _has_cjk(m.group(1)) else m.group(0)
+        seg = m.group(1)
+        if not _has_cjk(seg):
+            return m.group(0)
+        if seg and all(c in _KEEP_RUN for c in seg):
+            return m.group(0)
+        return seg
 
     for rx in (_RE_BLOCK3, _RE_BLOCK2):
         for _ in range(4):
@@ -102,6 +116,12 @@ CASES = [
     ("妈妈天天很忙", "妈妈天天很忙"),
     ("稍微慢一点儿", "稍微慢一点儿"),
     ("很多很多的人", "很多很多的人"),
+    # 称呼 / 叠词:连着叫也一个都不许压(2026-10-31 体检 §3.4:妈妈妈妈 → 妈 是错的)
+    ("妈妈妈妈", "妈妈妈妈"),
+    ("爸爸爸爸我想你了", "爸爸爸爸我想你了"),
+    ("妈妈妈妈妈妈", "妈妈妈妈妈妈"),
+    ("谢谢谢谢大家", "谢谢谢谢大家"),
+    ("爷爷奶奶都来了", "爷爷奶奶都来了"),
     ("一步一步来", "一步一步来"),
     ("可以可以,没问题", "可以可以,没问题"),
     ("好好休息", "好好休息"),

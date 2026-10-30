@@ -56,7 +56,10 @@ def main() -> int:
         text = str(final.get("text") or "")
         print("final :", repr(text))
         print("tail_chunks:", final.get("tail_chunks"))
-        ok = "FREQUENTLY" in text and TAIL in text.split("FREQUENTLY", 1)[1]
+        # 大小写不敏感:英文默认走小写整形(textfix),这里断言的是「尾巴有没有被丢」,
+        # 不是「FREQUENTLY 有没有被大写」。找大写字面量会被整形打穿(2026-10-31 体检发现)。
+        up = text.upper()
+        ok = "FREQUENTLY" in up and TAIL in text[up.index("FREQUENTLY") + len("FREQUENTLY"):]
         print("PASS" if ok else "FAIL: 尾巴(%s)被丢掉了" % TAIL)
         return 0 if ok else 1
     finally:
