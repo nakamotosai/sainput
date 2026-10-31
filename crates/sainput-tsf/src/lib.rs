@@ -144,6 +144,18 @@ struct ITextInputProcessorVtbl {
     activate_ex: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) -> Hresult,
 }
 
+/// panic 也要落进我们的日志文件:宿主可能没有控制台,默认 hook 写 stderr 等于丢掉。
+/// 在 `DllGetClassObject` 里装(那是第一个进入我们代码的入口,且**不在**加载器锁里)。
+static HOOK: std::sync::Once = std::sync::Once::new();
+
+fn install_panic_hook() {
+    HOOK.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            trace(&format!("PANIC 被兜住(没有传给宿主):{info}"));
+        }));
+    });
+}
+
 /// 还活着的 COM 对象数 —— `DllCanUnloadNow` 就报它。
 static LIVE_OBJECTS: AtomicU32 = AtomicU32::new(0);
 
@@ -318,6 +330,12 @@ unsafe extern "system" fn svc_release(this: *mut c_void) -> u32 {
 /// 走到这里说明:**目标进程里的 msctf 认了我们、也把我们装起来了**。这是 T1.2 的验收点。
 unsafe extern "system" fn svc_activate(this: *mut c_void, ptim: *mut c_void, tid: u32) -> Hresult {
     let r = catch_unwind(AssertUnwindSafe(|| {
+        // 诊断开关:验证"我们的 panic 不会带崩宿主应用"。
+        // 我们的代码跑在 Word / 飞书 / 浏览器里,崩一次是崩别人的应用 ——
+        // 所以这条不是可选项,而是每次改薄壳都要能一键复验的。
+        if std::env::var_os("SAINPUT_TSF_PANIC_TEST").is_some() {
+            panic!("panic test (env SAINPUT_TSF_PANIC_TEST)");
+        }
         let s = unsafe { &*(this as *const TextService) };
         unsafe { s.set_thread_mgr(ptim) };
         trace(&format!("Activate tid={tid} ptim={ptim:p}"));
@@ -362,6 +380,7 @@ pub unsafe extern "system" fn DllGetClassObject(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> Hresult {
+    install_panic_hook();
     let r = catch_unwind(AssertUnwindSafe(|| {
         if rclsid.is_null() || riid.is_null() || ppv.is_null() {
             return E_POINTER;
