@@ -443,7 +443,7 @@ impl Cfg {
             v.push("--twopass-model-dir".to_string());
             v.push(self.twopass_model_dir.display().to_string());
         }
-        // 注意：**不能**在这里判 `extra.exists()` —— 这个文件是 run 主循环在第一句开始时
+        // 注意:**不能**在这里判 `extra.exists()` —— 这个文件是 run 主循环在第一句开始时
         // 才创建的，而 asr_args 是在 spawn（更早）时调的。早期判存在会让这个参数永远传不出去，
         // 偏置就静默失效了。sidecar 那边对"文件不存在"是容忍的（返回 None）。
         if let Some(extra) = &self.hotwords_extra {

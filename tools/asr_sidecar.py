@@ -144,18 +144,8 @@ def punctuate_guarded(punct, t):
 
 
 def render_text(t, punct=None, use_itn=True, punct_mode="keep",
-                merge_terms=True, fix_case=True, punct_state=None, punct_fresh=True):
-    """ITN -> 标点 -> 排版整形。render() 的纯函数版本(不碰 live 状态,好测)。
-
-    `punct_state` / `punct_fresh` 是**流式降频**用的(体检报告 §5.2),单跑时都不用给:
-
-      · 标点模型要把**整句**送进去(80 字约 21ms),而它和 decode 在同一条串行线程上;
-        所以流式阶段按 500ms 节拍跑整句(`punct_fresh=True`),节拍内的每一拍**不调模型**
-        (`punct_fresh=False`),直接沿用上一次的前缀标点 + 这一次新增的正文。
-      · 为什么复用而不是「重新渲染但不加标点」:后者会让屏幕上的标点先消失、
-        下一拍又冒回来(这文件里到处在防的就是这种闪)。
-      · 定稿(final)一律整句重算:精度只在 final 保证,不传 punct_state 即可。
-    """
+                merge_terms=True, fix_case=True):
+    """ITN -> 标点 -> 排版整形。render() 的纯函数版本(不碰 live 状态,好测)。"""
     if not t:
         return t
     # 顺序有讲究:先去重复循环,再做 ITN 和标点 ——
@@ -169,22 +159,9 @@ def render_text(t, punct=None, use_itn=True, punct_mode="keep",
     # 读号码本来也不是句子,断句信息没有任何价值。
     bare_number = t.isascii() and t.isdigit()
     if punct is not None and not bare_number:
-        itn_t = t                      # 加标点**前**的文本 —— 前缀对齐用的就是它
-        pre = None
-        if punct_state is not None:
-            pi, pp = punct_state.get("itn") or "", punct_state.get("punct") or ""
-            if pi and pp and t.startswith(pi):
-                pre = (pi, pp)
-        if punct_fresh:
-            t, dropped = punctuate_guarded(punct, t)
-            if dropped:
-                note("[sidecar] 标点模型丢了正文,本句退回未加标点的文本")
-            if punct_state is not None:
-                # 冻结点存「屏幕上会出现的样子」:句尾那一笔这拍还没定稿,先砍掉 ——
-                # 否则下一拍它会被当成**句中**标点冻在句子中间(凭空多个句号)。
-                punct_state["itn"], punct_state["punct"] = itn_t, polish_mod.strip_terminal(t)
-        elif pre is not None:
-            t = pre[1] + t[len(pre[0]):]
+        t, dropped = punctuate_guarded(punct, t)
+        if dropped:
+            note("[sidecar] 标点模型丢了正文,本句退回未加标点的文本")
     t = polish_mod.polish(t)
     # 排版整形放最后:标点已经落定,才轮到「标点转空格」和「英文拆字合并」。
     # 反过来做的话,标点模型会看到被抹掉标点的句子,断句会变差。
@@ -420,33 +397,27 @@ def main():
             # 静音多少秒算一句说完（托盘可改，立刻生效）。0 = 不断句，只认松手。
             "silence_sec": float(a.rule2)}
 
-    # 标点节拍:流式阶段最多 500ms 整句跑一次(体检报告 §5.2)。
-    # partial 每次过节流(150ms 一拍)都要把**整句**送 CT-Transformer(80 字约 21ms),
-    # 而它和 decode 在**同一条串行线程**上 —— 重算太勤就是画面卡顿。
-    # 节拍**内**的那几拍不调模型,而是复用上一次的前缀标点(见 render_text),
-    # 这样屏幕上的标点既不会闪、也不会明显滞后(最多 500ms)。
-    # 定稿(final=True)不受节拍限制:精度只在 final 保证。
-    PUNCT_TICK = 0.5
-    _punct_t = [0.0]
-    # 标点前缀复用状态:{"itn": 加标点前的文本, "punct": 加过标点的文本}
-    # (只有流式用;final 传 None = 整句重算。每句开头在 reset_stream 里清空)
-    _pstate = {"itn": "", "punct": ""}
-
+    # 标点:每一拍都整句重算(和 2026-10-30 之前的行为一致)。
+    #
+    # ⚠️ 这里曾经按 500ms 节拍降频 + 复用前缀标点(2026-10-31 体检的「省 CPU」那一项)。
+    # 当天就被用户反馈打回来了,实测数据(同一段 8.8s 中英混说音频,各测 2~3 次,结果稳定):
+    #
+    #   500ms 节拍(降频)          → 退格 24 次
+    #   每拍重算(本行)            → 退格 **15** 次
+    #
+    # 原因是「越晚改越贵」:标点模型会在**句中**插一笔(实测那例是在第 11 个字后面插了个「?」),
+    # 插一笔会让后面**整条尾巴位移**,目标窗口上只能退格重打整条尾巴 —— 而重打的长度
+    # 等于「插入点之后的尾巴长度」。降频让这一笔更晚落,尾巴更长,重打更贵,用户看到的就是
+    # 「回退后重新输入有点慢」。降频省下的 CPU 只有几十毫秒/句(约 0.5% 单核),不划算。
+    #
+    # 定稿(final)一如既往整句重算,不受任何节拍限制。
     def render(t, final=False):
-        """ITN -> 标点 -> 排版整形。返回 (文本, 耗时ms)。
-
-        final=True:定稿,一定整句重算标点,不用流式那套前缀复用。
-        """
+        """ITN -> 标点 -> 排版整形。返回 (文本, 耗时ms)。"""
         if not t:
             return "", 0.0
-        now = time.monotonic()
-        fresh = final or (now - _punct_t[0]) >= PUNCT_TICK
-        if fresh:
-            _punct_t[0] = now
         t0 = time.perf_counter()
         out = render_text(t, punct, use_itn,
-                          live["punct_mode"], live["merge_terms"], live["fix_case"],
-                          None if final else _pstate, fresh)
+                          live["punct_mode"], live["merge_terms"], live["fix_case"])
         return out, (time.perf_counter() - t0) * 1000.0
 
     emit({
@@ -596,8 +567,6 @@ def main():
         last_raw = ""
         last_out = ""
         last_tick = 0.0
-        _pstate["itn"] = _pstate["punct"] = ""   # 标点前缀复用不能跨句
-        _punct_t[0] = 0.0                   # 新的一句从「马上整句跑一次标点」开始
         pcm_clear()                         # 本句 PCM 用完即释放(二遍只重解本句)
 
     for raw in sys.stdin.buffer:
