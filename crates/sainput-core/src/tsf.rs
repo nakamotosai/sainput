@@ -16,6 +16,7 @@
 use crate::pebrel::Composer;
 use anyhow::{bail, Context, Result};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::windows::io::FromRawHandle;
@@ -75,15 +76,54 @@ pub fn available(pid: u32) -> bool {
     unsafe { WaitNamedPipeW(name.as_ptr(), 0) != 0 }
 }
 
+/// 句子序号:每新开一句 +1,**按开机时钟播种**。
+///
+/// 它是薄壳那边**幂等与乱序防护**的全部依据(见 `sainput-tsf/src/pipe.rs` 的协议说明):
+/// 重复的定稿会被丢掉(不会插两次),旧句迟到的帧也盖不回来。
+///
+/// 为什么必须带时钟种子(而不是从 1 数起):薄壳活在**目标应用的进程**里,它可以一直活着,
+/// 而引擎会重启(托盘重启、崩了重拉)。引擎一重启计数就归零,而薄壳记得的
+/// "已定稿到"还在高位 —— 于是之后每一句都会被当成迟到帧丢掉,表现为"TSF 上屏彻底不工作"。
+/// 用 `GetTickCount64() << 20` 播种:重启之后序号仍然单调,而且一句之内涨 1 不会撞上。
+static SENTENCE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetTickCount64() -> u64;
+}
+
+fn next_sentence() -> u64 {
+    let seed = unsafe { GetTickCount64() } << 20;
+    let mut cur = SENTENCE_SEQ.load(Ordering::SeqCst);
+    loop {
+        let next = if cur == 0 { seed.max(1) } else { cur + 1 };
+        match SENTENCE_SEQ.compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return next,
+            Err(v) => cur = v,
+        }
+    }
+}
+
 /// 组合态的传输层实现:把 `set`/`commit` 走管道交给目标进程里的薄壳。
 pub struct TsfComposer {
     pid: u32,
+    /// 这一句的序号(构造时取一次,一句之内所有帧都用它)。
+    sentence: u64,
     io: Option<File>,
 }
 
 impl TsfComposer {
     pub fn new(pid: u32) -> Self {
-        Self { pid, io: None }
+        Self {
+            pid,
+            sentence: next_sentence(),
+            io: None,
+        }
+    }
+
+    /// 给协议参数加句子序号前缀。
+    fn tagged(&self, text: &str) -> String {
+        format!("{} {}", self.sentence, text)
     }
 
     pub fn pid(&self) -> u32 {
@@ -114,7 +154,7 @@ impl TsfComposer {
                 bail!("连不上薄壳端点:{path}");
             }
             let f = unsafe { File::from_raw_handle(h as *mut _) };
-            let mut me = Self { pid: self.pid, io: Some(f) };
+            let mut me = Self { pid: self.pid, sentence: self.sentence, io: Some(f) };
             // 握手:版本对不上就别再往下走。
             let reply = me.request(b'P', PROTOCOL_VERSION)?;
             if !reply.starts_with("sainput-tsf/") || !reply.starts_with(PROTOCOL_VERSION) {
@@ -154,12 +194,14 @@ impl TsfComposer {
 impl Composer for TsfComposer {
     fn set(&mut self, text: &str) -> Result<()> {
         self.connect()?;
-        self.request(b'S', text).map(|_| ())
+        let arg = self.tagged(text);
+        self.request(b'S', &arg).map(|_| ())
     }
 
     fn commit(&mut self, text: &str) -> Result<()> {
         self.connect()?;
-        self.request(b'C', text).map(|_| ())
+        let arg = self.tagged(text);
+        self.request(b'C', &arg).map(|_| ())
     }
 }
 

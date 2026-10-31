@@ -12,13 +12,20 @@
 //! ```text
 //! 帧 = u32(小端,负载字节数) + 负载
 //! 负载 = 1 字节命令 + 参数(UTF-8)
-//!   'P' ping      参数:客户端版本串        应答:'O' + 薄壳版本串
-//!   'S' set       参数:组合态文本          应答:'O' + 当前组合态
-//!   'C' commit    参数:定稿文本            应答:'O' + 已定稿字节数
-//!   'X' cancel    参数:空                  应答:'O'
-//!   'Q' query     参数:空                  应答:'O' + "preedit|committed"(诊断/测试用)
+//!   'P' ping    参数:客户端版本串        应答:'O' + 薄壳版本串
+//!   'S' set     参数:"<句子序号> <文本>"  应答:'O' + 当前组合态
+//!   'C' commit  参数:"<句子序号> <文本>"  应答:'O' + 已定稿字节数
+//!                (序号是 64 位:引擎按时钟播种,重启后仍然单调 —— 见引擎侧 `next_sentence`)
+//!   'X' cancel  参数:空                  应答:'O'
+//!   'Q' query   参数:空                  应答:'O' + "preedit|committed|当前句|已定稿到"
 //! 应答 = 'O'(ok) 或 'E'(error,后跟 UTF-8 错误串)
 //! ```
+//!
+//! **句子序号是幂等与乱序的全部依据**(T2.3):引擎每开一句 +1,一句之内所有 `S` 用同一个号。
+//! 没有它,重复的定稿会把同一句插两次、迟到的帧会把上一句的字写进这一句 —— 这两种都
+//! 是用户可见的脏数据(重复的字 / 错位的句子)。规则很简单:
+//!   * 序号 **≤ 已定稿到** 的 `S`/`C` 一律丢弃(重复的、迟到的);
+//!   * 序号 **< 当前句** 的 `S` 也丢弃(旧句的尾巴不许盖回来)。
 //!
 //! 为什么不直接用它上屏:`S/C/X` 这三个动作的**语义**已经和 `pebrel::Composer`
 //! (`set`/`commit`)对齐了 —— 引擎侧换个传输层就能复用同一条上屏算术。
@@ -98,6 +105,10 @@ struct State {
     committed_bytes: usize,
     /// 最后一次动组合态的时刻(看门狗按它判"这句是不是没人管了")。
     last_activity_ms: u64,
+    /// 当前这一句的序号(引擎给的)。
+    active_sentence: u64,
+    /// 已经定稿到的句子序号。小于等于它的帧都是重复或迟到。
+    last_committed: u64,
 }
 
 /// 组合态多久没人动就自动取消。
@@ -326,6 +337,18 @@ fn write_frame(h: isize, payload: &[u8]) -> Result<(), ()> {
     Ok(())
 }
 
+/// 把 `"<句子序号> <文本>"` 拆开。没有序号(或不是数字)一律当成 0 号 ——
+/// 0 号小于任何"已定稿到",所以会被守卫丢掉,不会静默地当成有效帧。
+fn split_sentence(arg: &str) -> (u64, &str) {
+    match arg.split_once(' ') {
+        Some((head, rest)) => match head.trim().parse::<u64>() {
+            Ok(id) => (id, rest),
+            Err(_) => (0, arg),
+        },
+        None => (0, arg),
+    }
+}
+
 fn now_ms() -> u64 {
     unsafe { GetTickCount64() }
 }
@@ -379,17 +402,36 @@ fn handle(payload: &[u8]) -> Vec<u8> {
             ok(&format!("{} pid={}", PROTOCOL_VERSION, unsafe { GetCurrentProcessId() }))
         }
         b'S' => with_state(|st| {
-            st.preedit = arg.clone();
+            let (id, text) = split_sentence(&arg);
+            if id <= st.last_committed || id < st.active_sentence {
+                // 重复或迟到:不碰组合态,也不动计时器(它还会被看门狗收走)。
+                trace(&format!(
+                    "pipe 丢弃迟到的 set(句 {id};当前句 {} 已定稿到 {})",
+                    st.active_sentence, st.last_committed
+                ));
+                return ok(&st.preedit);
+            }
+            st.active_sentence = id;
+            st.preedit = text.to_string();
             st.last_activity_ms = now_ms();
-            trace(&format!("pipe set preedit={arg:?}"));
+            trace(&format!("pipe set preedit={:?}(句 {id})", st.preedit));
             ok(&st.preedit)
         }),
         b'C' => with_state(|st| {
-            let n = arg.len();
+            let (id, text) = split_sentence(&arg);
+            if id <= st.last_committed {
+                // 同一句被定稿两次 —— 宁可少插一次也不能插两次(插两次是可见的重字)。
+                trace(&format!("pipe 丢弃重复/迟到的 commit(句 {id};已定稿到 {})", st.last_committed));
+                return ok(&format!("{}", st.committed_bytes));
+            }
+            let n = text.len();
             st.committed_bytes += n;
-            st.preedit.clear();
+            st.last_committed = id;
+            if st.active_sentence == id {
+                st.preedit.clear();
+            }
             st.last_activity_ms = now_ms();
-            trace(&format!("pipe commit {n} bytes"));
+            trace(&format!("pipe commit {n} bytes(句 {id})"));
             ok(&format!("{}", st.committed_bytes))
         }),
         b'X' => with_state(|st| {
@@ -398,7 +440,12 @@ fn handle(payload: &[u8]) -> Vec<u8> {
             trace("pipe cancel");
             ok("")
         }),
-        b'Q' => with_state(|st| ok(&format!("{}|{}", st.preedit, st.committed_bytes))),
+        b'Q' => with_state(|st| {
+            ok(&format!(
+                "{}|{}|{}|{}",
+                st.preedit, st.committed_bytes, st.active_sentence, st.last_committed
+            ))
+        }),
         other => err(&format!("unknown command {:?}", other as char)),
     }
 }
