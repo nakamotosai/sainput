@@ -9,6 +9,15 @@
 
 ### Fixed
 
+- **TIP 注册会把开发产物写进系统**(T2.4 后半段)—— `tools/tsf_register.ps1` 现在
+  **拒绝**注册 `target-test`/`debug` 路径(除非显式 `-AllowDev`),正斜杠也拦;
+  `verify` 从"打印状态"升级成**给结论 + 退出码**(`OK`/`STALE(...)`/`NOT-REGISTERED`),
+  注册时记 `SainputVersion`/`SainputRegisteredAt`。实测后果就是本机现状:
+  `verdict: STALE(dev-build-registered)` —— 早先留下的一条注册指向 target-test,
+  还带语言 profile(输入法列表里会多一条选中就崩的项)。脚本同时补了 UTF-8 BOM
+  (PS 5.1 读无 BOM 的中文注释会吞掉下一行代码);机器可检的判据行一律 ASCII,
+  因为 PS 5.1 的输出是控制台代码页。回归:`tools/test_tsf_register.py`(10 条)。
+
 - **音频回调里的分配**(T6.3)—— 采集回调每次都新开重采样缓冲,每一帧还要
   `collect()` 一个新 `Vec`。实时线程上分配迟早抖动,而这条路上没有"看起来还行"可依赖。
   修法:重采样 scratch 复用 + **帧缓冲池**(下游用完 `recycle` 还回来),另加三个计数器
