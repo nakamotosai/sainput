@@ -25,7 +25,7 @@ mod tip;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::{Duration, Instant};
 
 // ---------------- Win32 声明(与仓库既有风格一致:手写 extern,不引 windows crate)----------------
@@ -116,6 +116,14 @@ const CLASS_NAME: &str = "SainputTsfHost";
 
 static DESTROYED: AtomicBool = AtomicBool::new(false);
 
+/// 主窗口在 `WM_SETFOCUS` 里要把焦点交给 EDIT。
+///
+/// 原先用 `SetWindowLongPtrW(GWLP_USERDATA)` 存句柄,结果**编 32 位时链不上** ——
+/// `SetWindowLongPtrW` 在 32 位 Windows 上不是导出符号(那只是 64 位的名字,
+/// 32 位要靠 `SetWindowLongW` 宏)。这个壳只有一个窗口,用个静态变量最省事,
+/// 也顺手把这个位数差异绕过去了。
+static EDIT_HANDLE: AtomicIsize = AtomicIsize::new(0);
+
 unsafe extern "system" fn wnd_proc(h: isize, m: u32, w: usize, l: isize) -> isize {
     match m {
         WM_DESTROY => {
@@ -125,7 +133,7 @@ unsafe extern "system" fn wnd_proc(h: isize, m: u32, w: usize, l: isize) -> isiz
         }
         WM_SETFOCUS => {
             // 焦点给到 EDIT:TSF 的文本存储是跟着焦点窗口建立的。
-            let edit = get_edit_handle(h);
+            let edit = EDIT_HANDLE.load(Ordering::SeqCst);
             if edit != 0 {
                 unsafe { SetFocus(edit) };
             }
@@ -135,17 +143,6 @@ unsafe extern "system" fn wnd_proc(h: isize, m: u32, w: usize, l: isize) -> isiz
     }
 }
 
-// 主窗口在 `GWLP_USERDATA` 里存 EDIT 句柄(WM_SETFOCUS 时要交给它)。
-#[link(name = "user32")]
-extern "system" {
-    fn SetWindowLongPtrW(h: isize, index: i32, value: isize) -> isize;
-    fn GetWindowLongPtrW(h: isize, index: i32) -> isize;
-}
-const GWLP_USERDATA: i32 = -21;
-
-fn get_edit_handle(h: isize) -> isize {
-    unsafe { GetWindowLongPtrW(h, GWLP_USERDATA) }
-}
 
 // ---------------- 工具 ----------------
 
@@ -336,7 +333,7 @@ fn main() {
             log.line("FATAL EDIT creation failed");
             std::process::exit(1);
         }
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, edit);
+        EDIT_HANDLE.store(edit, Ordering::SeqCst);
         ShowWindow(hwnd, SW_SHOW);
         SetFocus(edit);
         pump(trace_ref, !a.no_translate);

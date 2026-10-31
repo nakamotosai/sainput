@@ -10,10 +10,15 @@
 为什么不用真机注册就能测:msctf 装 TIP 走的就是上面这几步,我们原样走一遍;
 差别只在"谁调 DllGetClassObject"。所以这一步不需要 UAC、也不碰用户任何状态。
 
+换一套位数组合来跑(32 位薄壳 + 32 位宿主):
+    cargo build --release --target i686-pc-windows-msvc --target-dir target-test-msvc -p sainput-tsf -p sainput-tsf-host
+    SAINPUT_TSF_DIR=target-test-msvc/i686-pc-windows-msvc/release python tools/test_tsf_activate.py
+
 跑法:
     cargo build --release --target-dir target-test -p sainput-tsf-host -p sainput-tsf
     python tools/test_tsf_activate.py
 """
+import os
 import os
 import pathlib
 import sys
@@ -30,6 +35,13 @@ MARKERS = ["DllGetClassObject -> ClassFactory", "CreateInstance -> TextService",
 
 
 def find(rel, what):
+    # `SAINPUT_TSF_DIR` = 换一套"薄壳 + 宿主"来跑(例如 32 位那套:
+    # target-test-msvc/i686-pc-windows-msvc/release)。引擎不跟着换 —— 它本来就是另一个进程。
+    override = os.environ.get("SAINPUT_TSF_DIR")
+    if override and rel != "sainput.exe":
+        p = pathlib.Path(override) / rel
+        if p.exists():
+            return p
     for d in DIRS:
         p = REPO / d / rel
         if p.exists():

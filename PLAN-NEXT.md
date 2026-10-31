@@ -103,7 +103,7 @@ sainput 的快通道(M1)与质量层(M2)已交付并冻结;剩下的是**上屏�
 | T1.4 | 组合态上屏:`StartComposition` → 逐帧 `SetText` 改写 → `EndComposition` | host 的 EDIT 文本等于期望值;**中途不留半句残字** | A | ⬜ |
 | T1.5 | ✅ 跨进程通道:引擎 ↔ DLL 命名管道(`compose`/`commit`/`cancel` + 版本握手) | 引擎发一句,宿主窗口一次到位;断开时链路干净退出 | A | ✅ **两侧都通**(18 条判据全过)。实测引擎在 console 桌面、薄壳在私有桌面宿主里,3 帧 + 定稿全部落地 —— 管道跨桌面。"窗口一次到位"要等 T1.4(卡注册) |
 | T1.6 | ✅ Rust 侧 `TsfComposer` 接上 `Composer` trait;策略沿用**既有** `ime_wmchar` 键新增 `tsf` 头(不另起 `tsf` 键 —— 上屏方式只该有一个真相源);可用性判据 = 目标进程的管道在不在(`WaitNamedPipeW(…,0)`,不占连接槽) | `tsf` 下薄壳活着的窗口走 TSF、其余按 `auto` 判;没端点绝不误伤 | A | ✅ |
-| T1.7 | 位数:x86 + x64 两个 DLL | 32 位宿主与 64 位宿主都能上屏 | A | ⬜ |
+| T1.7 | ✅ 位数:i686 + x86_64 两个 DLL(32 位走 **MSVC** 目标,w64devkit 没有 i686 运行时时才发现) | 32 位宿主与 64 位宿主都能上屏 | A | ✅ 32 位那一套(薄壳+宿主)跑完 `test_tsf_activate` / `test_tsf_pipe` / `test_tsf_panic` 三条全过;顺带修掉两个真 32 位 bug |
 
 ### 阶段 2 —— 工程化与稳健性
 

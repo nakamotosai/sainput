@@ -38,7 +38,7 @@ pub mod pipe;
 use std::ffi::c_void;
 use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 // ------------------------------------------------------------------ 基础类型
 
@@ -169,25 +169,21 @@ struct ClassFactory {
 struct TextService {
     vtbl: *const ITextInputProcessorVtbl,
     refs: AtomicU32,
-    /// 激活时拿到的线程管理器(后续做组合态要用,现在只记着)。
-    thread_mgr: AtomicU32, // 低 32 位占位:真拿指针见 `active_ptr`
+    /// 激活时拿到的线程管理器(`ITfThreadMgr*`,组合态要用)。
+    ///
+    /// 存成 `AtomicUsize` 而不是"拆成高低两个 u32":后者在 **32 位**上会 `>> 32` 溢出
+    /// (实测编 i686 时就炸了),而 `usize` 本来就是"能装下指针的整数"。
+    thread_mgr: AtomicUsize,
     active: AtomicU32,
-    /// 线程管理器指针(`ITfThreadMgr*`)。用 `usize` 存,避免在原子量里放指针类型。
-    active_ptr: AtomicU32,
-    active_ptr_hi: AtomicU32,
 }
 
 impl TextService {
     unsafe fn set_thread_mgr(&self, tm: *mut c_void) {
-        let v = tm as usize;
-        self.active_ptr.store((v & 0xFFFF_FFFF) as u32, Ordering::SeqCst);
-        self.active_ptr_hi.store((v >> 32) as u32, Ordering::SeqCst);
+        self.thread_mgr.store(tm as usize, Ordering::SeqCst);
         self.active.store(1, Ordering::SeqCst);
     }
     unsafe fn get_thread_mgr(&self) -> *mut c_void {
-        let lo = self.active_ptr.load(Ordering::SeqCst) as usize;
-        let hi = self.active_ptr_hi.load(Ordering::SeqCst) as usize;
-        ((hi << 32) | lo) as *mut c_void
+        self.thread_mgr.load(Ordering::SeqCst) as *mut c_void
     }
 }
 
@@ -261,10 +257,8 @@ unsafe extern "system" fn factory_create_instance(
         let svc = Box::new(TextService {
             vtbl: &TEXT_SERVICE_VTBL,
             refs: AtomicU32::new(1),
-            thread_mgr: AtomicU32::new(0),
+            thread_mgr: AtomicUsize::new(0),
             active: AtomicU32::new(0),
-            active_ptr: AtomicU32::new(0),
-            active_ptr_hi: AtomicU32::new(0),
         });
         LIVE_OBJECTS.fetch_add(1, Ordering::SeqCst);
         trace("CreateInstance -> TextService");

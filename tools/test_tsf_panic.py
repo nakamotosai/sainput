@@ -11,10 +11,15 @@
   2. 宿主进程**正常退出**(exit 0)—— 它活着走完了后面每一步;
   3. 薄壳日志里没有任何"进程没了"的痕迹(日志是它自己写的,说明它还写过别的行)。
 
+换一套位数组合来跑(32 位薄壳 + 32 位宿主):
+    cargo build --release --target i686-pc-windows-msvc --target-dir target-test-msvc -p sainput-tsf -p sainput-tsf-host
+    SAINPUT_TSF_DIR=target-test-msvc/i686-pc-windows-msvc/release python tools/test_tsf_activate.py
+
 跑法:
     cargo build --release --target-dir target-test -p sainput-tsf -p sainput-tsf-host
     python tools/test_tsf_panic.py
 """
+import os
 import os
 import pathlib
 import sys
@@ -29,6 +34,11 @@ DESKTOP = "SAI-TsfPanic"
 
 
 def find(rel):
+    override = os.environ.get("SAINPUT_TSF_DIR")
+    if override and rel != "sainput.exe":
+        p = pathlib.Path(override) / rel
+        if p.exists():
+            return p
     for d in DIRS:
         p = REPO / d / rel
         if p.exists():

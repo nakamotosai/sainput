@@ -41,3 +41,14 @@
 # # 用 MSYS2 的 gcc 时同理：
 # # linker = "C:/msys64/mingw64/bin/gcc.exe"
 # # ar = "C:/msys64/mingw64/bin/ar.exe"
+
+# 32 位怎么编(TSF 薄壳必须能装进 32 位应用:msctf 按**目标进程**的位数加载 DLL):
+#
+#   rustup target add i686-pc-windows-msvc
+#   cargo build --release --target i686-pc-windows-msvc --target-dir target-test-msvc \
+#       -p sainput-tsf -p sainput-tsf-host
+#
+# 为什么走 MSVC 而不是 gnu:w64devkit **没有 i686 的 gcc 运行时**
+# (lib/gcc 下只有 x86_64-w64-mingw32;实测 i686-pc-windows-gnu 链不过 `_Unwind_Resume`)。
+# 本机有 VS2022 BuildTools,rustc 自己找得到 link.exe,所以 32 位用 MSVC 那条路。
+# 单独一个 `target-test-msvc` 目录:两套工具链的产物不混在一起。
