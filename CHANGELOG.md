@@ -16,6 +16,14 @@
   现在实现 `ITfThreadMgrEventSink::OnSetFocus` 并用 `ITfSource::AdviseSink` 挂上,焦点变化即重挂。
   实测:挂载 `hr=0x0 cookie=67108866`,随后收到 `OnSetFocus` 并更新上下文(含焦点离开文档时清空)。
 
+### Fixed
+
+- **实验组件曾把日常输入拖慢约 6 倍(已撤)**:TSF 薄壳注册进语言列表期间,引擎的 `auto`
+  策略会优先走 TSF,而组合态那头 `StartComposition` 卡死 + 2.5s 超时 + 30s 熔断 →
+  **每句白等 2.5 秒**。`tools/latency_report.py` 按时间切开的数据:试验后期 65 句中位
+  **4242ms**(历史基线 2528 句为 647ms)。注册已撤销;教训:实验中的组件默认永不注册,
+  自动策略必须先算最坏情况。
+
 ### Changed
 
 - **TSF 回调对象改为可编组(组合态仍不通,但这本身是对的)**。给组合态 sink 聚合
