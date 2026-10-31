@@ -139,6 +139,33 @@ def enum_windows(pid, hdesk=None):
     return out
 
 
+WM_GETTEXT = 0x000D
+WM_GETTEXTLENGTH = 0x000E
+
+u32.FindWindowExW.restype = wt.HWND
+u32.FindWindowExW.argtypes = [wt.HWND, wt.HWND, wt.LPCWSTR, wt.LPCWSTR]
+u32.SendMessageW.restype = ctypes.c_ssize_t
+u32.SendMessageW.argtypes = [wt.HWND, wt.UINT, ctypes.c_size_t, ctypes.c_ssize_t]
+
+
+def find_edit(pid, hdesk=None):
+    """找该 pid 的顶层窗口里的 EDIT 控件(宿主壳的读回口)。"""
+    for hwnd, _cls, _title, _vis in enum_windows(pid, hdesk):
+        edit = u32.FindWindowExW(hwnd, None, "Edit", None)
+        if edit:
+            return edit
+    return None
+
+
+def read_edit(edit):
+    """跨进程读 EDIT 内容。WM_GETTEXT 由 user32 负责搬运字符串(实测跨桌面可用)。"""
+    n = u32.SendMessageW(edit, WM_GETTEXTLENGTH, 0, 0)
+    buf = ctypes.create_unicode_buffer(int(n) + 2)
+    u32.SendMessageW(edit, WM_GETTEXT, len(buf), ctypes.cast(buf, ctypes.c_void_p).value)
+    return buf.value
+
+
+
 def _print_win(prefix, ws):
     for hwnd, cls, title, vis in ws:
         cls = cls.encode("ascii", "replace").decode("ascii")
@@ -183,6 +210,22 @@ def cmd_windows(a):
     return 0
 
 
+def cmd_readtext(a):
+    """读回宿主壳 EDIT 里的内容 —— TSF 组合态断言的唯一入口。"""
+    hdesk = open_desktop(a.desktop) if a.desktop else None
+    try:
+        edit = find_edit(a.pid, hdesk)
+        if not edit:
+            print(f"[hdesk] pid={a.pid}: no EDIT control found")
+            return 2
+        text = read_edit(edit)
+        print(f"[hdesk] edit={edit:#x} text={text!r}")
+        return 0
+    finally:
+        if hdesk:
+            close(hdesk)
+
+
 def cmd_prove(a):
     """自证:窗口确实建了(私有桌面数得到),但用户看不见(console 桌面数不到)。"""
     if a.desktop == "Default":
@@ -203,10 +246,28 @@ def cmd_prove(a):
         print(f"[hdesk] private_windows={len(mine)}  console_windows={len(theirs)}", flush=True)
         _print_win("private:", mine)
         _print_win("!!CONSOLE:", theirs)
+        text_ok, got = True, None
+        if a.expect_text is not None:
+            edit = find_edit(pid, hdesk)
+            if not edit:
+                print("[hdesk] no EDIT control found on that pid", flush=True)
+                text_ok, got = False, None
+            else:
+                while time.time() < deadline:
+                    got = read_edit(edit)
+                    if got == a.expect_text:
+                        break
+                    time.sleep(0.2)
+                text_ok = (got == a.expect_text)
+                shown = got.encode("unicode_escape").decode("ascii")
+                want = a.expect_text.encode("unicode_escape").decode("ascii")
+                print(f"[hdesk] edit_text={shown}  expect={want}  ({'match' if text_ok else 'MISMATCH'})",
+                      flush=True)
         code = wait_exit(hp, 3000)
-        ok = len(theirs) == 0 and len(mine) >= a.min_windows
+        ok = len(theirs) == 0 and len(mine) >= a.min_windows and text_ok
         if code is None:
             terminate(pid)
+        print(f"[hdesk] child exit_code={code}", flush=True)
         print("[hdesk] " + ("PASS -- windows live on the private desktop, console sees 0" if ok
                             else "FAIL -- isolation did not hold, see the list above"), flush=True)
         return 0 if ok else 2
@@ -242,7 +303,14 @@ def main():
     common(sp)
     sp.add_argument("--dwell", type=int, default=6000)
     sp.add_argument("--min-windows", type=int, default=1)
+    sp.add_argument("--expect-text", default=None,
+                    help="若给了,还要断言该 pid 的 EDIT 内容等于这个值(宿主壳的读回口)")
     sp.set_defaults(fn=cmd_prove)
+
+    sp = sub.add_parser("readtext", help="read back the EDIT content of a pid (WM_GETTEXT)")
+    sp.add_argument("--pid", type=int, required=True)
+    sp.add_argument("--desktop", default=None)
+    sp.set_defaults(fn=cmd_readtext)
 
     a = p.parse_args()
     return a.fn(a)

@@ -1,0 +1,14 @@
+[package]
+name = "sainput-tsf-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TSF 上屏回归用的目标应用壳(窗口 + EDIT + 读回)"
+
+[[bin]]
+name = "sainput-tsf-host"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true

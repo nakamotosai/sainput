@@ -79,7 +79,7 @@ sainput 的快通道(M1)与质量层(M2)已交付并冻结;剩下的是**上屏�
 | ID | 任务 | 验收判据 | 级别 | 状态 |
 |---|---|---|---|---|
 | T0.1 | `tools/hdesk.py`:自建私有桌面启动器(建桌面 / 起进程 / 等退出或常驻 / 枚举窗口计数 / 回收) | 能把一个窗口程序跑在私有桌面,且 console 桌面枚举该 pid 顶层窗口 = 0 | A | ✅ |
-| T0.2 | `sainput-tsf-host`:测试目标壳(窗口 + `EDIT` + 落日志 + `WM_GETTEXT` 读回) | 私有桌面上自检通过,内容一字不差写进日志 | A | ⬜ |
+| T0.2 | `crates/sainput-tsf-host`:测试目标壳(窗口 + `EDIT` + 落日志)+ `hdesk readtext` 跨进程读回 | 私有桌面上自检通过,内容一字不差写进日志 | A | ✅ |
 | T0.3 | 引擎确定性入口:`sainput --selftest compose "文本"`(不走麦克风/热键,直接喂 composer) | 现有 SendInput 通道下,host 里能看到该文本 | A | ⬜ |
 
 ### 阶段 1 —— TSF 最小可运行纵向切片
