@@ -53,6 +53,24 @@
 不变量:①**只提前定稿,绝不重复上屏**(T4.1/T4.2 的守卫仍然在);②**定稿文本 = 超时那一刻的最后一条 partial**
 (不拼接、不猜测);③默认值保守,**先用 latency_report 做 A/B,不达标就回退**。
 
+**⚠️ 部署与踩坑(2026-10-31 晚,务必记住)**
+
+1. **跑 `sainput run` 做任何测试前,必须设 `SAINPUT_SINGLE_NS`**(如
+   `SAINPUT_SINGLE_NS=sainput-cap-test`)。不设的话,单实例逻辑会按 exe 名找到
+   **用户正在用的那个实例**、请它退出、不走就硬杀(`crates/sainput-core/src/single.rs`
+   的 `ns()`/`exe_name()`)—— 我这次没设,把用户正在用的输入法踢下线了一次 ✗。
+   已有的测试脚本(`test_race_guards.py` 等)都设了 `SAINPUT_SINGLE_NS=sainput-racetest`,照它们抄。
+2. **`cargo build --release` 报 `failed to remove file ...sainput.exe`(os error 5)
+   不是编译错误** —— 编译早就过了,只是最后一步换不上(镜像被在跑的进程锁着)。
+   换法:`powershell -File tools/swap_engine.ps1`(会先检查有没有在跑,有就拒绝;
+   换的时候留一份 `.bak`)。
+3. 启动用 `start.bat`(它会带 `run --hide-console`);直接 `Start-Process sainput.exe`
+   没有子命令,起不来 ✗。
+4. 本次已部署:新引擎在 `target/x86_64-pc-windows-gnu/release/sainput.exe`
+   (旧的在同目录 `.bak`),测试副本在 `target-test/.../release/`(测试脚本认这个目录)。
+   给用户重启后跑 `python tools/latency_report.py --last 20` 就能看到真实的前/后对比
+   (报告已会读 `收尾硬上限 ... 到点(实际等 Nms)` 那一行并给出"上限前/上限后"两列)。
+
 **✅ 已实现并验过(2026-10-31 晚)** —— 收尾硬上限,松手后不再干等模型:
 
 改了什么(`crates/sainput-cli/src/main.rs`):
