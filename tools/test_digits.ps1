@@ -84,7 +84,7 @@ function Read-Screen([IntPtr]$hwnd) {
   return (Get-Clipboard -Raw)
 }
 
-function Run-Case([string]$label, [string]$wav, [string]$doc) {
+function Run-Case([string]$label, [string]$wav, [string]$doc, [string[]]$extra = @()) {
   [DG]::SetForegroundWindow($h) | Out-Null
   Start-Sleep -Milliseconds 600
   [System.Windows.Forms.SendKeys]::SendWait("^a")
@@ -93,7 +93,7 @@ function Run-Case([string]$label, [string]$wav, [string]$doc) {
   Start-Sleep -Milliseconds 300
   if ($doc) { [System.Windows.Forms.SendKeys]::SendWait($doc); Start-Sleep -Milliseconds 400 }
 
-  $a = @("run","--feed",$wav,"--feed-restart","--hotkey","rightctrl","--no-tray","--no-overlay","--log-dir",$dir)
+  $a = @("run","--feed",$wav,"--feed-restart","--hotkey","rightctrl","--no-tray","--no-overlay","--log-dir",$dir) + $extra
   $p = Start-Process -FilePath $exe -ArgumentList $a -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput "$dir\out.txt" -RedirectStandardError "$dir\err.txt"
   for ($i=0; $i -lt 120; $i++) { Start-Sleep -Milliseconds 500; if ((Get-Content "$dir\out.txt" -Raw -Encoding UTF8 -ErrorAction SilentlyContinue) -match "就绪") { break } }
@@ -113,7 +113,10 @@ function Run-Case([string]$label, [string]$wav, [string]$doc) {
 }
 
 # 1) 纯数字串:光标前有 "X",期望正好是 "X12345"(左边没空格、句尾也没空格)
-$got = Run-Case "纯数字串(期望 X12345)" $wavDigits "X"
+# 取最后一个元素:Run-Case 内部还有别的语句会往管道里漏输出,不取标量的话
+# `.StartsWith()` 会被 PowerShell 逐元素调用、返回一个数组,下面 `-and` 就判错了
+# (2026-10-31 实测:两条断言都 PASS,脚本却报 FAIL,根因就在这里)。
+$got = @(Run-Case "纯数字串(期望 X12345)" $wavDigits "X")[-1]
 $ok1 = ($got -ceq "X12345")
 Write-Output ("数字串判定: " + $(if ($ok1) { "PASS" } else { "FAIL" }))
 if (-not $ok1) {
@@ -123,7 +126,10 @@ if (-not $ok1) {
 # 2) 正控:普通中文句子,期望 "X" 后面**有**空格(补空格那条功能没被改坏)
 $ok2 = $null
 if (Test-Path -LiteralPath $wavText) {
-  $got2 = Run-Case "普通中文句(期望 X 后面有空格)" $wavText "X"
+  # 显式 --leading-space:这条是**功能控制项**,判的是「前置空格有没有被改坏」,
+# 不能跟着用户自己的配置走 —— 本机 sainput.conf 里 leading_space = false(用户关掉了),
+# 不指定的话这条会永远 FAIL(2026-10-31 实测踩到)。
+$got2 = @(Run-Case "普通中文句(期望 X 后面有空格)" $wavText "X" @("--leading-space"))[-1]
   $ok2 = $got2.StartsWith("X ")
   Write-Output ("补空格正控: " + $(if ($ok2) { "PASS" } else { "FAIL" }))
 }
