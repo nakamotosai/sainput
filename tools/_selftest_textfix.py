@@ -27,6 +27,13 @@ def pipeline(raw):
 # A) textfix 单件
 CASES_TEXTFIX = [
     ("MONDAY TODAY IS THE DAY", "monday today is the day"),
+    # --- 2026-10-31 体检 §3.3:缩写白名单补过之后,这几条要钉住(防回退) ---
+    ("NASA 的报告", "NASA 的报告"),                    # 原本被一律小写化成 nasa
+    ("USA TODAY", "USA Today"),                       # USA 保住;TODAY 是**普通词**,按既定口径小写
+    ("VS CODE 打不开", "VS Code 打不开"),               # 原本 vs code
+    ("GITHUB ACTIONS 跑起来了", "GitHub Actions 跑起来了"),
+    ("GO LANG 写的", "Go lang 写的"),                  # 「lang」是普通词,和 TODAY 同一口径(边界,非缺陷)
+    ("LET US GO", "let us go"),                       # US 故意**不收**白名单:它是代词 us
     ("HELLO WORLD", "hello world"),                      # 默认小写(2026-10-31 用户口径)
     ("SOMETHINGUNKNOWN 这个词", "somethingunknown 这个词"),   # 名单外也小写:全大写就是模型的锅
     ("GITHUB 上看的 PYTHON 和 RUST", "GitHub 上看的 Python 和 Rust"),  # 专有名词表
