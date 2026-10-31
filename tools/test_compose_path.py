@@ -34,10 +34,9 @@ SAINPUT_CANDIDATES = [
 DESKTOP = "SAI-ComposePath"
 CN = "你好,这是确定性入口。(abc123)"
 
-# 已知缺陷(PLAN-NEXT T4.5):经典控件不处理 posted 的 WM_KEYDOWN VK_BACK,
-# 真正删除来自宿主自己 TranslateMessage 生成的 WM_CHAR(0x08),而那条被排在补打文本之后
-# → 删掉的是句尾而不是该删的字。修好之前这个用例按 XFAIL 记,不算失败。
-XFAIL = {"退格改写(--pre 先错后对)"}
+# T4.5 已于 2026-10-31 修好(退格风味按控件类分:经典 Edit 用 WM_CHAR(0x08),
+# RichEdit/Qt 用 WM_KEYDOWN/UP)。保留下面的用例作为**回归**:两种风味各一条,
+# 任何一条坏掉都必须是 FAIL,不再有"已知失败"豁免。
 
 
 def first(cands, what):
@@ -48,10 +47,11 @@ def first(cands, what):
     sys.exit(2)
 
 
-def wait_edit(pid, h, timeout=10.0):
+def wait_edit(pid, h, control="edit", timeout=10.0):
+    cls = "RICHEDIT50W" if control.startswith("rich") else "Edit"
     t0 = time.time()
     while time.time() - t0 < timeout:
-        e = hdesk.find_edit(pid, h)
+        e = hdesk.find_edit(pid, h, cls)
         if e:
             return e
         time.sleep(0.2)
@@ -63,21 +63,26 @@ def main():
     sainput = first(SAINPUT_CANDIDATES, "sainput.exe")
     fails = []
 
+    pre = CN[:6] + "错错错"
     cases = [
-        ("一次投递(无前缀)", CN, [], CN),
-        ("流式 4 段", CN, ["--frames", "4"], CN),
-        ("句首补空格", CN, ["--prefix", "space"], " " + CN),
-        ("整句一次(最终态)", CN, ["--mode", "wmchar-final"], CN),
-        ("退格改写(--pre 先错后对)", CN, ["--pre", CN[:6] + "错错错"], CN),
+        ("一次投递(无前缀)", CN, [], CN, "edit"),
+        ("流式 4 段", CN, ["--frames", "4"], CN, "edit"),
+        ("句首补空格", CN, ["--prefix", "space"], " " + CN, "edit"),
+        ("整句一次(最终态)", CN, ["--mode", "wmchar-final"], CN, "edit"),
+        # T4.5 两种退格风味各一条:经典 Edit 走 WM_CHAR(0x08),RichEdit 走 WM_KEYDOWN/UP
+        ("退格改写/经典 Edit 风味", CN, ["--pre", pre], CN, "edit"),
+        ("退格改写/RichEdit 风味", CN, ["--pre", pre], CN, "rich50"),
     ]
 
-    for name, text, extra, expect in cases:
+    for name, text, extra, expect, control in cases:
         h = hdesk.open_desktop(DESKTOP)
         hp = ht = None
         try:
             hp, ht, pid = hdesk.launch(
-                str(host_exe), f"--life 20000 --log {REPO / 'tmp' / 'compose-host.log'}", DESKTOP)
-            edit = wait_edit(pid, h)
+                str(host_exe),
+                f"--life 20000 --log {REPO / 'tmp' / 'compose-host.log'} --control {control}",
+                DESKTOP)
+            edit = wait_edit(pid, h, control)
             if not edit:
                 print(f"[FAIL] {name}: 宿主壳的 EDIT 没出现")
                 fails.append(name)
@@ -98,10 +103,9 @@ def main():
                     break
                 time.sleep(0.1)
             ok = code == 0 and got == expect
-            tag = "PASS" if ok else ("XFAIL(T4.5)" if name in XFAIL else "FAIL")
-            print(f"[{tag}] {name}: exit={code} text={got!r}"
+            print(f"[{'PASS' if ok else 'FAIL'}] {name}: exit={code} text={got!r}"
                   + ("" if ok else f" expect={expect!r}"))
-            if not ok and name not in XFAIL:
+            if not ok:
                 fails.append(name)
         finally:
             if hp:

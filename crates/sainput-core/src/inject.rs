@@ -507,10 +507,19 @@ fn type_text_with(mode: KeyMode, s: &str) -> Result<()> {
 
 /// 按当前方式退格 n 次。
 ///
-/// 消息通道下退格用 **PostMessage(WM_KEYDOWN/UP, VK_BACK)**,不是 WM_CHAR(0x08):
-/// 退格在 GUI 程序里走的是按键那条路(终端收到按键才给 pty 发 DEL),
-/// `WM_CHAR(0x08)` 只有经典控件会当删除用。两种消息进的是同一个队列,
-/// 所以「退格 + 补打」的先后顺序仍然有保证。
+/// **消息通道下退格走哪条消息要看控件类** —— 这是 2026-10-31 在私有桌面靶子上量出来的
+/// (探针 `tools/probe_backspace_flavor.py`),两个"edit 类"的答案正好相反:
+///
+/// | 控件类 | 投 `WM_KEYDOWN/UP VK_BACK` | 投 `WM_CHAR(0x08)` |
+/// |---|---|---|
+/// | 经典 `Edit` | **无效**(关掉应用的 `TranslateMessage` 后一次都不生效) | **有效** |
+/// | `RICHEDIT50W` | **有效**(自己处理,不依赖 `TranslateMessage`) | 无效 |
+/// | Qt(`qt*`) | 有效(工具链真机探针 `probe_wmchar_backspace.py`) | —— |
+///
+/// 经典控件那条尤其阴:开着 `TranslateMessage`(所有正常程序的默认)时看着"能用",
+/// 但真正删除的是**应用自己把这条 KEYDOWN 翻译出来的 `WM_CHAR(0x08)`**,
+/// 而那条消息会被排到"我们随后投出的补打字符"**之后** —— 屏幕上删掉的是句尾,
+/// 不是该删的那几个字。`--no-translate` 下才看得见真相(见 `PLAN-NEXT.md` T4.5)。
 fn backspace_with(mode: KeyMode, n: usize) -> Result<()> {
     match mode {
         KeyMode::Keys => backspace(n),
@@ -519,8 +528,34 @@ fn backspace_with(mode: KeyMode, n: usize) -> Result<()> {
     }
 }
 
+/// 这个控件类该用 `WM_CHAR(0x08)` 退格吗?纯函数,判据见 `backspace_with` 的表。
+///
+/// 判据**故意写窄**:只有量过的类才改行为,没量过的一律保持"投 KEYDOWN/UP"
+/// (与 2026-10-30 之前完全一致)—— 换错风味是**可见的丢字/乱改**,
+/// 而"没量过的类维持现状"最坏也只是维持现状。
+pub fn class_backspace_as_char(class: &str) -> bool {
+    let c = class.to_ascii_lowercase();
+    // RichEdit 一族自己处理按键消息(`richedit` 里也含 `edit`,必须先挡掉)。
+    if c.contains("richedit") {
+        return false;
+    }
+    c.contains("edit")
+}
+
+/// 目标窗口的类名(拿不到就返回空串)。
+#[cfg(windows)]
+fn class_name_of(hwnd: isize) -> String {
+    let mut buf = [0u16; 128];
+    let n = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    if n <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buf[..n as usize])
+}
+
 #[cfg(windows)]
 fn post_backspace(hwnd: isize, n: usize) -> Result<()> {
+    const WM_CHAR: u32 = 0x0102;
     const WM_KEYDOWN: u32 = 0x0100;
     const WM_KEYUP: u32 = 0x0101;
     const VK_BACK: usize = 0x08;
@@ -531,7 +566,14 @@ fn post_backspace(hwnd: isize, n: usize) -> Result<()> {
     let scan: isize = 0x0E;
     let down = 1 | (scan << 16);
     let up = 1 | (scan << 16) | (1 << 30) | (1 << 31);
+    let as_char = class_backspace_as_char(&class_name_of(hwnd));
     for _ in 0..n {
+        if as_char {
+            if unsafe { PostMessageW(hwnd, WM_CHAR, VK_BACK, 0) } == 0 {
+                anyhow::bail!("PostMessage(WM_CHAR 0x08) 失败:窗口句柄 {hwnd:#x}");
+            }
+            continue;
+        }
         if unsafe { PostMessageW(hwnd, WM_KEYDOWN, VK_BACK, down) } == 0 {
             anyhow::bail!("PostMessage(WM_KEYDOWN VK_BACK) 失败:窗口句柄 {hwnd:#x}");
         }
@@ -576,6 +618,7 @@ fn post_chars(_hwnd: isize, _s: &str) -> Result<()> {
 #[link(name = "user32")]
 extern "system" {
     fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+    fn GetClassNameW(hwnd: isize, buf: *mut u16, max: i32) -> i32;
     /// 报错时带上 win32 错误码 —— 只给一个句柄等于没给现场(2026-10-31 加)。
     fn IsWindow(hwnd: isize) -> i32;
 }
@@ -630,6 +673,23 @@ fn common_prefix_chars(a: &str, b: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// 退格风味表(`backspace_with` 的那张表就是这几条量出来的结论)。
+    #[test]
+    fn backspace_flavor_by_class() {
+        use super::class_backspace_as_char;
+        // 经典控件:只认 WM_CHAR(0x08)
+        assert!(class_backspace_as_char("Edit"));
+        assert!(class_backspace_as_char("EDIT"));
+        // RichEdit 一族:自己处理按键,且它的名字里也含 edit —— 必须先挡掉
+        assert!(!class_backspace_as_char("RICHEDIT50W"));
+        assert!(!class_backspace_as_char("RichEdit20W"));
+        // Qt / 终端 / 浏览器那类:维持投 KEYDOWN/UP(各自真机量过或用的是别的通道)
+        assert!(!class_backspace_as_char("Qt51514QWindowIcon"));
+        assert!(!class_backspace_as_char("CASCADIA_HOSTING_WINDOW_CLASS"));
+        assert!(!class_backspace_as_char("Chrome_WidgetWin_1"));
+        assert!(!class_backspace_as_char(""));
+    }
+
     use super::*;
 
     /// 前缀（前置空格）必须进入和正文同一条算术。

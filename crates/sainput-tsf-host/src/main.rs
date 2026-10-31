@@ -58,6 +58,11 @@ struct Msg {
     pt_y: i32,
 }
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn LoadLibraryW(name: *const u16) -> isize;
+}
+
 #[link(name = "user32")]
 extern "system" {
     fn RegisterClassW(c: *const WndClassW) -> u16;
@@ -206,8 +211,11 @@ struct Args {
     selftest_file: Option<PathBuf>,
     dump_every: u64,
     title: String,
+    control: String,
     /// 装一遍 TSF 薄壳并走完整条 COM 激活链(`--load-tip <dll>`)。
     load_tip: Option<String>,
+    /// 文本控件的类名(`--control edit|rich50`)。T4.5 要在**不同控件类**上量
+    /// "退格吃哪种消息",所以靶子得能换。
     /// 不调 `TranslateMessage`(`--no-translate`):用来把「posted 的 WM_KEYDOWN 到底
     /// 有没有被控件处理」和「TranslateMessage 生成的那条 WM_CHAR(0x08)」分开。
     no_translate: bool,
@@ -225,6 +233,7 @@ fn parse_args() -> Args {
         dump_every: 250,
         title: "sainput tsf host".into(),
         load_tip: None,
+        control: "edit".into(),
         trace: false,
         no_translate: false,
     };
@@ -239,6 +248,7 @@ fn parse_args() -> Args {
             "--dump-every" => a.dump_every = it.next().and_then(|v| v.parse().ok()).unwrap_or(250),
             "--title" => a.title = it.next().unwrap_or(a.title),
             "--load-tip" => a.load_tip = it.next(),
+            "--control" => a.control = it.next().unwrap_or(a.control),
             "--trace" => a.trace = true,
             "--no-translate" => a.no_translate = true,
             other => eprintln!("[host] unknown arg: {other}"),
@@ -294,7 +304,16 @@ fn main() {
         }
 
         // 经典 EDIT:走的是 IMM32/TSF 兼容路径,和记事本那类应用同一条。
-        let edit_cls = wide("EDIT");
+        // `--control rich50` 换成 RichEdit(msftedit.dll 的 RICHEDIT50W,写字板那类),
+        // 用来确认「经典控件那一族」的退格判据是不是同一条。
+        let edit_cls = match a.control.as_str() {
+            "rich50" | "richedit" => {
+                let m = LoadLibraryW(wide("msftedit.dll").as_ptr());
+                log.line(&format!("LoadLibrary msftedit.dll module=0x{m:x}"));
+                wide("RICHEDIT50W")
+            }
+            _ => wide("EDIT"),
+        };
         let edit = CreateWindowExW(
             0,
             edit_cls.as_ptr(),

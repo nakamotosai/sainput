@@ -97,9 +97,9 @@ sainput 的快通道(M1)与质量层(M2)已交付并冻结;剩下的是**上屏�
 
 | ID | 任务 | 验收判据 | 级别 | 状态 |
 |---|---|---|---|---|
-| T1.1 | **可行性 spike**:按 `TF_IPPMF_FORTHREAD/FORPROCESS` 激活自己的 TIP,是否会改用户的全局输入法状态;TIP 激活后标准 EDIT 是否出现文本存储 | ① 前后用户全局 profile 不变 ② `ITfThreadMgr::GetFocus` 非空 | A | ⬜ |
-| T1.2 | `crates/sainput-tsf`(cdylib):ClassFactory + `ITfTextInputProcessor` + `TF_CreateThreadMgr`,先只做"被激活时落一行日志" | DLL 被宿主加载并 `Activate` 成功 | A | ⬜ |
-| T1.3 | 注册/注销脚本(一次升权):COM in-proc server + TIP profile;卸载可彻底注销、无残留 | 注册后 TIP 列表可见;卸载后注册表无残留、应用照常输入 | B(一次性) | ⬜ |
+| T1.1 | **可行性 spike**:按 `TF_IPPMF_FORPROCESS`(SDK 实测值 `0x10000000`)激活自己的 TIP,是否会改用户的全局输入法状态;TIP 激活后标准 EDIT 是否出现文本存储 | ① 前后用户全局 profile 不变 ② `ITfThreadMgr::GetFocus` 非空 | A | ⛔ 依赖 T1.3(没有注册好的 profile 就激活不了) |
+| T1.2 | ✅ `crates/sainput-tsf`(cdylib,手写 COM)+ 宿主 `--load-tip`(走 msctf 装 TIP 的整条链) | DLL 被宿主加载并 `Activate` 成功 | A | ✅ |
+| T1.3 | 注册/注销脚本(一次升权):COM in-proc server + TIP profile;卸载可彻底注销、无残留 | 注册后 TIP 列表可见;卸载后注册表无残留、应用照常输入 | B(一次性) | ⛔ **要你点一次 UAC** —— 实测:`HKLM\SOFTWARE\Microsoft\CTF\TIP`、`HKLM\SOFTWARE\Classes\CLSID` 普通用户都拒写,`HKCU\Software\Microsoft\CTF` 连读都拒,没有 per-user 绕路 |
 | T1.4 | 组合态上屏:`StartComposition` → 逐帧 `SetText` 改写 → `EndComposition` | host 的 EDIT 文本等于期望值;**中途不留半句残字** | A | ⬜ |
 | T1.5 | 跨进程通道:引擎 ↔ DLL 命名管道(`compose`/`commit`/`cancel` + 版本握手) | 引擎发一句,宿主窗口一次到位;断开时链路干净退出 | A | ⬜ |
 | T1.6 | Rust 侧 `TsfComposer` 接上现有 `Composer` trait;配置 `tsf = auto\|always\|never`;可用性判据 = 目标进程的管道在不在 | `auto` 下支持 TSF 的窗口走 TSF、其余走旧通道 | A | ⬜ |
@@ -132,7 +132,7 @@ sainput 的快通道(M1)与质量层(M2)已交付并冻结;剩下的是**上屏�
 | T4.2 | final 之后丢弃迟到 streaming | 定稿不再被改写 | A | ⬜ |
 | T4.3 | 焦点变更丢弃提交 | 半句不落到别的窗口 | A | ⬜ |
 | T4.4 | 上述三条的回归脚本 | 一条命令跑完、结论可读 | A | ⬜ |
-| **T4.5** | **消息通道退格落点**(T0.3 现场抓到的既有缺陷):经典控件不处理 posted 的 `WM_KEYDOWN VK_BACK`,真正删除来自应用自己 `TranslateMessage` 生成的 `WM_CHAR(0x08)`,而那条被排在"补打文本"之后 → **删掉的是句尾而不是该删的那几个字**。修法:按目标类决定退格方式(经典 `Edit`/RichEdit 用 `WM_CHAR(0x08)`;Qt/终端等仍用 `WM_KEYDOWN/UP`),判据从 `decide_key_mode` 已有的类名判断拿 | 私有桌面宿主壳上「先投错版再定稿」读回一字不差 | A | ⬜ |
+| **T4.5** | ✅ **2026-10-31 已修**。**消息通道退格落点**(T0.3 现场抓到的既有缺陷):经典控件不处理 posted 的 `WM_KEYDOWN VK_BACK`,真正删除来自应用自己 `TranslateMessage` 生成的 `WM_CHAR(0x08)`,而那条被排在"补打文本"之后 → **删掉的是句尾而不是该删的那几个字**。修法:按目标类决定退格方式(经典 `Edit`/RichEdit 用 `WM_CHAR(0x08)`;Qt/终端等仍用 `WM_KEYDOWN/UP`),判据从 `decide_key_mode` 已有的类名判断拿 | 私有桌面宿主壳上「先投错版再定稿」读回一字不差 | A | ✅ |
 
 ### 阶段 5 —— 慢路径纠错(M4)
 

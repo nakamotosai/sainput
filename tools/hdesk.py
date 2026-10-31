@@ -148,13 +148,22 @@ u32.SendMessageW.restype = ctypes.c_ssize_t
 u32.SendMessageW.argtypes = [wt.HWND, wt.UINT, ctypes.c_size_t, ctypes.c_ssize_t]
 
 
-def find_edit(pid, hdesk=None):
-    """找该 pid 的顶层窗口里的 EDIT 控件(宿主壳的读回口)。"""
+# 文本控件的类名。"Edit" 是经典控件;"RICHEDIT50W" 是 msftedit.dll 里的
+# RichEdit(写字板那类,宿主壳 `--control rich50` 用)—— 读回口按类名找。
+TEXT_CLASSES = ("Edit", "RICHEDIT50W", "RichEdit20W")
+
+
+def find_child(pid, cls, hdesk=None):
     for hwnd, _cls, _title, _vis in enum_windows(pid, hdesk):
-        edit = u32.FindWindowExW(hwnd, None, "Edit", None)
-        if edit:
-            return edit
+        c = u32.FindWindowExW(hwnd, None, cls, None)
+        if c:
+            return c
     return None
+
+
+def find_edit(pid, hdesk=None, cls="Edit"):
+    """找该 pid 的顶层窗口里的文本控件(宿主壳的读回口)。"""
+    return find_child(pid, cls, hdesk)
 
 
 def read_edit(edit):
@@ -214,7 +223,7 @@ def cmd_readtext(a):
     """读回宿主壳 EDIT 里的内容 —— TSF 组合态断言的唯一入口。"""
     hdesk = open_desktop(a.desktop) if a.desktop else None
     try:
-        edit = find_edit(a.pid, hdesk)
+        edit = find_edit(a.pid, hdesk, a.cls)
         if not edit:
             print(f"[hdesk] pid={a.pid}: no EDIT control found")
             return 2
@@ -309,6 +318,7 @@ def main():
 
     sp = sub.add_parser("readtext", help="read back the EDIT content of a pid (WM_GETTEXT)")
     sp.add_argument("--pid", type=int, required=True)
+    sp.add_argument("--class", dest="cls", default="Edit")
     sp.add_argument("--desktop", default=None)
     sp.set_defaults(fn=cmd_readtext)
 

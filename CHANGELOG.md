@@ -7,6 +7,28 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **消息通道的退格改错了地方(经典控件)** —— 2026-10-31 在私有桌面靶子上量出来的:
+  `ime_wmchar` 模式下,退格用的是 `PostMessage(WM_KEYDOWN/UP, VK_BACK)`。实测
+  **经典 `Edit` 根本不处理这条 posted 按键** —— 关掉应用自己的 `TranslateMessage`
+  之后退格一次都不生效;而所有正常程序都开着 `TranslateMessage`,于是真正执行删除的是
+  **应用把这条按键翻译出来的 `WM_CHAR(0x08)`**,那条消息会被排到"我们随后补打的字符"
+  **之后**:屏幕上删掉的是**句尾**,不是该删的那几个字。
+  (真机表现:一句被回头改写的话,末尾少几个字、错字还留着。)
+  修法:**按控件类分退格风味**,判据来自新探针 `tools/probe_backspace_flavor.py`:
+
+  | 控件类 | 投 `WM_KEYDOWN/UP` | 投 `WM_CHAR(0x08)` |
+  |---|---|---|
+  | 经典 `Edit` | 无效 | **有效** ← 用这条 |
+  | `RICHEDIT50W` | **有效** ← 用这条 | 无效 |
+  | Qt(`qt*`) | 有效(真机实测) | —— |
+
+  没量过的类**一律维持原行为**(换错风味是可见的丢字,维持现状最坏也只是维持现状)。
+  验证:`tools/test_compose_path.py` 六条全过 —— 其中"退格改写"两条覆盖两种风味
+  (修之前经典 `Edit` 那条是失败的);`cargo test -p sainput-core` 41 passed
+  (新增 `inject::tests::backspace_flavor_by_class`)。
+
 ### Added
 
 - **句尾自动加空格(托盘「后面自动加空格」,2026-10-31 用户要的)**:和原有的
