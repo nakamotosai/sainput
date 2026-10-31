@@ -93,6 +93,8 @@ pub const EDGE_FPS_NAMES: [&str; 2] = ["60fps(默认,最滑)", "30fps(省电,省
 pub const EDGE_FPS_CONF: [&str; 2] = ["60", "30"];
 /// 释放卡住的修饰键（键盘失灵时自救）
 const ID_RELEASE_KEYS: usize = 19;
+/// T5.2 收回上一句。是**动作**不是开关:不落配置,只发一次请求。
+const ID_UNDO_LAST: usize = 20;
 /// 热键子菜单的基址：ID_HOTKEY_BASE + 序号。
 /// 用连续 id 而不是给每个键写死常量 —— 以后加热键只改候选表，不用动命令行常量。
 const ID_HOTKEY_BASE: usize = 100;
@@ -120,6 +122,8 @@ pub enum TrayToggle {
     SetHotkey(usize),
     /// 把控制台窗口叫出来
     ShowConsole,
+    /// 把**上一句**从上屏过的那个窗口里收回去(T5.2)。焦点不在那儿就拒绝(见 worker)。
+    UndoLast,
     /// 开机自启开关
     AutoStart,
     /// 悬浮显示方式：0=关 1=细条 2=悬浮球 3=边缘光
@@ -943,6 +947,7 @@ fn queue_toggle(id: usize) {
         ID_SHOW_CONSOLE => Some(TrayToggle::ShowConsole),
         ID_AUTOSTART => Some(TrayToggle::AutoStart),
         ID_RELEASE_KEYS => Some(TrayToggle::ReleaseKeys),
+        ID_UNDO_LAST => Some(TrayToggle::UndoLast),
         _ if id >= ID_OVERLAY_BASE && id < ID_OVERLAY_BASE + 4 => {
             Some(TrayToggle::SetOverlayMode(id - ID_OVERLAY_BASE))
         }

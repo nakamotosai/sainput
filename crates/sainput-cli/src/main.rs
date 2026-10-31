@@ -1420,6 +1420,13 @@ fn open_with_shell(path: &Path) {
 
 /// 把这次会话的识别原文 / 渲染结果 / 上屏动作写进文件。
 /// 用户报「吞字」「慢」这类问题时，只有拿到真实会话记录才谈得上定位。
+/// T5.2「收回上一句」:托盘点一下 → 这里置位 → worker 每拍消费一次。
+///
+/// 为什么用**一次性原子位**而不是配置项:它不落盘、只生效一次;
+/// 塞进配置会变成"永久开关",而且托盘那条 `apply_toggle` 跑在**主线程**,
+/// 记账与写入器都在 worker —— 跨线程只能靠这种一次性信号。
+static UNDO_REQUEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub struct Logger {
     file: std::sync::Mutex<std::fs::File>,
     path: String,
@@ -1921,6 +1928,17 @@ fn worker(
     // 焦点守卫(体检报告 §4.3):按下那一刻的前台窗口,整句以它为准。
     // `focus_lost` = 中途复核发现不一致 → 本句不再注入。
     let mut guard_hwnd: isize = 0;
+    /// 上一句:**在哪个窗口**、**净上屏了几个字**(供"收回上一句"用)。
+    let mut last_undo: Option<(isize, usize)> = None;
+    /// 本句开始时的计数快照(计数是累计的,差额才是这一句真正打上去的字数)。
+    let mut typed0: usize = 0;
+    let mut bs0: usize = 0;
+    /// 【诊断】`SAINPUT_DIAG_UNDO_AFTER_MS=800`:每句定稿后自动点一次"收回上一句"。
+    /// 私有桌面上没有托盘可点,回归靠它驱动。
+    let mut diag_undo_at: Option<std::time::Instant> = None;
+    let diag_undo_ms: Option<u64> = std::env::var("SAINPUT_DIAG_UNDO_AFTER_MS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
     let mut focus_lost = false;
 
     // 默认常驻预热：否则「按下热键 → 开麦」要 100ms 左右，第一个字会被吞掉。
@@ -1973,6 +1991,41 @@ fn worker(
         // —— 那几个状态本来就每拍都有事做(音频帧、sidecar 消息)。
         // 以前这里是无条件 `try_recv` + 循环末尾 `sleep(4ms)/sleep(8ms)`,
         // 空闲时每秒白醒 125~250 次(体检报告 §5.2)。
+            // T5.2「收回上一句」:托盘点一下(或诊断钩子到点)→ 每拍看一次。
+            // **焦点不在那一句的窗口里就拒绝** —— 退格打在当前焦点上,打错窗口会删掉别人的内容。
+            let diag_due = diag_undo_at.map_or(false, |t| std::time::Instant::now() >= t);
+            if UNDO_REQUEST.swap(false, std::sync::atomic::Ordering::SeqCst) || diag_due {
+                if diag_due {
+                    diag_undo_at = None;
+                }
+                match last_undo {
+                    Some((hwnd, n)) if n > 0 => {
+                        let cur = inject::focused_window();
+                        if cur == hwnd {
+                            match wr.undo(n) {
+                                Ok(()) => {
+                                    let l = format!("[sainput] 托盘 → 收回上一句:{n} 字");
+                                    println!("{l}");
+                                    if let Some(lg) = o.log.as_ref() {
+                                        lg.line(&l);
+                                    }
+                                    last_undo = None;
+                                }
+                                Err(e) => eprintln!("[sainput] 收回上一句失败:{e}"),
+                            }
+                        } else {
+                            let l = format!(
+                                "[sainput] ⚠ 没收:光标已经不在那句话的窗口里(0x{hwnd:X} → 0x{cur:X})—— 不动,免得删掉别人的内容"
+                            );
+                            println!("{l}");
+                            if let Some(lg) = o.log.as_ref() {
+                                lg.line(&l);
+                            }
+                        }
+                    }
+                    _ => println!("[sainput] 这一步没有可以收回的句子"),
+                }
+            }
         let idle_wait = !recording && tail.is_none() && stage == Stage::Idle;
         let ev = if idle_wait {
             match rx.recv_timeout(Duration::from_millis(20)) {
@@ -2462,6 +2515,16 @@ fn worker(
                 if is_final_finish {
                     // 定稿之后这一句的 streaming 一律不认(见 `finalized` 的注释)
                     finalized = true;
+                    // T5.2:记下这一句落在哪个窗口、净打上去几个字 —— "收回上一句"要用。
+                    // 净字数 = 这一句的差额(打字 - 退格),不是累计值。
+                    let typed = wr.typed_chars.saturating_sub(typed0);
+                    let bs = wr.backspaces.saturating_sub(bs0);
+                    let net = typed.saturating_sub(bs);
+                    let target = inject::focused_window();
+                    last_undo = Some((target, net));
+                    if let Some(ms) = diag_undo_ms {
+                        diag_undo_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(ms));
+                    }
                 }
                 stage = Stage::Idle;
                 if defer_reset {
@@ -3034,6 +3097,13 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
                 TRAILING_SPACE.store(v, O::Relaxed);
                 ("trailing_space", if v { "true" } else { "false" },
                  if v { "后面自动加空格:开(只补一个)" } else { "后面自动加空格:关" }.to_string())
+            }
+            tray::TrayToggle::UndoLast => {
+                // 只是置位:真正的退格在 worker 里做(它才持有写入器与上一句的记账)
+                UNDO_REQUEST.store(true, std::sync::atomic::Ordering::SeqCst);
+                println!("[sainput] 托盘 → 收回上一句(交给 worker 执行)");
+                // 动作型:与"释放卡住的键"同款 —— 不写配置、不进开关表,直接返回
+                return;
             }
             tray::TrayToggle::ReleaseKeys => {
                 // 键盘失灵时的自救：把可能卡在「按下」的修饰键全部补 keyup。

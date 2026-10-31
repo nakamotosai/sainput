@@ -1198,6 +1198,24 @@ impl StreamWriter {
     /// 用在「这一句没有定稿,但流水线已经结束」的路径上(识别报错、空定稿):
     /// 组合串挂在应用里的时候,那边是把按键让给它的 —— 留着不放,用户会觉得
     /// 键盘坏了。丢掉的只是「应用里还没提交的那一版」,屏幕上真正上过的东西不动。
+    /// 收回已经上屏的 `n` 个字符(T5.2「收回上一句」)。
+    ///
+    /// 走 `backspace_with` —— **按本句当初用的那条通道退格**(Keys 走 SendInput、
+    /// 消息通道走 `WM_KEYDOWN/UP VK_BACK`)。直接用 `inject::backspace` 是错的:
+    /// 它只会 SendInput,在那些"必须走消息通道"的窗口里(微信 4.x、Qt、认字符不认消息的控件)
+    /// 一个都退不掉 —— 那正是当初要开第二条通道的原因。
+    ///
+    /// ⚠️ 调用方**必须先确认焦点还在那一句的窗口里**:退格打在**当前焦点**上,
+    /// 打错窗口就是删掉别人的内容。
+    pub fn undo(&mut self, n: usize) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        backspace_with(self.mode, n)?;
+        self.backspaces = self.backspaces.saturating_add(n);
+        Ok(())
+    }
+
     pub fn cancel_buffer(&mut self) {
         if self.composed.is_empty() {
             return;
