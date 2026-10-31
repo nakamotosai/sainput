@@ -101,7 +101,7 @@ sainput 的快通道(M1)与质量层(M2)已交付并冻结;剩下的是**上屏�
 | T1.2 | ✅ `crates/sainput-tsf`(cdylib,手写 COM)+ 宿主 `--load-tip`(走 msctf 装 TIP 的整条链) | DLL 被宿主加载并 `Activate` 成功 | A | ✅ |
 | T1.3 | 注册/注销脚本(一次升权):COM in-proc server + TIP profile;卸载可彻底注销、无残留 | 注册后 TIP 列表可见;卸载后注册表无残留、应用照常输入 | B(一次性) | ⛔ **要你点一次 UAC** —— 实测:`HKLM\SOFTWARE\Microsoft\CTF\TIP`、`HKLM\SOFTWARE\Classes\CLSID` 普通用户都拒写,`HKCU\Software\Microsoft\CTF` 连读都拒,没有 per-user 绕路 |
 | T1.4 | 组合态上屏:`StartComposition` → 逐帧 `SetText` 改写 → `EndComposition` | host 的 EDIT 文本等于期望值;**中途不留半句残字** | A | ⬜ |
-| T1.5 | 跨进程通道:引擎 ↔ DLL 命名管道(`compose`/`commit`/`cancel` + 版本握手) | 引擎发一句,宿主窗口一次到位;断开时链路干净退出 | A | ⬜ |
+| T1.5 | 跨进程通道:引擎 ↔ DLL 命名管道(`compose`/`commit`/`cancel` + 版本握手) | 引擎发一句,宿主窗口一次到位;断开时链路干净退出 | A | 🔄 **薄壳侧已通**(协议/状态机/生命周期,`tools/test_tsf_pipe.py` 15 条全过);引擎侧客户端随 T1.6 接 |
 | T1.6 | Rust 侧 `TsfComposer` 接上现有 `Composer` trait;配置 `tsf = auto\|always\|never`;可用性判据 = 目标进程的管道在不在 | `auto` 下支持 TSF 的窗口走 TSF、其余走旧通道 | A | ⬜ |
 | T1.7 | 位数:x86 + x64 两个 DLL | 32 位宿主与 64 位宿主都能上屏 | A | ⬜ |
 

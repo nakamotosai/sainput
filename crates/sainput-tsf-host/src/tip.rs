@@ -46,6 +46,11 @@ struct ThreadMgrVtbl {
     release: unsafe extern "system" fn(*mut c_void) -> u32,
     activate: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32,
     deactivate: unsafe extern "system" fn(*mut c_void) -> i32,
+    create_document_mgr: usize,
+    enum_document_mgrs: usize,
+    /// `ITfThreadMgr::GetFocus`:返回**当前焦点文档管理器**。
+    /// 它非空 = 那个应用已经有一个 TSF 文本存储在跑 —— 组合态上屏(T1.4)的前提。
+    get_focus: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32,
 }
 
 #[repr(C)]
@@ -78,7 +83,7 @@ const S_OK: i32 = 0;
 const S_FALSE: i32 = 1;
 
 /// 返回值:每一步是否都如预期。
-pub unsafe fn run(dll: &str, log: &Log) -> bool {
+pub unsafe fn run(dll: &str, hold_ms: u64, log: &Log) -> bool {
     let path = wide(dll);
     let module = unsafe { LoadLibraryW(path.as_ptr()) };
     if module == 0 {
@@ -118,6 +123,17 @@ pub unsafe fn run(dll: &str, log: &Log) -> bool {
         return false;
     }
 
+    // 1b) 焦点文档:T1.4 能不能开工就看这一条(空 = 这个进程还没有 TSF 文本存储)
+    let tm_vt = unsafe { *(tm as *const *const ThreadMgrVtbl) };
+    let mut focus: *mut c_void = std::ptr::null_mut();
+    let h = unsafe { ((*tm_vt).get_focus)(tm, &mut focus) };
+    log.line(&format!(
+        "tip GetFocus: hr={} docmgr={} {}",
+        hr(h),
+        if focus.is_null() { "NULL" } else { "非空" },
+        if focus.is_null() { "(没有文本存储 —— 组合态上屏还谈不上)" } else { "(有文本存储!)" }
+    ));
+
     // 2) DllGetClassObject —— msctf 也是这么拿类厂的
     let name = b"DllGetClassObject\0";
     let gco: DllGetClassObjectFn = unsafe { std::mem::transmute(GetProcAddress(module, name.as_ptr())) };
@@ -142,10 +158,23 @@ pub unsafe fn run(dll: &str, log: &Log) -> bool {
         return false;
     }
 
-    // 4) 激活 —— 这一句进得去,说明薄壳在真实进程里站住了
+    // 4) 激活 —— 这一句进得去,说明薄壳在真实进程里站住了。
+    //    激活期间它的**命名管道服务端**是活的(`\\.\pipe\sainput-tsf-<本进程 pid>`),
+    //    外部测试就趁这个窗口连进来(T1.5)。
     let svc_vt = unsafe { *(svc as *const *const TipVtbl) };
     let h = unsafe { ((*svc_vt).activate)(svc, tm, tid) };
     ok &= check("ITfTextInputProcessor::Activate", h, S_OK, log);
+    if hold_ms > 0 {
+        log.line(&format!(
+            "tip 保持激活 {hold_ms}ms:管道 \\\\.\\pipe\\sainput-tsf-{} 现在可连",
+            std::process::id()
+        ));
+        println!("[host] tip pipe live pid={}", std::process::id());
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(hold_ms) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     // 5) 还活着的时候不允许卸载(引用计数没算错)
     let cun: DllCanUnloadNowFn =
@@ -158,11 +187,17 @@ pub unsafe fn run(dll: &str, log: &Log) -> bool {
     ok &= check("ITfTextInputProcessor::Deactivate", h, S_OK, log);
     unsafe { ((*svc_vt).release)(svc) };
     unsafe { ((*vt).release)(factory) };
-    let h = unsafe { cun() };
+    // 反激活之后管道线程要一点时间收摊,所以这里**轮询**等它允许卸载 ——
+    // 顺带把"线程还活着就不许卸"这条规矩也验了:如果薄壳忘了算这件事,这里会超时。
+    let mut h = unsafe { cun() };
+    let t0 = Instant::now();
+    while h != S_OK && t0.elapsed() < Duration::from_millis(2000) {
+        std::thread::sleep(Duration::from_millis(20));
+        h = unsafe { cun() };
+    }
     ok &= check("DllCanUnloadNow(释放后)", h, S_OK, log);
 
     // 7) 线程管理器还回去
-    let tm_vt = unsafe { *(tm as *const *const ThreadMgrVtbl) };
     unsafe { ((*tm_vt).deactivate)(tm) };
     unsafe { ((*tm_vt).release)(tm) };
 
@@ -182,11 +217,18 @@ pub unsafe fn run(dll: &str, log: &Log) -> bool {
         log.line(&format!("tip 薄壳日志路径 {p:?}"));
     }
 
-    // 给日志一点落盘时间,再卸载。
+    // 给日志一点落盘时间。
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_millis(50) {
         std::thread::sleep(Duration::from_millis(10));
     }
-    unsafe { FreeLibrary(module) };
+    // **只在薄壳说"可以卸"时才卸**。它说不行而我们硬卸,等于让它自己的线程
+    // 跳进一片已解除映射的代码 —— 崩的是宿主进程,而且是那种最难查的崩。
+    if unsafe { cun() } == S_OK {
+        unsafe { FreeLibrary(module) };
+        log.line("tip FreeLibrary 已执行");
+    } else {
+        log.line("tip 薄壳说还不能卸(线程仍在收尾)—— 保持加载,不 FreeLibrary");
+    }
     ok
 }

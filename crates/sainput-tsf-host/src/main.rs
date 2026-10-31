@@ -214,6 +214,8 @@ struct Args {
     control: String,
     /// 装一遍 TSF 薄壳并走完整条 COM 激活链(`--load-tip <dll>`)。
     load_tip: Option<String>,
+    /// 薄壳激活后保持多久(毫秒):管道服务端只在这段时间里可连(T1.5 用)。
+    tip_hold: u64,
     /// 文本控件的类名(`--control edit|rich50`)。T4.5 要在**不同控件类**上量
     /// "退格吃哪种消息",所以靶子得能换。
     /// 不调 `TranslateMessage`(`--no-translate`):用来把「posted 的 WM_KEYDOWN 到底
@@ -233,6 +235,7 @@ fn parse_args() -> Args {
         dump_every: 250,
         title: "sainput tsf host".into(),
         load_tip: None,
+        tip_hold: 0,
         control: "edit".into(),
         trace: false,
         no_translate: false,
@@ -248,6 +251,7 @@ fn parse_args() -> Args {
             "--dump-every" => a.dump_every = it.next().and_then(|v| v.parse().ok()).unwrap_or(250),
             "--title" => a.title = it.next().unwrap_or(a.title),
             "--load-tip" => a.load_tip = it.next(),
+            "--tip-hold" => a.tip_hold = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--control" => a.control = it.next().unwrap_or(a.control),
             "--trace" => a.trace = true,
             "--no-translate" => a.no_translate = true,
@@ -343,7 +347,7 @@ fn main() {
         ));
 
         if let Some(dll) = a.load_tip.clone() {
-            let ok = tip::run(&dll, &log);
+            let ok = tip::run(&dll, a.tip_hold, &log);
             log.line(&format!("tip RESULT {}", if ok { "PASS" } else { "FAIL" }));
             println!("[host] tip {}", if ok { "PASS" } else { "FAIL" });
         }

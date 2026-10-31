@@ -33,6 +33,8 @@
 
 #![allow(non_snake_case)]
 
+pub mod pipe;
+
 use std::ffi::c_void;
 use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -319,6 +321,8 @@ unsafe extern "system" fn svc_activate(this: *mut c_void, ptim: *mut c_void, tid
         let s = unsafe { &*(this as *const TextService) };
         unsafe { s.set_thread_mgr(ptim) };
         trace(&format!("Activate tid={tid} ptim={ptim:p}"));
+        // 引擎要能找到我们:端点名按 pid 算,所以只要把服务端起起来就行。
+        pipe::ensure_server();
         S_OK
     }));
     r.unwrap_or(E_FAIL)
@@ -342,6 +346,7 @@ unsafe extern "system" fn svc_deactivate(this: *mut c_void) -> Hresult {
         let s = unsafe { &*(this as *const TextService) };
         let tm = unsafe { s.get_thread_mgr() };
         s.active.store(0, Ordering::SeqCst);
+        pipe::request_stop();
         trace(&format!("Deactivate (had ptim={tm:p})"));
         S_OK
     }));
@@ -384,7 +389,8 @@ pub unsafe extern "system" fn DllGetClassObject(
 /// 还有活对象时不能卸载(对象是堆上的,卸载后回调就悬空了)。
 #[no_mangle]
 pub extern "system" fn DllCanUnloadNow() -> Hresult {
-    if LIVE_OBJECTS.load(Ordering::SeqCst) == 0 {
+    // 有活对象、或管道线程还在跑,都不能卸 —— 后者尤其致命:线程会跳进已解除映射的代码。
+    if LIVE_OBJECTS.load(Ordering::SeqCst) == 0 && !pipe::server_alive() {
         S_OK
     } else {
         S_FALSE
@@ -400,6 +406,13 @@ pub extern "system" fn DllMain(hinst: isize, reason: u32, _reserved: *mut c_void
         trace("DllMain PROCESS_ATTACH");
     }
     1
+}
+
+/// 调试/测试用:把协议版本回给宿主,免得测试写死。返回值是写入的 UTF-16 码元数。
+#[no_mangle]
+pub unsafe extern "system" fn SainputTsfProtocolVersion() -> *const u8 {
+    static V: &[u8] = b"sainput-tsf/1\0";
+    V.as_ptr()
 }
 
 /// 调试/测试用:把日志文件路径回给宿主,免得测试去猜 `%TEMP%`。
