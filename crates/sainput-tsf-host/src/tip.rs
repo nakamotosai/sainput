@@ -25,6 +25,10 @@ extern "system" {
 /// 反正仓库本来就手写 FFI,这里只多一次 `GetProcAddress`,换来不依赖 SDK 的 .lib。
 type TfCreateThreadMgrFn = unsafe extern "system" fn(*mut *mut c_void) -> i32;
 
+pub(crate) unsafe fn resolve_msctf_create() -> Option<TfCreateThreadMgrFn> {
+    unsafe { resolve_msctf() }
+}
+
 unsafe fn resolve_msctf() -> Option<TfCreateThreadMgrFn> {
     let name = wide("msctf.dll");
     let m = unsafe { LoadLibraryW(name.as_ptr()) };
@@ -39,19 +43,25 @@ unsafe fn resolve_msctf() -> Option<TfCreateThreadMgrFn> {
 }
 
 /// COM 对象的开头永远是一个 vtable 指针;这里只声明用得着的那几个槽位。
+/// `ITfThreadMgr`(IID `aa80e801-2021-11d2-93e0-0060b067b86e`)的方法顺序:
+/// Activate / Deactivate / CreateDocumentMgr / EnumDocumentMgrs / GetFocus / **SetFocus** / ...
 #[repr(C)]
-struct ThreadMgrVtbl {
-    query_interface: usize,
-    add_ref: usize,
-    release: unsafe extern "system" fn(*mut c_void) -> u32,
-    activate: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32,
-    deactivate: unsafe extern "system" fn(*mut c_void) -> i32,
-    create_document_mgr: usize,
-    enum_document_mgrs: usize,
-    /// `ITfThreadMgr::GetFocus`:返回**当前焦点文档管理器**。
-    /// 它非空 = 那个应用已经有一个 TSF 文本存储在跑 —— 组合态上屏(T1.4)的前提。
-    get_focus: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32,
+pub(crate) struct ThreadMgrVtblPrefix {
+    pub query_interface: usize,
+    pub add_ref: usize,
+    pub release: unsafe extern "system" fn(*mut c_void) -> u32,
+    pub activate: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32,
+    pub deactivate: unsafe extern "system" fn(*mut c_void) -> i32,
+    pub create_document_mgr:
+        unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32,
+    pub enum_document_mgrs: usize,
+    /// `GetFocus`:返回**当前焦点文档管理器**。
+    /// 它非空 = 这个进程已经有 TSF 文本存储在跑 —— 组合态上屏(T1.4)的前提。
+    pub get_focus: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32,
+    /// `SetFocus(ITfDocumentMgr*)`:把我们自己建的文档顶上去当焦点。
+    pub set_focus: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32,
 }
+type ThreadMgrVtbl = ThreadMgrVtblPrefix;
 
 #[repr(C)]
 struct ClassFactoryVtbl {
@@ -99,7 +109,14 @@ pub unsafe fn focused_document(tm: *mut c_void) -> Option<*mut c_void> {
 }
 
 /// 返回值:每一步是否都如预期。
-pub unsafe fn run_mode(dll: &str, hold_ms: u64, activate_for_process: bool, activate_legacy: bool, log: &Log) -> bool {
+pub unsafe fn run_mode(
+    dll: &str,
+    hold_ms: u64,
+    activate_for_process: bool,
+    activate_legacy: bool,
+    activate_hold_ms: u64,
+    log: &Log,
+) -> bool {
     let trace_ref = if log.tracing { Some(log) } else { None };
     let path = wide(dll);
     let module = unsafe { LoadLibraryW(path.as_ptr()) };
@@ -205,7 +222,7 @@ pub unsafe fn run_mode(dll: &str, hold_ms: u64, activate_for_process: bool, acti
         log.line(&format!("profile T1.1(老 API)结果 {}", if ok11 { "PASS" } else { "FAIL" }));
     }
     if activate_for_process {
-        let ok11 = unsafe { crate::profile::activate_for_process(log, tm) };
+        let ok11 = unsafe { crate::profile::activate_for_process(log, tm, activate_hold_ms) };
         ok &= ok11;
         log.line(&format!("profile T1.1 结果 {}", if ok11 { "PASS" } else { "FAIL" }));
     }

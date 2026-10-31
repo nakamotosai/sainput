@@ -320,7 +320,7 @@ pub unsafe fn snapshot_line(_log: &Log, _tag: &str) -> String {
 }
 
 /// 在**本进程**里激活我们自己的 TIP,然后看文本存储出没出来。
-pub unsafe fn activate_for_process(log: &Log, tm: *mut c_void) -> bool {
+pub unsafe fn activate_for_process(log: &Log, tm: *mut c_void, hold_ms: u64) -> bool {
     let Some((_profiles, mgr)) = (unsafe { managers() }) else {
         log.line("profile 激活失败:拿不到 TSF 的管理器");
         return false;
@@ -355,6 +355,16 @@ pub unsafe fn activate_for_process(log: &Log, tm: *mut c_void) -> bool {
         return false;
     }
     snapshot(log, "激活后(本进程)");
+
+    // 【实验/测试】激活后停一会儿:这段窗口里本进程才是"活动 profile 是我们"的状态 ——
+    // 有些事(比如写事务)只有在这个状态下才谈得上。窗口一过立刻还原。
+    if hold_ms > 0 {
+        log.line(&format!("profile 保持激活 {hold_ms}ms(这段窗口里做实验)"));
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_millis(hold_ms) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 
     // 收尾:**把默认输入法还给用户**(不还就等于把用户的输入法弄坏了)。
     if let Some((c, p)) = saved {

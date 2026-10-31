@@ -371,7 +371,10 @@ fn watchdog() {
             }
         });
         if dropped {
-            trace("pipe watchdog: 组合态闲置超时,已取消(不让半句话留在应用里)");
+            let hr = crate::compose::cancel();
+            trace(&format!(
+                "pipe watchdog: 组合态闲置超时,已取消(不让半句话留在应用里)hr={hr:#x}"
+            ));
         }
     }
 }
@@ -428,7 +431,9 @@ fn handle(payload: &[u8]) -> Vec<u8> {
             st.preedit = text.to_string();
             st.last_activity_ms = now_ms();
             trace(&format!("pipe set preedit={:?}(句 {id})", st.preedit));
-            ok(&st.preedit)
+            // 真正写进应用上下文的那一步(组合态:整体替换,不产生按键)。
+            let hr = crate::compose::set_text(text);
+            ok(&format!("{}\n{hr}", st.preedit))
         }),
         b'C' => with_state(|st| {
             let (id, text) = split_sentence(&arg);
@@ -444,19 +449,25 @@ fn handle(payload: &[u8]) -> Vec<u8> {
                 st.preedit.clear();
             }
             st.last_activity_ms = now_ms();
-            trace(&format!("pipe commit {n} bytes(句 {id})"));
-            ok(&format!("{}", st.committed_bytes))
+            let hr = crate::compose::commit(text);
+            trace(&format!("pipe commit {n} bytes(句 {id}) hr={hr:#x}"));
+            ok(&format!("{}\n{hr}", st.committed_bytes))
         }),
         b'X' => with_state(|st| {
             st.preedit.clear();
             st.last_activity_ms = now_ms();
-            trace("pipe cancel");
-            ok("")
+            let hr = crate::compose::cancel();
+            trace(&format!("pipe cancel hr={hr:#x}"));
+            ok(&format!("{hr}"))
         }),
         b'Q' => with_state(|st| {
             ok(&format!(
-                "{}|{}|{}|{}",
-                st.preedit, st.committed_bytes, st.active_sentence, st.last_committed
+                "{}|{}|{}|{}|{}",
+                st.preedit,
+                st.committed_bytes,
+                st.active_sentence,
+                st.last_committed,
+                crate::compose::current_text()
             ))
         }),
         other => err(&format!("unknown command {:?}", other as char)),

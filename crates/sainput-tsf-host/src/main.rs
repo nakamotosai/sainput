@@ -21,6 +21,7 @@
 //! 运行时输出一律 ASCII(本机控制台 CP936,中文会串码);日志文件是 UTF-8。
 
 mod profile;
+mod store;
 mod tip;
 
 use std::fs::OpenOptions;
@@ -119,6 +120,11 @@ const WM_SETFOCUS: u32 = 0x0007;
 const CLASS_NAME: &str = "SainputTsfHost";
 
 static DESTROYED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// 主窗口句柄:文本存储的 `GetWnd` 要用它(没有窗口时是 0)。
+    pub(crate) static WINDOW: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
 
 /// 主窗口在 `WM_SETFOCUS` 里要把焦点交给 EDIT。
 ///
@@ -253,8 +259,14 @@ struct Args {
     activate_legacy: bool,
     /// `--set-default <CLSID> <PROFILE>`:把 zh-CN 的默认输入法设回去(撤销我们自己的激活)。
     set_default: Option<(String, String)>,
+    /// `--tfstore`:自建文本存储 + 文档 + 上下文(T1.4 的组合态前提,零副作用)。
+    tfstore: bool,
+    /// 假存储里的初始文本(空上下文会被 TSF 判定 `TF_E_EMPTYCONTEXT` 驳回写事务)。
+    store_seed: String,
     /// `--enum-profiles`:把 msctf 眼里的输入法列出来(T1.1 排障用)。
     enum_profiles: bool,
+    /// `--activate-hold <ms>`:激活后停这么久再做别的(T1.4 实验窗口)。
+    activate_hold: u64,
     /// `--activate-profile`:在本进程里按 `TF_IPPMF_FORPROCESS` 激活我们的 TIP(T1.1 用)。
     activate_profile: bool,
     /// 不调 `TranslateMessage`(`--no-translate`):用来把「posted 的 WM_KEYDOWN 到底
@@ -280,11 +292,14 @@ fn parse_args() -> Args {
         no_translate: false,
         report_profile: false,
         enum_profiles: false,
+        tfstore: false,
+        store_seed: "这是窗口里原有的文本。".into(),
         set_default: None,
         activate_legacy: false,
         no_window: false,
         hide_window: false,
         activate_profile: false,
+        activate_hold: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -303,6 +318,8 @@ fn parse_args() -> Args {
             "--no-translate" => a.no_translate = true,
             "--report-profile" => a.report_profile = true,
             "--enum-profiles" => a.enum_profiles = true,
+            "--tfstore" => a.tfstore = true,
+            "--store-seed" => a.store_seed = it.next().unwrap_or(a.store_seed),
             "--activate-legacy" => a.activate_legacy = true,
             "--set-default" => {
                 let c = it.next().unwrap_or_default();
@@ -312,6 +329,7 @@ fn parse_args() -> Args {
             "--no-window" => a.no_window = true,
             "--hide-window" => a.hide_window = true,
             "--activate-profile" => a.activate_profile = true,
+            "--activate-hold" => a.activate_hold = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             other => eprintln!("[host] unknown arg: {other}"),
         }
     }
@@ -344,7 +362,7 @@ fn main() {
                 profile::snapshot(&log, "旁观");
             }
             if let Some(dll) = a.load_tip.clone() {
-                let ok = tip::run_mode(&dll, a.tip_hold, a.activate_profile, a.activate_legacy, &log);
+                let ok = tip::run_mode(&dll, a.tip_hold, a.activate_profile, a.activate_legacy, a.activate_hold, &log);
                 log.line(&format!("tip RESULT {}", if ok { "PASS" } else { "FAIL" }));
             }
         }
@@ -426,6 +444,7 @@ fn main() {
             std::process::exit(1);
         }
         EDIT_HANDLE.store(edit, Ordering::SeqCst);
+        WINDOW.with(|w| w.set(hwnd));
         let fg = if a.hide_window {
             0 // 不显示、也不抢前台:只要控件存在于本进程,焦点在**自己的线程内**就够了
         } else {
@@ -448,8 +467,13 @@ fn main() {
             profile::snapshot(&log, "旁观");
             println!("[host] report-profile 完成");
         }
+        if a.tfstore {
+            // 先把上下文建好(组合态要用),再装薄壳 —— 薄壳 `Activate` 时拿到的线程
+            // 管理器与本进程是同一个,所以它 `GetFocus` 就能看到我们刚推上去的上下文。
+            unsafe { store::create_context(&log, a.log.clone(), &a.store_seed) };
+        }
         if let Some(dll) = a.load_tip.clone() {
-            let ok = tip::run_mode(&dll, a.tip_hold, a.activate_profile, a.activate_legacy, &log);
+            let ok = tip::run_mode(&dll, a.tip_hold, a.activate_profile, a.activate_legacy, a.activate_hold, &log);
             log.line(&format!("tip RESULT {}", if ok { "PASS" } else { "FAIL" }));
             println!("[host] tip {}", if ok { "PASS" } else { "FAIL" });
         }

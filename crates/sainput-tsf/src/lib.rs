@@ -33,6 +33,7 @@
 
 #![allow(non_snake_case)]
 
+pub mod compose;
 pub mod pipe;
 
 use std::ffi::c_void;
@@ -120,7 +121,7 @@ fn log_path() -> std::path::PathBuf {
     }
 }
 
-fn trace(msg: &str) {
+pub(crate) fn trace(msg: &str) {
     let line = format!(
         "pid={} tid={} {msg}\n",
         std::process::id(),
@@ -355,6 +356,10 @@ unsafe extern "system" fn svc_activate(this: *mut c_void, ptim: *mut c_void, tid
         let s = unsafe { &*(this as *const TextService) };
         unsafe { s.set_thread_mgr(ptim) };
         trace(&format!("Activate tid={tid} ptim={ptim:p}"));
+        // 记下"当前上下文":引擎发来的组合态文本就写进它。
+        // 失败不报错 —— 有的应用(或我们的测试宿主没建上下文时)根本没有 TSF 文本存储,
+        // 那种情况下引擎侧会退档,不该让 Activate 失败(激活失败会让整个输入法链回退)。
+        compose::attach_context(ptim, tid);
         // 引擎要能找到我们:端点名按 pid 算,所以只要把服务端起起来就行。
         pipe::ensure_server();
         S_OK
