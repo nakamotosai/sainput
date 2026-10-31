@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use sainput_core::asr::{Msg, Sidecar};
+use sainput_core::corpus::Corpus;
 use sainput_core::config::{self, Settings};
 use sainput_core::overlay::{EdgeTint, Overlay};
 use sainput_core::tray::Tray;
@@ -1714,7 +1715,12 @@ const SIDE_WRITE_FAIL_LIMIT: u32 = 3;
 /// 音频悄悄消失,用户看到的是「按住热键、边缘光亮着、说话,屏幕上一个字都不出」
 /// —— 没有任何提示(体检报告 §2)。计数是「子进程还活着吗」之外的第二条旁证:
 /// 有些死法 `try_wait` 一时看不到,但写一定会失败。
-fn send_frame(side: &mut Sidecar, pcm: &[i16], fails: &mut u32) {
+fn send_frame(side: &mut Sidecar, corpus: &mut Corpus, pcm: &[i16], fails: &mut u32) {
+    // 语料留存:和发给模型的**同一批字节**顺手留一份。
+    // 放在这里是因为这是所有音频的**唯一汇聚点**(麦克风/f尾巴/feed 都走它)——
+    // 分散到各处去留,迟早会漏掉某一条路,到时候"为什么这句没音频"能查半天。
+    // `push` 自己会在"不在采集这一句"时忽略(见 corpus.rs 的 armed)。
+    corpus.push(pcm);
     match side.send_audio(pcm) {
         Ok(()) => *fails = 0,
         Err(_) => *fails = fails.saturating_add(1),
@@ -1760,6 +1766,7 @@ fn begin_tail(tail: &mut Option<Tail>, o: &RunOpts) {
 /// 返回值 = 这一拍里 finish 了。
 fn tail_tick(
     side: &mut Sidecar,
+    corpus: &mut Corpus,
     o: &RunOpts,
     cap: &Option<audio::Capture>,
     fst: &mut FeedState,
@@ -1801,7 +1808,7 @@ fn tail_tick(
             t.quiet_frames += 1;
         }
         n += 1;
-        send_frame(side, &fr, fails);
+        send_frame(side, corpus, &fr, fails);
         // feed 模式下这几帧是引擎自己造的,还回去没有意义(不是池里的);真麦克风才还。
         if o.feed.is_none() {
             recycle_frame(cap, fr);
@@ -1920,6 +1927,30 @@ fn worker(
     let mut last_partial: Option<(String, String)> = None;
     // 上限已经触发过(别再触发第二次)。
     let mut cap_fired = false;
+    // 语料留存(见 crates/sainput-core/src/corpus.rs):落在**和会话日志同一个目录**的
+    // corpus/ 下。跟着日志走是有意的 —— 用户关了日志(`--no-log`)时,连音频也不该留。
+    let mut corpus = match o.log.as_ref().and_then(|l| Path::new(l.path()).parent()) {
+        Some(d) => {
+            let c = Corpus::new(d.join("corpus"), chrono_like_stamp());
+            if c.enabled() {
+                let line = format!(
+                    "[sainput] 语料留存:{} / {}(只留说话那几秒、只在本机;关掉:SAINPUT_CORPUS=off)",
+                    c.path(),
+                    c.limits()
+                );
+                println!("{line}");
+                if let Some(l) = o.log.as_ref() {
+                    l.line(&line);
+                }
+            }
+            c
+        }
+        None => Corpus::off(),
+    };
+    // 这一句是**什么时候松手**的(定稿时算"松键→出字"用)。尾巴开始的那一刻。
+    let mut released_at: Option<Instant> = None;
+    // 收尾上限这一句实际等了多久(没触发就是 None)—— 决定"上限有没有帮上忙"。
+    let mut cap_waited: Option<u128> = None;
     // TSF 通道这次运行里**坏过**吗(版本不匹配 / 端点没了 / 对面崩了)?
     // 坏过就一直退到 auto 那条通道 —— 一句一句地重试一个坏通道,用户看到的是「说了半天一个字都没上屏」。
     let mut tsf_fallback = false;
@@ -2110,11 +2141,11 @@ fn worker(
                     // 否则两句音频会混进同一个 stream。
                     if tail.is_some() {
                         for fr in drain_mic(&cap) {
-                            send_frame(&mut side, &fr, &mut side_fails);
+                            send_frame(&mut side, &mut corpus, &fr, &mut side_fails);
                             recycle_frame(&cap, fr);
                         }
                         for fr in feed_tick(&o, &mut fst) {
-                            send_frame(&mut side, &fr, &mut side_fails);
+                            send_frame(&mut side, &mut corpus, &fr, &mut side_fails);
                         }
                         // 打断路径也必须补底噪再 finish —— 见 finish_with_pad 的注释：
                         // 漏掉它等于在「没收完就再按」这条路上退回吞字。
@@ -2201,6 +2232,9 @@ fn worker(
                     await_since = None;
                     last_partial = None;
                     cap_fired = false;
+                    cap_waited = None;
+                    released_at = None;
+                    corpus.begin();
                     utterances += 1;
                     // feed 测试模式：新的一句从 wav 头重放（否则第二句只有静音）
                     fst.begin_utterance();
@@ -2239,7 +2273,7 @@ fn worker(
             if o.feed.is_some() {
                 for fr in feed_tick(&o, &mut fst) {
                     ov_level(&o.overlay, frame_rms(&fr) * 6.0);
-                    send_frame(&mut side, &fr, &mut side_fails);
+                    send_frame(&mut side, &mut corpus, &fr, &mut side_fails);
                 }
                 // 测试用:喂到指定位置就当用户松手了(和真按一下右 Ctrl 抬起等价)
                 if let Some(rel) = o.feed_release {
@@ -2298,7 +2332,7 @@ fn worker(
                     // 麦克风原始 RMS 很小(正常说话 0.02~0.2),
                     // 乘 6 再钳到 0..1,让"正常说话"能占到波形高度的 6~7 成。
                     ov_level(&o.overlay, frame_rms(&f) * 6.0);
-                    send_frame(&mut side, &f, &mut side_fails);
+                    send_frame(&mut side, &mut corpus, &f, &mut side_fails);
                     // 用完就还(T6.3):**这是生产路径上最主要的取帧处**,
                     // 漏了它,回调里每帧都得新开一个 Vec —— 实测"池未命中"会随句数线性涨。
                     recycle_frame(&cap, f);
@@ -2338,10 +2372,11 @@ fn worker(
             let finished = {
                 let text_idle_ms = last_text_at.elapsed().as_millis() as f64;
                 let t = tail.as_mut().unwrap();
-                tail_tick(&mut side, &o, &cap, &mut fst, t, text_idle_ms, &mut side_fails)
+                tail_tick(&mut side, &mut corpus, &o, &cap, &mut fst, t, text_idle_ms, &mut side_fails)
             };
             if finished {
                 if let Some(t) = tail.take() {
+                    released_at = Some(t.start);
                     report_tail(
                         &o,
                         &t,
@@ -2400,6 +2435,7 @@ fn worker(
                     if waited >= final_wait_ms {
                         if let Some((text, raw)) = last_partial.clone().filter(|(t, _)| !t.is_empty()) {
                             cap_fired = true;
+                            cap_waited = Some(waited);
                             if let Some(l) = o.log.as_ref() {
                                 l.line(&format!(
                                     "! 收尾硬上限 {}ms 到点(实际等 {}ms)→ 先把当前最好的一版打上屏(reason=cap,真 final 到了再补)",
@@ -2563,6 +2599,34 @@ fn worker(
                 if reason != "cap" {
                     let rec = if raw.is_empty() { text.as_str() } else { raw.as_str() };
                     history.push(rec);
+                }
+                // 语料:一句一份(音频在 send_frame 那边攒好了,这里收口)。
+                // 只在真定稿(`finish`)时写 —— cap 那次不是终稿,写了就会一句两份。
+                if reason == "finish" {
+                    // 松键时刻:正常情况下尾巴收完时就记下了(`released_at`);
+                    // 但**定稿可能赶在尾巴收完之前到**(sidecar 自己判到端点、或假侧车按脚本吐),
+                    // 那就直接从还活着的尾巴上取 —— 两种都要算得出"松键→出字",
+                    // 否则语料里这一列会莫名其妙是 null(2026-10-31 实测踩到)。
+                    let rel = released_at.or_else(|| tail.as_ref().map(|t| t.start));
+                    let wait_ms = rel.map(|r| r.elapsed().as_millis() as u64);
+                    let row = serde_json::json!({
+                        "text": text,
+                        "raw": raw,
+                        "reason": reason,
+                        // 松键→出字(用户实际等待);cap 触发过就再记一笔上限等了多久
+                        "wait_ms": wait_ms,
+                        "cap_waited_ms": cap_waited,
+                        "dropped_frames": dropped_now(&cap),
+                    });
+                    if let Some(p) = corpus.finish(row) {
+                        if let Some(l) = o.log.as_ref() {
+                            l.line(&format!(
+                                "C 语料 {p}  ({} 句 / {})",
+                                corpus.written(),
+                                corpus.limits()
+                            ));
+                        }
+                    }
                 }
             }
             // 组合态下 `injected` 一直是空的,所以"退档重来"就是整句一次落地,不丢字。

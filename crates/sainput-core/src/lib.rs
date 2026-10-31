@@ -11,6 +11,7 @@ pub mod autostart;
 pub mod caretctx;
 pub mod config;
 pub mod context;
+pub mod corpus;
 pub mod hotkey;
 pub mod inject;
 pub mod metrics;

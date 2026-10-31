@@ -339,6 +339,31 @@ powershell -File scripts/fetch_models.ps1 -DryRun                # 只打印将�
 旧的双语档在真机中文上会**重复打转**（`重点重点呢…动动动荡荡荡`）；x-asr-480ms 同一段
 输出干净，并且 `MONDAY` / `THE DAY AFTER TOMORROW` / `ALWAYS` / `FREQUENTLY` 都认得出。
 
+### 语料留存(自动攒"真实语音",给横评用)
+
+上面那张表是**拿我自己的真机语音**比出来的 —— 想再比一次,数据不用重新录:
+引擎每句都会顺手留一份到 **`logs/corpus/`**(和会话日志同一个目录)。
+
+| 文件 | 内容 |
+|---|---|
+| `logs/corpus/<启动时刻>-<序号>.wav` | 这一句**说话那几秒**的真实音频(16 kHz 单声道 16 bit) |
+| `logs/corpus/index.jsonl` | 每句一行:`text` / `raw` / `wait_ms`(松键→出字)/ `cap_waited_ms`(收尾上限等了多久)/ `dur_ms` / `dropped_frames` |
+
+不用它的时候没有存在感,要用的时候一条命令就能横评(把默认模型换成候选目录即可):
+
+```bash
+python tools/bench_models.py --wavs logs/corpus models/<候选模型目录>
+```
+
+边界(有意这么定):
+
+* **只留说话那几秒** —— 一次按下到定稿之间的采集帧,不留环境音、不留常驻循环;
+* **只在本机** —— 不发往任何网络;
+* **有上限会滚动** —— 默认 200 句 / 300MB,超了删最旧的(先到哪个算哪个);
+* **关掉**:`SAINPUT_CORPUS=off`(`SAINPUT_CORPUS_MAX` / `SAINPUT_CORPUS_MB` 可改上限);
+* **不是偷偷录**:启动时会打一行 `语料留存:<路径> / 上限 ...`;关了会话日志(`--no-log`)时
+  它自动一并关闭 —— 没有日志就不该留音频。
+
 ### 备选档
 
 | 档 | 适合 |

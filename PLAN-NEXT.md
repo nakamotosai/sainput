@@ -127,6 +127,20 @@ SAINPUT_FINAL_WAIT_MS=400,脚本在 2500ms 后才给真 final:
    → 所以修法只有两条:**松手后给"等模型"设上限**(用当前最好的一版定稿),
    或者**松手后对整段音频做一次整段解码**(用户提的正是这条)。
 
+### ✅ 语料留存已实现并验过(2026-10-31 晚)
+
+引擎每句自动留一份到 `<日志目录>/corpus/`:`<启动时刻>-<序号>.wav`(只说那几秒的真实音频)
++ `index.jsonl`(text/raw/wait_ms/cap_waited_ms/dur_ms/dropped_frames),默认上限 200 句/300MB
+滚动删最旧。关掉:`SAINPUT_CORPUS=off`;`--no-log` 时自动一并关(没有日志就不留音频)。
+
+验证:单元测试 3 项(原样读回 ±1LSB、滚动删最旧且 index 对齐、非本句的帧不入档);
+端到端(假侧车 + `--feed`,**带 `SAINPUT_SINGLE_NS`**)落盘 1.31s wav + `wait_ms: 323`
+的 index 行,python `wave` 能按标准读(16000Hz/mono/20992 帧);`SAINPUT_CORPUS=off` 与
+`--no-log` 两种情况下目录为空。现成工具直接可用:`bench_models.py --wavs logs/corpus <候选模型>`。
+
+**还没装到在跑的那个二进制上**:`target/release/sainput.exe` 被正在运行的实例锁着,
+换不了。用户下次退出后跑 `powershell -File tools/swap_engine.ps1` 即可(它会拒绝在有进程时动手)。
+
 ## 2) 更准 / 3) 有没有更好的模型 —— 都用**真实语料**回答,不让用户录音
 
 - 引擎侧加一个**自动留存**开关:每句把(音频 + 识别文本 + 时延)落到 `logs/corpus/`,带上限与滚动清理;
