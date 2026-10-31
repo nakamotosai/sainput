@@ -649,11 +649,14 @@ fn cmd_devices() -> Result<()> {
 // ------------------------------------------------------------ probe/record
 fn report_stats(cap: &audio::Capture) {
     println!(
-        "[stats] 出帧={} 原始样本={} 丢帧={} 流错误={}",
+        "[stats] 出帧={} 原始样本={} 丢帧={} 流错误={} 回调内新开缓冲={}",
         cap.stats.frames_out.load(Ordering::Relaxed),
         cap.stats.samples_in.load(Ordering::Relaxed),
         cap.stats.frames_dropped.load(Ordering::Relaxed),
         cap.stats.stream_errors.load(Ordering::Relaxed),
+        // T6.3 的判据:这个数**只在开头涨几下**(帧池先装满),之后就不再涨 ——
+        // 涨个不停说明下游没把缓冲还回来,实时回调又变成会分配的地方了。
+        cap.stats.pool_misses.load(Ordering::Relaxed),
     );
 }
 
@@ -718,7 +721,9 @@ fn cmd_probe(a: &Args) -> Result<()> {
     let mut deltas: Vec<f64> = Vec::new();
     while Instant::now() < deadline {
         match cap.rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(_) => {
+            Ok(f) => {
+                // 探针也是**下游**,用完就得还 —— 帧池靠这个循环起来(T6.3 零分配)。
+                cap.recycle(f);
                 let now = Instant::now();
                 if let Some(p) = last {
                     deltas.push((now - p).as_secs_f64() * 1000.0);
@@ -1592,6 +1597,16 @@ fn feed_tick(o: &RunOpts, st: &mut FeedState) -> Vec<Vec<i16>> {
 }
 
 /// 麦克风模式：把当前已经到达的帧全部取走（非阻塞）。
+/// 用完就把帧缓冲还给采集线程。
+///
+/// 实时回调要"零分配"就得让缓冲循环起来:每丢一个 `Vec`,采集线程下次都得多
+/// 分配一次(见 `audio::Capture::recycle` 与 `CaptureStats::pool_misses`)。
+fn recycle_frame(cap: &Option<audio::Capture>, buf: Vec<i16>) {
+    if let Some(c) = cap {
+        c.recycle(buf);
+    }
+}
+
 fn drain_mic(cap: &Option<audio::Capture>) -> Vec<Vec<i16>> {
     let mut out = Vec::new();
     if let Some(c) = cap {
@@ -1611,6 +1626,34 @@ fn drain_mic(cap: &Option<audio::Capture>) -> Vec<Vec<i16>> {
 fn dropped_now(cap: &Option<audio::Capture>) -> u64 {
     cap.as_ref()
         .map(|c| c.stats.frames_dropped.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// 采集回调**被迫新开缓冲区**的累计次数(T6.3 的实时性判据)。
+///
+/// 稳态下它不该再涨:下游用完把帧缓冲还回去(见 `recycle_frame`),回调就能一直复用。
+/// 它一直涨 = 实时线程还在分配,那条路上迟早会出现卡顿。
+fn pool_misses_now(cap: &Option<audio::Capture>) -> u64 {
+    cap.as_ref()
+        .map(|c| c.stats.pool_misses.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+fn recycle_failed_now(cap: &Option<audio::Capture>) -> u64 {
+    cap.as_ref()
+        .map(|c| c.stats.recycle_failed.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+fn pool_reuse_now(cap: &Option<audio::Capture>) -> u64 {
+    cap.as_ref()
+        .map(|c| c.stats.pool_reuse.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+fn frames_out_now(cap: &Option<audio::Capture>) -> u64 {
+    cap.as_ref()
+        .map(|c| c.stats.frames_out.load(Ordering::Relaxed))
         .unwrap_or(0)
 }
 
@@ -1728,6 +1771,10 @@ fn tail_tick(
         }
         n += 1;
         send_frame(side, &fr, fails);
+        // feed 模式下这几帧是引擎自己造的,还回去没有意义(不是池里的);真麦克风才还。
+        if o.feed.is_none() {
+            recycle_frame(cap, fr);
+        }
     }
     let now = Instant::now();
     let quiet_ok = t.quiet >= o.tail.quiet_ms as f64;
@@ -1773,7 +1820,17 @@ fn finish_with_pad(side: &mut Sidecar, o: &RunOpts, t: &mut Tail, text_idle_ms: 
 /// 只有 `--lazy-mic`（松手就释放麦克风）才是每句重新起算。
 /// 以前这个数字只在 `probe` 子命令里打印，run 模式里丢了帧也看不出来 ——
 /// 「吞字」排查的第一个问题就是「音频到底丢没丢」，不能没有它。
-fn report_tail(o: &RunOpts, t: &Tail, abs_ms: u128, why: &str, dropped: u64) {
+fn report_tail(
+    o: &RunOpts,
+    t: &Tail,
+    abs_ms: u128,
+    why: &str,
+    dropped: u64,
+    misses: u64,
+    recycle_failed: u64,
+    reuse: u64,
+    out: u64,
+) {
     let dur = t.start.elapsed().as_millis();
     let quiet_rms = if t.quiet_frames > 0 {
         t.quiet_rms_sum / t.quiet_frames as f64
@@ -1782,7 +1839,7 @@ fn report_tail(o: &RunOpts, t: &Tail, abs_ms: u128, why: &str, dropped: u64) {
     };
     if let Some(l) = &o.log {
         l.line(&format!(
-            "T {abs_ms:6}ms  松键→收尾 {dur}ms | 尾巴真音频 {} 帧 | 连续安静 {:.0}ms | 底噪 RMS {:.4} | 补 {}ms 底噪 | 模型停吐 {:.0}ms | 峰值 RMS {:.4} | 累计丢帧 {dropped} | {why}",
+            "T {abs_ms:6}ms  松键→收尾 {dur}ms | 尾巴真音频 {} 帧 | 连续安静 {:.0}ms | 底噪 RMS {:.4} | 补 {}ms 底噪 | 模型停吐 {:.0}ms | 峰值 RMS {:.4} | 累计丢帧 {dropped} | 帧池 出{out} 未命中{misses} 复用{reuse} 回收失败{recycle_failed} | {why}",
             t.voiced_frames, t.quiet, quiet_rms, o.tail.pad_ms, t.text_idle_at_end, t.rms_max
         ));
     }
@@ -1949,6 +2006,7 @@ fn worker(
                     if tail.is_some() {
                         for fr in drain_mic(&cap) {
                             send_frame(&mut side, &fr, &mut side_fails);
+                            recycle_frame(&cap, fr);
                         }
                         for fr in feed_tick(&o, &mut fst) {
                             send_frame(&mut side, &fr, &mut side_fails);
@@ -1961,7 +2019,17 @@ fn worker(
                             finish_with_pad(&mut side, &o, t, text_idle_ms);
                         }
                         if let Some(t) = tail.take() {
-                            report_tail(&o, &t, t0.elapsed().as_millis(), "被下一次按下打断", dropped);
+                            report_tail(
+                                &o,
+                                &t,
+                                t0.elapsed().as_millis(),
+                                "被下一次按下打断",
+                                dropped,
+                                pool_misses_now(&cap),
+                                recycle_failed_now(&cap),
+                                pool_reuse_now(&cap),
+                                frames_out_now(&cap),
+                            );
                         }
                         stage = Stage::AwaitFinal;
                     }
@@ -2122,6 +2190,9 @@ fn worker(
                     // 乘 6 再钳到 0..1,让"正常说话"能占到波形高度的 6~7 成。
                     ov_level(&o.overlay, frame_rms(&f) * 6.0);
                     send_frame(&mut side, &f, &mut side_fails);
+                    // 用完就还(T6.3):**这是生产路径上最主要的取帧处**,
+                    // 漏了它,回调里每帧都得新开一个 Vec —— 实测"池未命中"会随句数线性涨。
+                    recycle_frame(&cap, f);
                     got += 1;
                     if got >= 32 {
                         break;
@@ -2162,7 +2233,17 @@ fn worker(
             };
             if finished {
                 if let Some(t) = tail.take() {
-                    report_tail(&o, &t, t0.elapsed().as_millis(), "安静了/到上限", dropped_now(&cap));
+                    report_tail(
+                        &o,
+                        &t,
+                        t0.elapsed().as_millis(),
+                        "安静了/到上限",
+                        dropped_now(&cap),
+                        pool_misses_now(&cap),
+                        recycle_failed_now(&cap),
+                        pool_reuse_now(&cap),
+                        frames_out_now(&cap),
+                    );
                 }
                 stage = Stage::AwaitFinal;
                 println!("[sainput] ○ 尾巴收完，识别中……");
@@ -2185,7 +2266,11 @@ fn worker(
             // (「什么都没在做」的空闲状态不会走到这里 —— 那种情况下循环开头
             //  已经阻塞在热键通道上了。)
             if let Some(c) = &cap {
-                while c.rx.try_recv().is_ok() {} // 常驻麦:这期间的帧不属于这一句,排掉防堆积
+                // 常驻麦:这期间的帧不属于这一句,排掉防堆积 —— 但**排掉也要还**
+                // (T6.3):不还的话回调里每帧都得新开缓冲,实时线程一直在分配。
+                while let Ok(f) = c.rx.try_recv() {
+                    c.recycle(f);
+                }
             }
             match side.rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(m) => buf.push(m),
@@ -2201,7 +2286,10 @@ fn worker(
         } else {
             let mut errored = false;
             if let Some(c) = &cap {
-                while c.rx.try_recv().is_ok() {} // 常驻模式:空闲时排掉,防堆积
+                // 空闲期排掉堆积(不属于任何一句),但**排掉也要还**(T6.3)。
+                while let Ok(f) = c.rx.try_recv() {
+                    c.recycle(f);
+                }
                 // 驱动报过错 = 这条流已经不可信。留着它,下次按下热键只会
                 // 收不到任何音频(用户看到「没输入」);丢掉它,下一次
                 // audio::start 会重新打开麦克风。
