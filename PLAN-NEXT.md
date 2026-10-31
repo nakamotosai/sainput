@@ -53,6 +53,27 @@
 不变量:①**只提前定稿,绝不重复上屏**(T4.1/T4.2 的守卫仍然在);②**定稿文本 = 超时那一刻的最后一条 partial**
 (不拼接、不猜测);③默认值保守,**先用 latency_report 做 A/B,不达标就回退**。
 
+**✅ 已实现并验过(2026-10-31 晚)** —— 收尾硬上限,松手后不再干等模型:
+
+改了什么(`crates/sainput-cli/src/main.rs`):
+- 进 `AwaitFinal` 开始计时;**到点(`final_wait_ms`,默认 1200ms)就把最后一条 partial
+  当成一次"先上屏"打出去**(reason=`cap`),然后照常等真 final;
+- cap **不是**这一句的结束:真 final 到了仍走 `finish` 那条路,关键模式的 `finalize` 是
+  **差额补打**(common_prefix + 只打尾巴),所以晚到的那版只是把最后那个字补上 ——
+  既不重复上屏,也不会把"最后一个字"判死;
+- 没有非空 partial 时**不触发**(宁可等,也不把这一句打脏);
+- **组合态(`is_compose`)不参与**:那条路 `finalize` 是整段一次提交,同一句提交两次会重字;
+- 阈值:`SAINPUT_FINAL_WAIT_MS`(0 = 关掉,退回旧行为)。
+
+实测(假侧车,`--feed tmp/zh-en.wav --feed-release-at 1.0 --dry-run`):
+```
+SAINPUT_FINAL_WAIT_MS=400,脚本在 2500ms 后才给真 final:
+  ! 收尾硬上限 400ms 到点(实际等 404ms)→ 先把当前最好的一版打上屏(reason=cap,真 final 到了再补)
+  F   4170ms  (cap)     第一句完整
+  F   4503ms  (finish)  第一句完整      ← 真 final 仍在,没被丢掉
+```
+回归:`tools/test_race_guards.py` **4/4 PASS**(含 T4.1/T4.2 迟到帧、T4.3 焦点守卫对照组)。
+
 **改动点已落到行(下一次直接改,别再从头找)**:
 - 等模型的分支:`main.rs` 里 `} else if stage == Stage::AwaitFinal {`(2026-10-31 时是第 2347 行);
 - **定稿要走既有函数 `handle_msg`**(同文件里 `handle_msg(msg, &mut wr, &ui)`)——

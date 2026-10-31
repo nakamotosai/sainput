@@ -1065,7 +1065,8 @@ fn handle_msg(m: Msg, wr: &mut inject::StreamWriter, ui: &Ui) -> bool {
                 if overlay_mode() == 1 {
                     if let Some(ov) = ov_get() {
                         if text.is_empty() {
-                            if reason == "finish" {
+                            // `cap` 和 `finish` 一样是"这一句结束了",空文本就该把细条收掉。
+                            if reason == "finish" || reason == "cap" {
                                 ov.hide();
                             }
                         } else {
@@ -1900,6 +1901,25 @@ fn worker(
     // (屏幕上从「你好世界」变成「迟到的一帧」)。定稿就是定稿 —— 之后这一句的
     // streaming 一律不认,直到下一次按下。
     let mut finalized = false;
+    // 收尾硬上限(用户第一诉求):**松手就是说完**,最多再等模型 `final_wait_ms`,
+    // 到点就用"当前最好的一版"定稿,不许无限等。
+    //
+    // 慢的根因不是算力(实测这个模型 RTF 只有 0.19):它是流式模型,最后一段字要等
+    // "听到后面 160ms 音频"才肯吐。松手时补底噪就是给它这段"未来",但补完仍可能拖到
+    // 600ms+ 才吐出最后一个字 —— 用户体感就是"最后那个字被吃掉了"(见 PLAN-NEXT)。
+    // 上限到点:拿最后一条 partial 定稿(reason=`cap`)。
+    // 阈值:`SAINPUT_FINAL_WAIT_MS`(默认 1200;填 0 = 关掉,退回旧行为)。
+    let final_wait_ms: u128 = std::env::var("SAINPUT_FINAL_WAIT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(1200);
+    // 进入"等定稿"的时刻:上限从这里起算(离开 AwaitFinal 就清,下一句重新算)。
+    let mut await_since: Option<Instant> = None;
+    // 最后一条 streaming partial = "当前最好的一版"。上限到点就拿它定稿。
+    // 只留一条、每句清空,不累积。
+    let mut last_partial: Option<(String, String)> = None;
+    // 上限已经触发过(别再触发第二次)。
+    let mut cap_fired = false;
     // TSF 通道这次运行里**坏过**吗(版本不匹配 / 端点没了 / 对面崩了)?
     // 坏过就一直退到 auto 那条通道 —— 一句一句地重试一个坏通道,用户看到的是「说了半天一个字都没上屏」。
     let mut tsf_fallback = false;
@@ -2177,6 +2197,10 @@ fn worker(
                     }
                     stage = Stage::Recording;
                     finalized = false;
+                    // 新的一句:上限重新起算,上一句的 partial 不能带过来定稿。
+                    await_since = None;
+                    last_partial = None;
+                    cap_fired = false;
                     utterances += 1;
                     // feed 测试模式：新的一句从 wav 头重放（否则第二句只有静音）
                     fst.begin_utterance();
@@ -2357,6 +2381,40 @@ fn worker(
                     c.recycle(f);
                 }
             }
+            // 收尾硬上限:到点就把当前最好的一版**先打上屏**,不再干等模型。
+            //
+            // 只在上限到点、**且手上真有一版非空文字**时才动手 —— 没有文字可上屏时
+            // 触发等于白打一枪(还可能把这一句弄脏),宁可继续等。
+            //
+            // 为什么**排除组合态(`is_compose`)**:那条路 `finalize` 是"整段一次提交",
+            // 同一句提交两次会在应用里出现两遍;而真 final 马上就到,不值得为几百毫秒
+            // 冒重字的险。关键模式(`WmChar`/`SendInput`/`TSF`)走的是**差额补打**
+            // (见 inject.rs `finalize`:common_prefix + 只打尾巴),先打一版再补尾巴是安全的。
+            //
+            // 定稿走的是和真 final **完全相同**的那条路:塞进 `buf`,由下面 3) 的
+            // 处理块落地 —— T4.1/T4.2 的守卫(定稿后不认迟到帧、不重复上屏)全都在那边,
+            // 超出 max_bs 时整笔放弃的账实一致保护也在那边。
+            if !cap_fired && final_wait_ms > 0 && !wr.mode().is_compose() {
+                if let Some(since) = await_since {
+                    let waited = since.elapsed().as_millis();
+                    if waited >= final_wait_ms {
+                        if let Some((text, raw)) = last_partial.clone().filter(|(t, _)| !t.is_empty()) {
+                            cap_fired = true;
+                            if let Some(l) = o.log.as_ref() {
+                                l.line(&format!(
+                                    "! 收尾硬上限 {}ms 到点(实际等 {}ms)→ 先把当前最好的一版打上屏(reason=cap,真 final 到了再补)",
+                                    final_wait_ms, waited
+                                ));
+                            }
+                            println!(
+                                "[sainput] ⏱ 等定稿超过 {}ms,先把现在的文字打上屏(真定稿到了再补尾巴)",
+                                final_wait_ms
+                            );
+                            buf.push(Msg::Final { text, raw, reason: "cap".into() });
+                        }
+                    }
+                }
+            }
             match side.rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(m) => buf.push(m),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -2450,6 +2508,15 @@ fn worker(
             }
         }
 
+        // 收尾上限的秒表:进 AwaitFinal 开始算,离开就清(所以下一句是重新起算的)。
+        if stage == Stage::AwaitFinal {
+            if await_since.is_none() {
+                await_since = Some(Instant::now());
+            }
+        } else {
+            await_since = None;
+        }
+
         side.drain(&mut buf);
         for m in buf.drain(..) {
             // 空闲状态下迟到的东西一律丢掉(别把已经上屏的字擦掉、也别让
@@ -2465,6 +2532,13 @@ fn worker(
                 }
                 continue;
             }
+            // `cap` = 收尾硬上限到点时,我们**自己**把"当前最好的一版"先打上屏的那一次
+            // (见 `final_wait_ms`)。它 **不是**这一句的结束:真 final 通常还在路上,
+            // 到了以后照常走 finish 那条路 —— 关键模式下 `finalize` 是**差额补打**
+            // (common_prefix + 只打多出来的尾巴),所以晚到的那一版只会把最后那个字补上,
+            // 不会重复上屏、也不会把这一句判死。
+            // 所以这里**不能**把 cap 归进 is_final_finish:那会让 stage 提前变 Idle,
+            // 之后真 final 反而被当迟到帧丢掉 —— 用户的"最后一个字"就真没了。
             let is_final_finish = matches!(&m, Msg::Final { reason, .. } if reason == "finish");
             let is_final_endpoint = matches!(&m, Msg::Final { reason, .. } if reason == "endpoint");
             let ui = Ui {
@@ -2476,14 +2550,20 @@ fn worker(
                 t0,
                 focus_ok: !focus_lost,
             };
-            if matches!(&m, Msg::Partial { .. }) {
+            if let Msg::Partial { text, raw, .. } = &m {
                 last_text_at = Instant::now();
+                // 记下"当前最好的一版":收尾上限到点时靠它定稿(见 `final_wait_ms`)。
+                last_partial = Some((text.clone(), raw.clone()));
             }
             // 上下文偏置：定稿时记下这句的**原文**（不是渲染后的文本 ——
             // 渲染层做过标点/空格整形，拿来抽术语反而更脏）。要在 handle_msg 之前取。
-            if let Msg::Final { text, raw, .. } = &m {
-                let rec = if raw.is_empty() { text.as_str() } else { raw.as_str() };
-                history.push(rec);
+            if let Msg::Final { text, raw, reason } = &m {
+                // cap 是"先打上屏的那一版",不是这一句的终稿:别让它进上下文偏置历史
+                // (否则同一句会进两次,抽术语时算重)。
+                if reason != "cap" {
+                    let rec = if raw.is_empty() { text.as_str() } else { raw.as_str() };
+                    history.push(rec);
+                }
             }
             // 组合态下 `injected` 一直是空的,所以"退档重来"就是整句一次落地,不丢字。
             // 只在组合态才克隆消息(便宜),别的模式不白花这一次拷贝。
