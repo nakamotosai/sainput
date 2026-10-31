@@ -1626,6 +1626,9 @@ fn with_target(
             }
         };
         *slot = Some(RtCache { factory, rt, target, bound: Some(want) });
+        // 新目标 = 旧目标上的画刷作废(画刷绑在目标上,拿旧的去画会画不出来或直接报错)。
+        // 只在**新建**这一支丢;单纯重新 BindDC 不动画刷对象。
+        invalidate_dwrite_brush();
     }
 
     // 只有「绑的东西变了」才重新 BindDC —— DC 和矩形都没变就不动它。
@@ -2170,6 +2173,93 @@ fn hue_to_rgb(h: f32) -> (f32, f32, f32) {
 }
 
 /// 细条的文字绘制：**只有正文一行**，垂直居中。
+/// DWrite 资源缓存(T6.4)。
+///
+/// D2D 的 factory / render target 早就缓存了(见 `with_target` 里那段 247ms/帧的教训),
+/// 但**文字**这条路上每帧还在重建三样:`IDWriteFactory`、`IDWriteTextFormat`、那支画刷。
+/// 上屏是逐帧发生的,这三样白付的开销加起来就是"每次上屏多花的钱"。
+///
+/// 缓存口径:
+/// - factory:进程级共享(`DWRITE_FACTORY_TYPE_SHARED`),建一次就够;
+/// - TextFormat:**按字号缓存**(字号 = `BAR_FONT × DPI 缩放`),缩放变了才重建 ——
+///   插拔显示器/改 DPI 之后自动跟着变,不会拿旧字号糊上去;
+/// - 画刷:**绑在 D2D 目标上**,目标重建时必须丢掉(见 `invalidate_dwrite_brush`)。
+///
+/// 计数是可机检判据:"画 N 帧之后只应该是 (1,1,1)"。
+///
+/// ⚠️ 计数是**全局原子**,不能放进 `DwCache`(那是 thread_local):绘制跑在 overlay
+/// 自己的窗口线程上,而读计数的人在主线程 —— 用 thread_local 读到的永远是 0,
+/// 探针会给出一个"0 ≤ 1 所以 PASS"的假绿(踩过)。
+static N_FACTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static N_FORMAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static N_BRUSH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct DwCache {
+    factory: Option<windows::Win32::Graphics::DirectWrite::IDWriteFactory>,
+    format: Option<(i32, windows::Win32::Graphics::DirectWrite::IDWriteTextFormat)>,
+    ink: Option<windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush>,
+}
+
+impl Default for DwCache {
+    fn default() -> Self {
+        Self {
+            factory: None,
+            format: None,
+            ink: None,
+        }
+    }
+}
+
+thread_local! {
+    static DW: std::cell::RefCell<DwCache> = std::cell::RefCell::new(DwCache::default());
+}
+
+/// 三类资源的创建次数(factory / TextFormat / 画刷)—— 测试与排障用。
+pub fn dwrite_create_counts() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        N_FACTORY.load(Ordering::Relaxed),
+        N_FORMAT.load(Ordering::Relaxed),
+        N_BRUSH.load(Ordering::Relaxed),
+    )
+}
+
+/// 丢掉画刷缓存:D2D 目标重建时调 —— 画刷绑在目标上,旧目标那份不能用。
+fn invalidate_dwrite_brush() {
+    DW.with(|d| d.borrow_mut().ink = None);
+}
+
+/// 请求**绘制线程**在下一次绘制前丢掉三样缓存(计数不动)。
+///
+/// 为什么是"请求"而不是直接清:缓存和计数一样住在 **overlay 自己的线程**里
+/// (`thread_local`),从别的线程直接清只会清到调用者自己那份空缓存(踩过两次)。
+/// 这个标志是跨线程让绘制线程丢弃缓存的标准做法,探针自校准就用它。
+pub fn dwrite_schedule_drop_cache() {
+    DROP_NEXT.store(true, Ordering::Relaxed);
+}
+
+/// 绘制线程侧:该丢就在下一次绘制前丢掉。
+fn take_drop_request() {
+    if DROP_NEXT.swap(false, Ordering::Relaxed) {
+        DW.with(|d| {
+            let mut g = d.borrow_mut();
+            g.factory = None;
+            g.format = None;
+            g.ink = None;
+        });
+    }
+}
+
+static DROP_NEXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 计数归零(缓存不动)。给探针把"两段测试"分开记账。
+pub fn dwrite_reset_counts() {
+    use std::sync::atomic::Ordering;
+    N_FACTORY.store(0, Ordering::Relaxed);
+    N_FORMAT.store(0, Ordering::Relaxed);
+    N_BRUSH.store(0, Ordering::Relaxed);
+}
+
 fn draw_bar_text(
     target: &windows::Win32::Graphics::Direct2D::ID2D1RenderTarget,
     body: &windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F,
@@ -2179,61 +2269,109 @@ fn draw_bar_text(
     use windows::Win32::Graphics::Direct2D as d2d;
     use windows::Win32::Graphics::Direct2D::Common as d2dc;
     use windows::Win32::Graphics::DirectWrite::{
-        DWriteCreateFactory, IDWriteFactory, DWRITE_FACTORY_TYPE_SHARED,
+        DWriteCreateFactory, DWRITE_FACTORY_TYPE_SHARED,
         DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
         DWRITE_FONT_WEIGHT_NORMAL, DWRITE_MEASURING_MODE_NATURAL,
         DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
     };
 
-    unsafe {
-        let dwrite: IDWriteFactory = match DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) {
-            Ok(f) => f,
-            Err(e) => { eprintln!("[ov] DWriteCreateFactory failed: {e:?}"); return; }
-        };
-        let face = wide("Microsoft YaHei UI");
-        let f_text = match dwrite.CreateTextFormat(
-            PCWSTR(face.as_ptr()),
-            None,
-            DWRITE_FONT_WEIGHT_NORMAL,
-            DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-            BAR_FONT * scale(),
-            PCWSTR(wide("zh-CN").as_ptr()),
-        ) {
-            Ok(f) => f,
-            Err(e) => { eprintln!("[ov] CreateTextFormat failed: {e:?}"); return; }
-        };
+    take_drop_request();
+    // 字号随 DPI 缩放变;它变了才需要换 TextFormat。
+    let size_key = (BAR_FONT * scale()).round() as i32;
 
-        // ⚠️ DrawText 默认是**左上对齐**。不设这两项的话，文字会贴着面板上边
-        // 往右排 —— 看起来就是"歪的"（用户实测指出）。
-        //   PARAGRAPH_ALIGNMENT_CENTER → 垂直居中
-        //   TEXT_ALIGNMENT_CENTER      → 水平居中
-        let _ = f_text.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        let _ = f_text.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-
-        let tx = wide(text);
-        let rect = d2dc::D2D_RECT_F {
-            left: body.left + px(BAR_PAD_X) as f32,
-            top: body.top,
-            right: body.right - px(BAR_PAD_X) as f32,
-            bottom: body.bottom,
-        };
-        if let Ok(br) = target.CreateSolidColorBrush(&argb(BAR_INK) as *const _, None) {
-            let _ = target.DrawText(
-                &tx[..tx.len().saturating_sub(1)],
-                &f_text,
-                &rect,
-                &br,
-                d2d::D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
+    // ⚠️ 从缓存里**克隆出来用**,不要握着 `RefCell` 的借用去调 D2D:
+    // 绘制路径里再碰一次这个 thread_local 就是借用冲突(panick)。
+    // COM 克隆只加一次引用计数,比每帧重建便宜得多。
+    let pair = DW.with(|d| {
+        let mut g = d.borrow_mut();
+        if g.factory.is_none() {
+            match unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) } {
+                Ok(f) => {
+                    g.factory = Some(f);
+                    N_FACTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e) => {
+                    eprintln!("[ov] DWriteCreateFactory failed: {e:?}");
+                    return None;
+                }
+            }
         }
+        let need_format = !matches!(&g.format, Some((k, _)) if *k == size_key);
+        if need_format {
+            let dwrite = g.factory.as_ref()?;
+            let face = wide("Microsoft YaHei UI");
+            match unsafe {
+                dwrite.CreateTextFormat(
+                    PCWSTR(face.as_ptr()),
+                    None,
+                    DWRITE_FONT_WEIGHT_NORMAL,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    BAR_FONT * scale(),
+                    PCWSTR(wide("zh-CN").as_ptr()),
+                )
+            } {
+                Ok(f) => {
+                    // ⚠️ DrawText 默认是**左上对齐**。不设这两项,文字会贴着面板上边往右排
+                    // ——看起来就是"歪的"(用户实测指出)。
+                    unsafe {
+                        let _ = f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                        let _ = f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    }
+                    g.format = Some((size_key, f));
+                    N_FORMAT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e) => {
+                    eprintln!("[ov] CreateTextFormat failed: {e:?}");
+                    return None;
+                }
+            }
+        }
+        if g.ink.is_none() {
+            match unsafe { target.CreateSolidColorBrush(&argb(BAR_INK) as *const _, None) } {
+                Ok(b) => {
+                    g.ink = Some(b);
+                    N_BRUSH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(_) => return None,
+            }
+        }
+        Some((g.format.as_ref()?.1.clone(), g.ink.as_ref()?.clone()))
+    });
+
+    let Some((f_text, br)) = pair else { return };
+    let tx = wide(text);
+    let rect = d2dc::D2D_RECT_F {
+        left: body.left + px(BAR_PAD_X) as f32,
+        top: body.top,
+        right: body.right - px(BAR_PAD_X) as f32,
+        bottom: body.bottom,
+    };
+    unsafe {
+        let _ = target.DrawText(
+            &tx[..tx.len().saturating_sub(1)],
+            &f_text,
+            &rect,
+            &br,
+            d2d::D2D1_DRAW_TEXT_OPTIONS_CLIP,
+            DWRITE_MEASURING_MODE_NATURAL,
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T6.4:画 N 帧,DWrite 的 factory / TextFormat / 画刷只该各建**一次**。
+    ///
+    /// 判据用**计数**而不是计时:计时在这台机器上会被调度噪声淹没(CI 上更飘),
+    /// 而"重建了几次"是确定的整数 —— 一旦退化回"每帧重建",这条立刻红。
+    #[test]
+    // T6.4 的判据**不做成单测**:这个文件里能建的只是内存 DC + D2D 目标,而 DWrite 的
+    // **文字**绘制在那条路上会挂住(实测:测试名打印出来之后 240s 超时)。生产里画字是在
+    // 有窗口、有消息循环的那条线程上 —— 判据因此改成 `examples/dwritecache.rs` 探针:
+    // 真窗口里推 N 帧,再读 `dwrite_create_counts()`。
 
     /// 回归：D2D 目标失效后必须丢掉缓存，并在下一帧重建。
     ///
