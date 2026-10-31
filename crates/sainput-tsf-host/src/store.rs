@@ -748,121 +748,82 @@ struct StoreVtbl {
 
 // ---------------------------------------------------------------- 建上下文
 
-/// `VARIANT`:`VT_I4` + 0。
+/// 向 TSF 报一次**初始状态**(文本变了 + 选区变了)。
 ///
-/// 大小要对得上:C 的 `VARIANT` 在 x64 是 **24** 字节、在 x86 是 **16** 字节 ——
-/// 用 `[usize; 2]` 当联合体正好两边都对(我们只需要"全零 + `VT_I4`")。
-#[repr(C)]
-struct Variant {
-    vt: u16,
-    r1: u16,
-    r2: u16,
-    r3: u16,
-    val: [usize; 2],
-}
+/// `ITextStoreACPSink::OnTextChange(dwFlags=0, pChange=NULL)` = "内容全变了";
+/// `OnSelectionChange()` = "选区变了"。这两条是**应用**告诉 TSF "我这里有什么"的
+/// 唯一途径,不报的话 msctf 眼里这个上下文就是空的。
+/// 从上下文 QI `ITextStoreACPSink`(应用那条"告诉 TSF 我变了"的通道)。
+const IID_ITEXTSTORE_ACP_SINK: Guid =
+    Guid::from_parts(0x22D4_4C94, 0xA419, 0x4542, [0xA2, 0x72, 0xAE, 0x26, 0x09, 0x3E, 0xCE, 0xCF]);
 
-impl Variant {
-    /// `VT_I4` + 0。**类型必须对**:官方"预定义隔间"表里
-    /// `GUID_COMPARTMENT_EMPTYCONTEXT` 写的是 `VT_I4` ——
-    /// 我试过 `VT_BOOL`,`SetValue` 直接回 `E_INVALIDARG`,隔间根本没设上,
-    /// 于是写事务照样被驳回(排查时白跑一轮)。
-    fn i4(v: i32) -> Self {
-        let mut out = Variant {
-            vt: 3, // VT_I4
-            r1: 0,
-            r2: 0,
-            r3: 0,
-            val: [0, 0],
-        };
-        out.val[0] = v as usize;
-        out
-    }
-}
-
-const IID_ITF_COMPARTMENT_MGR: Guid =
-    Guid::from_parts(0x7DCF_57AC, 0x18AD, 0x438B, [0x82, 0x4D, 0x97, 0x9B, 0xFF, 0xB7, 0x4B, 0x7C]);
-const GUID_COMPARTMENT_EMPTYCONTEXT: Guid =
-    Guid::from_parts(0xD748_7DBF, 0x804E, 0x41C5, [0x89, 0x4D, 0xAD, 0x96, 0xFD, 0x4E, 0xEA, 0x13]);
-
-#[repr(C)]
-struct CompartmentMgrVtbl {
-    query_interface: usize,
-    add_ref: usize,
-    release: usize,
-    get_compartment: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> Hresult,
-}
-
-#[repr(C)]
-struct CompartmentVtbl {
-    query_interface: usize,
-    add_ref: usize,
-    release: usize,
-    set_value: unsafe extern "system" fn(*mut c_void, u32, *const Variant) -> Hresult,
-    get_value: usize,
-}
-
-unsafe fn mark_context_not_empty(ctx: *mut c_void, tid: u32, log: &Log) {
+unsafe fn fetch_acp_sink(ctx: *mut c_void, log: &Log) -> *mut c_void {
     if ctx.is_null() {
-        return;
+        return std::ptr::null_mut();
     }
-    log.line(&format!("store 准备标记非空:ctx={ctx:p} tid={tid}"));
     let cvt = unsafe { *(ctx as *const *const UnknownVtbl) };
-    log.line(&format!("store ctx vtable={cvt:p}"));
-    let mut mgr: *mut c_void = std::ptr::null_mut();
-    let iid = IID_ITF_COMPARTMENT_MGR;
-    let hr = unsafe { ((*cvt).query_interface)(ctx, &iid, &mut mgr) };
+    let mut out: *mut c_void = std::ptr::null_mut();
+    let hr = unsafe { ((*cvt).query_interface)(ctx, &IID_ITEXTSTORE_ACP_SINK, &mut out) };
     log.line(&format!(
-        "store QI(ITfCompartmentMgr) hr={hr:#x} mgr={mgr:p}"
+        "store 自取 ITextStoreACPSink(从上下文) hr={hr:#x} sink={out:p}"
     ));
-    if hr != 0 || mgr.is_null() {
-        return;
+    if hr == 0 { out } else { std::ptr::null_mut() }
+}
+
+unsafe fn notify_initial(store_ptr: *mut c_void, ctx: *mut c_void, log: &Log) {
+    // 只用到前两个方法,单独声明一张**带类型**的 vtable(前缀里的那两个字段是 usize)。
+    #[repr(C)]
+    struct CallVtbl {
+        query_interface: usize,
+        add_ref: usize,
+        release: usize,
+        on_text_change: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> Hresult,
+        on_selection_change: unsafe extern "system" fn(*mut c_void) -> Hresult,
     }
-    let mvt = unsafe { *(mgr as *const *const CompartmentMgrVtbl) };
-    let mut comp: *mut c_void = std::ptr::null_mut();
-    let key = GUID_COMPARTMENT_EMPTYCONTEXT;
-    let hr = unsafe { ((*mvt).get_compartment)(mgr, &key, &mut comp) };
-    log.line(&format!("store GetCompartment(EMPTYCONTEXT) hr={hr:#x}"));
-    if hr != 0 || comp.is_null() {
-        return;
+    let st = store(store_ptr);
+    let mut sink = st.lock().sink;
+    if sink.is_null() {
+        // msctf 没有主动把 sink 递给我们(实测:整轮都不调 `AdviseSink`)。
+        // 那就照 Chromium 的做法**自己从上下文要**:`ITfContext::QueryInterface(
+        // IID_ITextStoreACPSink)` —— 这是应用拿到自己那条通知通道的正路。
+        sink = fetch_acp_sink(ctx, log);
+        if sink.is_null() {
+            log.line("store 报初始状态:拿不到 ITextStoreACPSink,跳过");
+            return;
+        }
+        st.lock().sink = sink;
     }
-    let cvt2 = unsafe { *(comp as *const *const CompartmentVtbl) };
-    let v = Variant::i4(0); // 0 = "这个上下文不是空的"
-    let hr = unsafe { ((*cvt2).set_value)(comp, tid, &v) };
+    let vt = unsafe { *(sink as *const *const CallVtbl) };
+    let hr_t = unsafe { ((*vt).on_text_change)(sink, 0, std::ptr::null_mut()) };
+    let hr_s = unsafe { ((*vt).on_selection_change)(sink) };
     log.line(&format!(
-        "store SetValue(EMPTYCONTEXT=FALSE) hr={hr:#x} —— '非空'声明完成"
+        "store 报初始状态 OnTextChange hr={hr_t:#x} OnSelectionChange hr={hr_s:#x}"
     ));
 }
 
-/// 也往**线程管理器的全局隔间**上写一份。
+
+/// 只把本进程的 TSF 线程管理器**拉起来**(`TF_CreateThreadMgr` + `Activate`),
+/// 不建任何存储/文档。返回线程管理器。
 ///
-/// 为什么两个地方都写:隔离间是按上下文存的,但"这个上下文是不是空的"也可能由
-/// 全局隔间决定(TSF 的两层模型)。实测要哪个只有试过才知道,所以两边都写、都记数。
-unsafe fn mark_thread_not_empty(tm: *mut c_void, tid: u32, log: &Log) {
-    if tm.is_null() {
-        return;
+/// 为什么需要它:真控件(RichEdit/写字板那一族)是在**拿到焦点那一刻**向 TSF
+/// 注册自己的文本存储的。要是进程里 TSF 还没 `Activate` 就去抢焦点,那一刻就
+/// 白白过去,`GetFocus` 会一直空 —— 实测(2026-10-31)就是这么空的。
+pub unsafe fn init_thread_mgr(log: &Log) -> Option<*mut c_void> {
+    let Some(tf_create) = (unsafe { crate::tip::resolve_msctf_create() }) else {
+        log.line("tfinit 拿不到 TF_CreateThreadMgr");
+        return None;
+    };
+    let mut tm: *mut c_void = std::ptr::null_mut();
+    let hr = unsafe { tf_create(&mut tm) };
+    if hr != 0 || tm.is_null() {
+        log.line(&format!("tfinit TF_CreateThreadMgr hr={hr:#x}"));
+        return None;
     }
-    let tvt = unsafe { *(tm as *const *const UnknownVtbl) };
-    let mut mgr: *mut c_void = std::ptr::null_mut();
-    let iid = IID_ITF_COMPARTMENT_MGR;
-    let hr = unsafe { ((*tvt).query_interface)(tm, &iid, &mut mgr) };
-    log.line(&format!(
-        "store QI(线程全局 ITfCompartmentMgr) hr={hr:#x} mgr={mgr:p}"
-    ));
-    if hr != 0 || mgr.is_null() {
-        return;
-    }
-    let mvt = unsafe { *(mgr as *const *const CompartmentMgrVtbl) };
-    let mut comp: *mut c_void = std::ptr::null_mut();
-    let key = GUID_COMPARTMENT_EMPTYCONTEXT;
-    let hr = unsafe { ((*mvt).get_compartment)(mgr, &key, &mut comp) };
-    log.line(&format!("store 全局 GetCompartment(EMPTYCONTEXT) hr={hr:#x}"));
-    if hr != 0 || comp.is_null() {
-        return;
-    }
-    let cvt = unsafe { *(comp as *const *const CompartmentVtbl) };
-    let v = Variant::i4(0);
-    let hr = unsafe { ((*cvt).set_value)(comp, tid, &v) };
-    log.line(&format!("store 全局 SetValue(EMPTYCONTEXT=FALSE) hr={hr:#x}"));
+    let tvt = unsafe { *(tm as *const *const ThreadMgrVtblPrefix) };
+    let mut tid: u32 = 0;
+    let hr = unsafe { ((*tvt).activate)(tm, &mut tid) };
+    log.line(&format!("tfinit ITfThreadMgr::Activate hr={hr:#x} tid={tid}"));
+    Some(tm)
 }
 
 /// 拿"当前焦点上下文"来探(不用假存储那条路:真实会话里标准控件的 TSF 兼容存储
@@ -984,10 +945,27 @@ pub unsafe fn create_context(
     // 我们这个是假存储,得自己声明。
     // 用 `GetTop` 拿到的那个上下文指针(`CreateContext` 交回来的那个实测不是
     // 能直接 QI 的接口指针 —— 拿它当 vtable 解引用会访问违例)。
-    unsafe { mark_context_not_empty(top, tid, log) };
-    unsafe { mark_thread_not_empty(tm, tid, log) };
+    // **不设** `GUID_COMPARTMENT_EMPTYCONTEXT`。
+    //
+    // 2026-10-31 更正:这里原先写着"不设 FALSE 就会被判定空上下文",那是错的。
+    // 证据两条:(a) 本机 SDK 的 `msctf.idl` 里 `TF_E_EMPTYCONTEXT`(0x80040509) 只是
+    // 一个返回码,与这个隔间没有文档上的因果关系;(b) Chromium(公认能跑的 TSF 宿主)
+    // 对**正常**上下文从不碰这个隔间 —— 它是 Win11 才有的"空存储"支持,只在**没有
+    // 文本存储**的 null store 上设成 `1`(那种上下文确实做不了组合态)。
+    // 实测:设 0 / 不设,对 `ITfContextComposition` 的可得性**没有影响**(都是
+    // `E_NOINTERFACE`),对写事务也没有 —— 所以这条弯路到此为止,不再设。
+    //
+    // 合成存储**真正**的上限见 HANDOFF §7 与 `PLAN-NEXT.md` 的 T1.4 行:
+    // msctf 建上下文时会向我们 QI 两个不在公开 SDK 里的接口,之后既不发
+    // `ITextStoreACPSink`、也不给组合态 —— 自搓的 `ITextStoreACP` 在它眼里不是
+    // 一等公民。要在真应用里验,不能在假存储上磨。
+    log.line("store 不设 EMPTYCONTEXT 隔间(对齐 Chromium;实测与组合态无关)");
     // 诊断:这个**上下文对象**到底支持哪些接口 —— 它决定 TSF 认不认这个上下文能接组合态。
     unsafe { probe_context_interfaces(top, log) };
-    log.line("store 上下文就绪:接下来薄壳可以 ITfContextComposition::StartComposition 了");
+    // 2026-10-31:我们**从没向 TSF 报过**任何文本/选区变化。真应用每改一次内容
+    // 都会经 sink 报一次,msctf 的"这个上下文有没有内容"很可能就看这个 ——
+    // 一回事不报,它就一直当这个上下文是空的(写事务回 `TF_E_EMPTYCONTEXT`)。
+    notify_initial(store_ptr, top, log);
+    log.line("store 上下文就绪(已向 TSF 报初始文本/选区)");
     Some((store_ptr, tm))
 }

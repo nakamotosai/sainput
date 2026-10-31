@@ -60,6 +60,14 @@ struct Msg {
     pt_y: i32,
 }
 
+#[link(name = "ole32")]
+extern "system" {
+    /// TSF 要求跑在 **COM 初始化过的**线程上(Chromium 那条 UI 线程就是)。
+    /// 这条我们一直缺:没它就靠 msctf 内部兜底,某些上下文服务(组合态就是其一)
+    /// 会直接以 `E_NOINTERFACE` 收场。
+    fn CoInitializeEx(pv: *mut std::ffi::c_void, dw: u32) -> i32;
+}
+
 #[link(name = "kernel32")]
 extern "system" {
     fn LoadLibraryW(name: *const u16) -> isize;
@@ -86,6 +94,7 @@ extern "system" {
     fn DefWindowProcW(h: isize, m: u32, w: usize, l: isize) -> isize;
     fn ShowWindow(h: isize, cmd: i32) -> i32;
     fn SetFocus(h: isize) -> isize;
+
     /// 在私有桌面上把自己顶到前台:引擎按"它的桌面上的前台窗口"决定往哪儿打字,
     /// 这张桌面上只有我们,所以这里失败也没关系,记进日志就行。
     fn SetForegroundWindow(h: isize) -> i32;
@@ -265,6 +274,9 @@ struct Args {
     store_seed: String,
     /// `--probe-ctx`:探一探**当前焦点上下文**支持哪些 TSF 接口(不用假存储)。
     probe_ctx: bool,
+    /// `--tfinit`:建窗口**之前**就把本进程的 TSF 拉起来(`Activate`)。
+    /// 真控件是在拿焦点那一刻注册文本存储的,顺序错了它就不注册(实测)。
+    tfinit: bool,
     /// `--enum-profiles`:把 msctf 眼里的输入法列出来(T1.1 排障用)。
     enum_profiles: bool,
     /// `--activate-hold <ms>`:激活后停这么久再做别的(T1.4 实验窗口)。
@@ -296,6 +308,7 @@ fn parse_args() -> Args {
         enum_profiles: false,
         tfstore: false,
         probe_ctx: false,
+        tfinit: false,
         store_seed: "这是窗口里原有的文本。".into(),
         set_default: None,
         activate_legacy: false,
@@ -323,6 +336,7 @@ fn parse_args() -> Args {
             "--enum-profiles" => a.enum_profiles = true,
             "--tfstore" => a.tfstore = true,
             "--probe-ctx" => a.probe_ctx = true,
+            "--tfinit" => a.tfinit = true,
             "--store-seed" => a.store_seed = it.next().unwrap_or(a.store_seed),
             "--activate-legacy" => a.activate_legacy = true,
             "--set-default" => {
@@ -341,6 +355,9 @@ fn parse_args() -> Args {
 }
 
 fn main() {
+    // COM 先初始化:TSF 的一切(上下文服务、组合态、sink 编组)都建立在它之上。
+    // `RPC_E_CHANGED_MODE`(0x80010106)说明这条线程早就初始化过,不算错。
+    let _co_hr = unsafe { CoInitializeEx(std::ptr::null_mut(), 2 /* COINIT_APARTMENTTHREADED */) };
     let mut a = parse_args();
     let start = Instant::now();
     let log = Log { path: a.log.clone(), start, tracing: a.trace };
@@ -396,6 +413,11 @@ fn main() {
         let atom = RegisterClassW(&wc);
         log.line(&format!("RegisterClass atom={atom}"));
         let trace_ref = if a.trace { Some(&log) } else { None };
+
+        // 顺序要紧:TSF 先 Activate,再建窗口/给焦点。
+        if a.tfinit {
+            store::init_thread_mgr(&log);
+        }
 
         let title = wide(&a.title);
         let hwnd = CreateWindowExW(
@@ -474,7 +496,7 @@ fn main() {
         if a.tfstore {
             // 先把上下文建好(组合态要用),再装薄壳 —— 薄壳 `Activate` 时拿到的线程
             // 管理器与本进程是同一个,所以它 `GetFocus` 就能看到我们刚推上去的上下文。
-            unsafe { store::create_context(&log, a.log.clone(), &a.store_seed) };
+            store::create_context(&log, a.log.clone(), &a.store_seed);
         }
         if let Some(dll) = a.load_tip.clone() {
             let ok = tip::run_mode(
