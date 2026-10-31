@@ -133,6 +133,9 @@ const IID_IUNKNOWN: Guid =
     Guid::from_parts(0x0000_0000, 0x0000, 0x0000, [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46]);
 const IID_ITF_CONTEXT_COMPOSITION: Guid =
     Guid::from_parts(0xD40C_8AAE, 0xAC92, 0x4FC7, [0x9A, 0x11, 0x0E, 0xE0, 0xE2, 0x3A, 0xA3, 0x9B]);
+/// `ITfCompositionSink`(msctf.idl:`uuid(A781718C-579A-4B15-A280-32B8577ACC5E)` = 本机 SDK 抄的)。
+const IID_ITF_COMPOSITION_SINK: Guid =
+    Guid::from_parts(0xA781_718C, 0x579A, 0x4B15, [0xA2, 0x80, 0x32, 0xB8, 0x57, 0x7A, 0xCC, 0x5E]);
 const IID_ITF_EDIT_SESSION: Guid =
     Guid::from_parts(0xAA80_E803, 0x2021, 0x11D2, [0x93, 0xE0, 0x00, 0x60, 0xB0, 0x67, 0xB8, 0x6E]);
 
@@ -408,13 +411,21 @@ static SESSION_VTBL: EditSessionVtbl = EditSessionVtbl {
 
 // ---------------------------------------------------------------- 组合态接收端(sink)
 
-unsafe extern "system" fn sink_qi(this: *mut c_void, _riid: *const Guid, ppv: *mut *mut c_void) -> Hresult {
-    if ppv.is_null() {
+unsafe extern "system" fn sink_qi(this: *mut c_void, riid: *const Guid, ppv: *mut *mut c_void) -> Hresult {
+    if riid.is_null() || ppv.is_null() {
         return E_FAIL;
     }
-    unsafe { *ppv = this };
-    unsafe { sink_add_ref(this) };
-    S_OK
+    // 只应答我们**真的是**的接口。之前这里对任何 IID 都回 `this` —— msctf 拿到一个
+    // 名不副实的指针之后行为不可预期(它按自己的接口布局去调,而我们的 vtable 更短)。
+    let want = unsafe { *riid };
+    if want == IID_IUNKNOWN || want == IID_ITF_COMPOSITION_SINK {
+        unsafe { *ppv = this };
+        unsafe { sink_add_ref(this) };
+        S_OK
+    } else {
+        unsafe { *ppv = std::ptr::null_mut() };
+        E_NOINTERFACE
+    }
 }
 
 unsafe extern "system" fn sink_add_ref(this: *mut c_void) -> u32 {

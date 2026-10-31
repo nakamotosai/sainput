@@ -275,7 +275,10 @@ struct Args {
     /// `--probe-ctx`:探一探**当前焦点上下文**支持哪些 TSF 接口(不用假存储)。
     probe_ctx: bool,
     /// `--tfinit`:建窗口**之前**就把本进程的 TSF 拉起来(`Activate`)。
-    /// 真控件是在拿焦点那一刻注册文本存储的,顺序错了它就不注册(实测)。
+    ///
+    /// ⚠ 2026-10-31 复测:对 **rich50** 这个开关是**有害**的 —— 带上它反而没有文本存储
+    /// (`compose attach:GetFocus hr=0x1 dim=null`),不带它才有。当初这条结论(调用顺序错了
+    /// 控件就不注册存储)是在经典 EDIT 上得的,别把它套到 RichEdit 上。
     tfinit: bool,
     /// `--enum-profiles`:把 msctf 眼里的输入法列出来(T1.1 排障用)。
     enum_profiles: bool,
