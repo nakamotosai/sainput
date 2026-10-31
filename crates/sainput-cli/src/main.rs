@@ -397,8 +397,11 @@ struct Cfg {
     twopass: bool,
     /// 二遍重打用的模型目录(只有 `twopass` 打开时才会传给 sidecar)。
     twopass_model_dir: PathBuf,
-    /// 焦点守卫(`focus_guard`,默认开):目标模式下,上屏前复核前台窗口,
-    /// 和按下时不一致就中止本句注入。见 worker 里的复核与 RunOpts.focus_guard。
+    /// 焦点守卫(`focus_guard`,**默认关**)。
+    ///
+    /// 开着 = 上屏前复核前台窗口,和按下时不一致就**中止本句注入**;代价是
+    /// 「按住说话途中切了窗口」会让整句一个字都不上屏。2026-10-31 用户明确否决了这个默认:
+    /// 实测他自己就是会边说话边切窗口,开着等于丢字。留着当选项(`focus_guard = true` 开)。
     focus_guard: bool,
 }
 
@@ -599,9 +602,8 @@ fn cfg(a: &Args) -> Result<Cfg> {
             .to_ascii_lowercase(),
         twopass,
         twopass_model_dir,
-        // 焦点守卫:默认**开**(它只在「按住说话途中切了窗口」时才动手,
-        // 同一窗口内正常输入的主路径一点都不受影响),所以 CLI 是 --no-focus-guard。
-        focus_guard: a.b("focus_guard", "--focus-guard", "--no-focus-guard", true),
+        // 焦点守卫:默认**关**(见字段注释 —— 开着会丢整句,用户否决)。
+        focus_guard: a.b("focus_guard", "--focus-guard", "--no-focus-guard", false),
         ctx_bias,
         // 上下文偏置的临时热词文件：默认放仓库根下 .ctx_hotwords.txt，由 run 主循环写。
         // 关掉偏置时给 None —— 这样 sidecar 连 per-stream 热词都不会去碰。
@@ -1352,7 +1354,7 @@ struct RunOpts {
     /// 演练模式(`run --dry-run`):走**完全相同**的链路,但一个字都不真的上屏。
     /// 用途:离线复现 / 定位问题(尤其配合 `--feed`)时不打扰当前焦点窗口。
     dry: bool,
-    /// 焦点守卫(体检报告 §4.3,`focus_guard` 默认开):整句开始前记下前台窗口,
+    /// 焦点守卫(体检报告 §4.3,`focus_guard` **默认关**):整句开始前记下前台窗口,
     /// 每次要注入前复核;不一致就中止本句注入并记日志。
     focus_guard: bool,
     /// 起 sidecar 的全部参数 —— sidecar 挂掉后由 worker **原地**重新 spawn
