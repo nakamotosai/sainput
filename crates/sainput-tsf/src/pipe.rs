@@ -432,8 +432,10 @@ fn handle(payload: &[u8]) -> Vec<u8> {
             st.last_activity_ms = now_ms();
             trace(&format!("pipe set preedit={:?}(句 {id})", st.preedit));
             // 真正写进应用上下文的那一步(组合态:整体替换,不产生按键)。
+            // **应答格式不变**(协议是给引擎看的);组合态的结果只进日志。
             let hr = crate::compose::set_text(text);
-            ok(&format!("{}\n{hr}", st.preedit))
+            trace(&format!("pipe set 已发送给组合态 hr={hr:#x}"));
+            ok(&st.preedit)
         }),
         b'C' => with_state(|st| {
             let (id, text) = split_sentence(&arg);
@@ -451,23 +453,19 @@ fn handle(payload: &[u8]) -> Vec<u8> {
             st.last_activity_ms = now_ms();
             let hr = crate::compose::commit(text);
             trace(&format!("pipe commit {n} bytes(句 {id}) hr={hr:#x}"));
-            ok(&format!("{}\n{hr}", st.committed_bytes))
+            ok(&format!("{}", st.committed_bytes))
         }),
         b'X' => with_state(|st| {
             st.preedit.clear();
             st.last_activity_ms = now_ms();
             let hr = crate::compose::cancel();
             trace(&format!("pipe cancel hr={hr:#x}"));
-            ok(&format!("{hr}"))
+            ok("")
         }),
         b'Q' => with_state(|st| {
             ok(&format!(
-                "{}|{}|{}|{}|{}",
-                st.preedit,
-                st.committed_bytes,
-                st.active_sentence,
-                st.last_committed,
-                crate::compose::current_text()
+                "{}|{}|{}|{}",
+                st.preedit, st.committed_bytes, st.active_sentence, st.last_committed
             ))
         }),
         other => err(&format!("unknown command {:?}", other as char)),
