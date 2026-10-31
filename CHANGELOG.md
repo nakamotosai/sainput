@@ -9,6 +9,13 @@
 
 ### Changed
 
+- **TSF 回调对象改为可编组(组合态仍不通,但这本身是对的)**。给组合态 sink 聚合
+  `CoCreateFreeThreadedMarshaler` 并让 `QueryInterface(IMarshal)` 转给它 —— 一个会被 msctf
+  跨线程编组去调的回调对象,答不出 `IMarshal` 是潜在挂死点。实测**没有**解决
+  `StartComposition` 卡住(日志确认编组器已建、调用仍卡),所以它不是 T1.4 的答案;
+  保留是因为"可编组的 COM 回调"本身就是正确性要求,不是优化。
+  同时本轮实测到护栏按设计工作:超时 2.5s 回 E_FAIL + 熔断 30s,引擎退档整句落地、不丢字。
+
 - **边缘光推图那半试过脏矩形,实测没赚到,已回退**(AUDIT §5.1)。清零那半前人已做(只清脏区,
   省 ~7ms/帧);剩下每帧整屏 `UpdateLayeredWindow`(4K ≈ 10ms)改用
   `UpdateLayeredWindowIndirect` + `prcDirty` 只推脏区 —— 同一探针(`tools/probe_edge_cpu.py`,

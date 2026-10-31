@@ -34,6 +34,13 @@ use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+#[link(name = "ole32")]
+extern "system" {
+    /// 让我们的回调对象**可跨线程编组**。TSF 的 sink 会被 msctf 编组到别处去调,
+    /// 一个裸指针给不出 `IMarshal` 时,编组那一步就会卡住(2026-10-31 的假设,见 T1.4 书签)。
+    fn CoCreateFreeThreadedMarshaler(outer: *mut c_void, out: *mut *mut c_void) -> i32;
+}
+
 #[link(name = "kernel32")]
 extern "system" {
     /// 只为日志取证:同步编辑会话卡住时,得知道"谁在等谁"。
@@ -134,6 +141,9 @@ const IID_IUNKNOWN: Guid =
 const IID_ITF_CONTEXT_COMPOSITION: Guid =
     Guid::from_parts(0xD40C_8AAE, 0xAC92, 0x4FC7, [0x9A, 0x11, 0x0E, 0xE0, 0xE2, 0x3A, 0xA3, 0x9B]);
 /// `ITfCompositionSink`(msctf.idl:`uuid(A781718C-579A-4B15-A280-32B8577ACC5E)` = 本机 SDK 抄的)。
+/// `IID_IMarshal`(objidl.h:00000003-0000-0000-C000-000000000046)。
+const IID_IMARSHAL: Guid =
+    Guid::from_parts(0x0000_0003, 0x0000, 0x0000, [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46]);
 const IID_ITF_COMPOSITION_SINK: Guid =
     Guid::from_parts(0xA781_718C, 0x579A, 0x4B15, [0xA2, 0x80, 0x32, 0xB8, 0x57, 0x7A, 0xCC, 0x5E]);
 const IID_ITF_EDIT_SESSION: Guid =
@@ -242,6 +252,9 @@ struct EditSession {
 struct CompositionSink {
     vtbl: *const CompositionSinkVtbl,
     refs: AtomicU32,
+    /// 聚合进来的自由线程编组器(给 `IMarshal` 用)。建不出来就是 null ——
+    /// 那时行为与以前完全一致(不该因为它把组合态整个弄挂)。
+    ftm: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -257,8 +270,22 @@ static SINK: LazyLock<usize> = LazyLock::new(|| {
     let s = Box::new(CompositionSink {
         vtbl: &SINK_VTBL,
         refs: AtomicU32::new(1),
+        ftm: AtomicUsize::new(0),
     });
-    Box::into_raw(s) as usize
+    let raw = Box::into_raw(s);
+    // 聚合自由线程编组器:我们的 sink 会被 msctf 编组到别的线程去调,
+    // 只给一个裸指针(答不出 `IMarshal`)时编组那一步可能永远等下去。
+    let mut ftm: *mut c_void = std::ptr::null_mut();
+    let hr = unsafe { CoCreateFreeThreadedMarshaler(raw as *mut c_void, &mut ftm) };
+    if hr == 0 && !ftm.is_null() {
+        unsafe { (*raw).ftm.store(ftm as usize, Ordering::SeqCst) };
+        trace(&format!("compose sink 已聚合自由线程编组器 ftm={ftm:p}"));
+    } else {
+        trace(&format!(
+            "compose sink 编组器没建出来(hr={hr:#x})—— 组合态照旧,只是少了跨线程编组的支持"
+        ));
+    }
+    raw as usize
 });
 
 fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {
@@ -421,11 +448,19 @@ unsafe extern "system" fn sink_qi(this: *mut c_void, riid: *const Guid, ppv: *mu
     if want == IID_IUNKNOWN || want == IID_ITF_COMPOSITION_SINK {
         unsafe { *ppv = this };
         unsafe { sink_add_ref(this) };
-        S_OK
-    } else {
-        unsafe { *ppv = std::ptr::null_mut() };
-        E_NOINTERFACE
+        return S_OK;
     }
+    if want == IID_IMARSHAL {
+        // 把 `IMarshal` 转给我们聚合的自由线程编组器 —— 我们自己不实现它。
+        let s = unsafe { &*(this as *const CompositionSink) };
+        let ftm = s.ftm.load(Ordering::SeqCst) as *mut c_void;
+        if !ftm.is_null() {
+            let vt = unsafe { *(ftm as *const *const UnknownVtbl) };
+            return unsafe { ((*vt).query_interface)(ftm, riid, ppv) };
+        }
+    }
+    unsafe { *ppv = std::ptr::null_mut() };
+    E_NOINTERFACE
 }
 
 unsafe extern "system" fn sink_add_ref(this: *mut c_void) -> u32 {
