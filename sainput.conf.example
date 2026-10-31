@@ -121,6 +121,14 @@ hotkey = rightctrl
 # 前提:Pebrel 2.3.2+ 带 `pane.compose`;它的数据目录要有 runtime.port(常驻实例会写)。
 # 名单形式 `pebrel:nebula.exe` 只在程序名不是 pebrel.exe 时才需要。
 #
+# ---- TSF 组合态(不按键、也不发消息的那条路;M3)----
+#     ime_wmchar = tsf                    # 只在"我们的 TSF 薄壳被那个进程激活"时生效
+# 这条路把文本经命名管道交给目标进程里的 TSF 薄壳(`crates/sainput-tsf`),由它写进
+# 那个应用自己的编辑上下文。它是**唯一**能打进管理员权限窗口的通道(SendInput 被 UIPI 挡)。
+# 判据很干净:薄壳只在 TSF 把我们激活时才有端点(`\\.\pipe\sainput-tsf-<pid>`),
+# 所以名单外不会误伤别的程序 —— 没端点就自动退回 auto 判出来的那条路。
+# ⚠️ 需要先注册(一次 UAC),见 `PLAN-NEXT.md` 的 T1.3。
+#
 # 消息通道的细节:**整段只走一条路** —— 字符用 PostMessage(WM_CHAR),退格用
 # PostMessage(WM_KEYDOWN/UP, VK_BACK)。两条都是同一个消息队列,先后顺序有保证;
 # 混着键盘注入发会把字母插到汉字中间(真机踩过),所以绝不混。

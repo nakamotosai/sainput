@@ -388,10 +388,11 @@ struct Cfg {
     ctx_bias: bool,
     /// 英文大小写修复(`fix_case`)。
     fix_case: bool,
-    /// 上屏方式策略(`ime_wmchar`):auto(默认)| on | off | nostream | pebrel。
+    /// 上屏方式策略(`ime_wmchar`):auto(默认)| on | off | nostream | pebrel | tsf。
     /// 目标窗口挂着输入法时,注入的字母会被输入法吃掉(中文不受影响),这时改用
     /// PostMessage(WM_CHAR) 绕开键盘那条链;`pebrel` 则完全不发按键,把整句放进
-    /// Pebrel 自己的组合态缓冲层。见 `sainput_core::inject::decide_key_mode`。
+    /// Pebrel 自己的组合态缓冲层;`tsf` 则经命名管道交给目标进程里的 TSF 薄壳
+    /// (唯一能打进管理员权限窗口的通道)。见 `sainput_core::inject::decide_key_mode`。
     ime_wmchar: String,
     /// 二遍重打(高精度模式,`twopass`):松键后用更准的模型把整句重解一遍。
     twopass: bool,
@@ -1158,6 +1159,7 @@ fn cmd_config(a: &Args, root: &Path) -> Result<()> {
         "on" | "wmchar" => "消息通道(流式)",
         "nostream" | "final" => "消息通道(整句一次,不流式)",
         "pebrel" | "compose" => "Pebrel 控制面(组合态缓冲层),其余窗口按 auto 判",
+        "tsf" => "TSF 组合态(写进应用的编辑上下文;没被激活的窗口按 auto 判)",
         "off" | "keys" | "input" => "键盘注入(强制)",
         _ => "auto(输入法吃字母的窗口改走消息通道:经典控件 / Qt 窗口)",
     };
@@ -1882,7 +1884,11 @@ fn worker(
                     if mode.is_compose() && !wr.mode().is_compose() {
                         // 隐藏控制台时 println 看不见:走了哪条上屏路必须能在会话日志里查
                         // —— 真机上正是靠日志才看出「前台不是 Pebrel」把整句拒掉这件事。
-                        let line = "[sainput] 上屏改用 Pebrel 组合态缓冲层:这一句先落在它自己的输入缓冲里,定稿才提交".to_string();
+                        let line = if mode == inject::KeyMode::Tsf {
+                            "[sainput] 上屏改用 TSF 组合态:文本写进那个应用自己的编辑上下文(不经键盘、不经消息)".to_string()
+                        } else {
+                            "[sainput] 上屏改用 Pebrel 组合态缓冲层:这一句先落在它自己的输入缓冲里,定稿才提交".to_string()
+                        };
                         if let Some(l) = o.log.as_ref() {
                             l.line(&line);
                         }
@@ -1891,10 +1897,14 @@ fn worker(
                     wr.set_mode(mode);
                     // 组合态的传输层:每句装一个新的 —— 目标窗口、活动 pane 都可能换了。
                     // 别的模式必须卸掉,免得留下来像个「看不见的输入框」。
-                    wr.set_composer(if mode.is_compose() {
-                        Some(Box::new(pebrel::PebrelComposer::new()))
-                    } else {
-                        None
+                    wr.set_composer(match mode {
+                        // TSF:交给目标进程里的薄壳。端点按**焦点窗口的 pid** 算 ——
+                        // 和刚才那次"该不该走 TSF"的决策同一个来源,不会错配到别的进程。
+                        inject::KeyMode::Tsf => Some(Box::new(sainput_core::tsf::TsfComposer::new(
+                            inject::focused_pid(),
+                        )) as Box<dyn pebrel::Composer>),
+                        m if m.is_compose() => Some(Box::new(pebrel::PebrelComposer::new())),
+                        _ => None,
                     });
                     // 上下文偏置：把「刚打出去的历史」抽成热词写盘，sidecar 在开新流时读。
                     // 必须在 reset 之前做（reset 之后 sidecar 才会重读文件）。
@@ -2968,10 +2978,16 @@ fn cmd_selftest(args: &[String]) -> Result<()> {
                 Some("keys") | None => inject::KeyMode::Keys,
                 Some("wmchar") => inject::KeyMode::WmChar(hwnd),
                 Some("wmchar-final") => inject::KeyMode::WmCharFinal(hwnd),
-                Some(other) => anyhow::bail!("--mode 只支持 keys / wmchar / wmchar-final,收到 {other}"),
+                Some("tsf") => inject::KeyMode::Tsf,
+                Some(other) => anyhow::bail!(
+                    "--mode 只支持 keys / wmchar / wmchar-final / tsf,收到 {other}"
+                ),
             };
             if mode.is_wmchar() && hwnd == 0 {
                 anyhow::bail!("消息通道模式必须给 --hwnd 0x…(SendInput 到不了别的桌面)");
+            }
+            if mode.is_compose() && hwnd == 0 {
+                anyhow::bail!("组合态模式必须给 --hwnd 0x…(目标进程的 pid 按它算)");
             }
             let prefix = match opt(args, "--prefix").as_deref() {
                 Some("space") => " ".to_string(),
@@ -2988,6 +3004,19 @@ fn cmd_selftest(args: &[String]) -> Result<()> {
 
             let mut w = inject::StreamWriter::new(max_bs, true);
             w.set_mode(mode);
+            if mode == inject::KeyMode::Tsf {
+                // `--pid` 是**测试床用**的显式目标:窗口在别的桌面上时
+                // `GetWindowThreadProcessId` 会返回 0(句柄是桌面作用域的),
+                // 那时只能由调用方把 pid 直接给出来。生产路径永远从焦点窗口推。
+                let pid = match opt(args, "--pid").and_then(|v| v.trim().parse::<u32>().ok()) {
+                    Some(p) => p,
+                    None => sainput_core::tsf::pid_of_window(hwnd),
+                };
+                if !sainput_core::tsf::available(pid) {
+                    anyhow::bail!("pid {pid} 没有我们的 TSF 薄壳端点(那台进程里 TIP 没被激活)");
+                }
+                w.set_composer(Some(Box::new(sainput_core::tsf::TsfComposer::new(pid))));
+            }
             if !prefix.is_empty() {
                 w.set_prefix(&prefix);
             }
@@ -3022,10 +3051,11 @@ fn cmd_selftest(args: &[String]) -> Result<()> {
             println!("  sainput selftest inject <text>              # 3 秒后打进当前焦点窗口");
             println!("  sainput selftest compose <text> [选项]      # 确定性入口,直接喂 composer");
             println!("      --hwnd 0x…          目标窗口(消息通道必给;SendInput 到不了别的桌面)");
-            println!("      --mode keys|wmchar|wmchar-final");
+            println!("      --mode keys|wmchar|wmchar-final|tsf");
             println!("      --prefix space      句首补一个空格(进同一条退格算术)");
             println!("      --frames N          模拟流式:切成 N 段逐段 update");
             println!("      --pre <文本>        先投一个错的版本再定稿(走退格改写算术)");
+            println!("      --pid N             TSF 模式:显式目标进程(测试用;跨桌面时窗口句柄推不出 pid)");
             Ok(())
         }
     }

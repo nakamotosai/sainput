@@ -16,6 +16,7 @@
 """
 import pathlib
 import struct
+import subprocess
 import sys
 import time
 
@@ -93,7 +94,7 @@ def main():
     try:
         # 保持激活 6 秒:管道只在这段窗口里可连
         hp, ht, pid = hdesk.launch(
-            str(host), f"--life 9000 --tip-hold 6000 --log {hlog} --load-tip {dll}", DESKTOP)
+            str(host), f"--life 24000 --tip-hold 20000 --log {hlog} --load-tip {dll}", DESKTOP)
         name = rf"\\.\pipe\sainput-tsf-{pid}"
         print(f"host pid={pid} pipe={name}")
         f = connect(name)
@@ -135,6 +136,35 @@ def main():
                 r = exchange(f2, b"P" + VERSION)
                 check("第二个客户端 ping 正常", r[:1] == b"O", repr(r))
                 f2.close()
+
+        # ---- 引擎侧:真的让 `sainput` 从**另一张桌面**发一句过来 ----
+        # 命名管道是内核对象,跨桌面没有障碍 —— 这条就是"引擎能打到目标进程"的证据。
+        sainput = find("sainput.exe", "engine")
+        edit = hdesk.find_edit(pid, h)
+        check("宿主有文本控件句柄", edit is not None)
+        if edit:
+            f3 = connect(name, timeout=4.0)
+            before = exchange(f3, b"Q") if f3 else b""
+            if f3:
+                f3.close()
+            r = subprocess.run(
+                # `--pid` 是必须的:窗口在别的桌面上,引擎那边
+                # `GetWindowThreadProcessId` 推不出 pid(句柄是桌面作用域的)。
+                # 生产路径不需要它 —— 引擎和焦点窗口永远在同一张桌面上。
+                [str(sainput), "selftest", "compose", "引擎经管道发来的一句", "--mode", "tsf",
+                 "--hwnd", hex(edit), "--pid", str(pid), "--frames", "3"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+            check("引擎(TSF 通道)退出码 0", r.returncode == 0, (r.stderr or "").strip()[:200])
+            check("引擎日志显示走的是 TSF 组合态", "TSF 组合态" in (r.stdout or ""), (r.stdout or "").strip()[:200])
+            f4 = connect(name, timeout=4.0)
+            if f4:
+                after = exchange(f4, b"Q")
+                f4.close()
+                # 引擎那一句是 3 帧 + 定稿一次:已定稿字节数必须增加
+                grew = after != before
+                check("管道状态记录了引擎的定稿", grew, f"{before!r} -> {after!r}")
+            else:
+                check("引擎之后管道仍可连", False)
 
         code = hdesk.wait_exit(hp, 30000)
         check("宿主正常退出", code == 0, f"exit={code}")

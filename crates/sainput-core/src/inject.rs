@@ -151,6 +151,10 @@ pub enum KeyMode {
     /// (`pane.compose` 的 preedit,可无限次整体替换),定稿时才作为一次写入提交给
     /// PTY。见 `crate::pebrel`。
     Pebrel,
+    /// **TSF 组合态**:一个按键都不发。文本走命名管道交给目标进程里的 TSF 薄壳
+    /// (`crates/sainput-tsf`),由它写进那个应用的编辑上下文。见 `crate::tsf`。
+    /// 它和 `Pebrel` 是同一个形状(**整体替换 + 一次提交**),只是传输层不同。
+    Tsf,
 }
 
 impl KeyMode {
@@ -162,14 +166,15 @@ impl KeyMode {
     pub fn is_final_only(self) -> bool {
         matches!(self, KeyMode::WmCharFinal(_))
     }
-    /// 走应用自己的组合态缓冲层(不产生按键)
+    /// 走组合态(不产生按键):Pebrel 控制面,或 TSF 薄壳。
     pub fn is_compose(self) -> bool {
-        matches!(self, KeyMode::Pebrel)
+        matches!(self, KeyMode::Pebrel | KeyMode::Tsf)
     }
     fn hwnd(self) -> isize {
         match self {
             KeyMode::Keys => 0,
             KeyMode::Pebrel => 0,
+            KeyMode::Tsf => 0,
             KeyMode::WmChar(h) | KeyMode::WmCharFinal(h) => h,
         }
     }
@@ -182,6 +187,7 @@ pub fn describe_target(mode: KeyMode) -> String {
         KeyMode::WmChar(h) => format!("消息通道(流式){}", target::describe(h)),
         KeyMode::WmCharFinal(h) => format!("消息通道(整句一次){}", target::describe(h)),
         KeyMode::Pebrel => "Pebrel 控制面(组合态缓冲层)".to_string(),
+        KeyMode::Tsf => "TSF 组合态(写进应用的编辑上下文)".to_string(),
     }
 }
 
@@ -213,6 +219,9 @@ pub fn decide_key_mode(
     thread_has_ime: bool,
     needs_channel: bool,
     exe: &str,
+    // 焦点窗口所在进程里**我们的 TSF 薄壳是不是活的**(端点能不能等到)。
+    // 这一条本身就是"该不该走 TSF"的判据:薄壳只在 TSF 把我们激活时才有端点。
+    tsf_available: bool,
 ) -> KeyMode {
     let exe = exe.to_ascii_lowercase();
     let (head, list) = match policy.split_once(':') {
@@ -269,6 +278,17 @@ pub fn decide_key_mode(
                 auto_mode()
             } else {
                 KeyMode::Keys
+            }
+        }
+        "tsf" => {
+            // 名单外**不换**(和 pebrel 同一个道理:静默把别的程序的文本塞进它的编辑上下文
+            // 是最难查的错误)。不写名单时靠 `tsf_available` 自己收窄 ——
+            // 只有"我们真的被那个进程激活了"才会走这条。
+            let want = if only_listed { listed(list) } else { true };
+            if want && tsf_available {
+                KeyMode::Tsf
+            } else {
+                auto_mode()
             }
         }
         "on" | "wmchar" => {
@@ -437,12 +457,17 @@ mod target {
 
     pub fn key_mode(policy: &str) -> KeyMode {
         let hwnd = focused_hwnd();
+        // 只有策略里真写了 tsf 才去探端点 —— 别的策略下每句多一次系统调用是白花。
+        let wants_tsf = policy.split(':').next().unwrap_or("").trim() == "tsf";
+        let tsf_available =
+            wants_tsf && crate::tsf::available(crate::tsf::pid_of_window(hwnd));
         super::decide_key_mode(
             policy,
             hwnd,
             thread_uses_ime(hwnd),
             needs_message_channel(hwnd),
             &exe_name(hwnd),
+            tsf_available,
         )
     }
 
@@ -470,6 +495,9 @@ mod target {
     }
     pub fn key_mode(_policy: &str) -> KeyMode {
         KeyMode::Keys
+    }
+    pub fn pid_of_window(_hwnd: isize) -> u32 {
+        0
     }
     pub fn describe(_hwnd: isize) -> String {
         String::new()
@@ -502,6 +530,7 @@ fn type_text_with(mode: KeyMode, s: &str) -> Result<()> {
         // 组合态不发按键:文本走 `pane.compose`。走到这里说明模式/传输层接线错了,
         // 宁可明确报错,也不要静默退化成键盘注入(那正是这条模式要避开的失败)。
         KeyMode::Pebrel => anyhow::bail!("Pebrel 组合态不走按键通道"),
+        KeyMode::Tsf => anyhow::bail!("TSF 组合态不走按键通道"),
     }
 }
 
@@ -525,6 +554,7 @@ fn backspace_with(mode: KeyMode, n: usize) -> Result<()> {
         KeyMode::Keys => backspace(n),
         KeyMode::WmChar(h) | KeyMode::WmCharFinal(h) => post_backspace(h, n),
         KeyMode::Pebrel => anyhow::bail!("Pebrel 组合态不做退格:整句是整体替换的"),
+        KeyMode::Tsf => anyhow::bail!("TSF 组合态不做退格:整句是整体替换的"),
     }
 }
 
@@ -803,57 +833,65 @@ mod tests {
         const E: &str = "pebrel.exe";
         const OTHER: &str = "notepad.exe";
         // off:永远是键盘注入
-        assert_eq!(decide_key_mode("off", 0x1234, true, true, E), KeyMode::Keys);
+        assert_eq!(decide_key_mode("off", 0x1234, true, true, E, false), KeyMode::Keys);
+        // tsf:只有"薄壳在那个进程里活着"才换 —— 没端点就按 auto 判,不误伤别的窗口
+        assert_eq!(decide_key_mode("tsf", 0x1234, true, true, E, true), KeyMode::Tsf);
+        assert_eq!(decide_key_mode("tsf", 0x1234, true, true, E, false), KeyMode::WmChar(0x1234));
+        // 连输入法都没有的窗口也照样能用 TSF(它根本不走键盘/消息)
+        assert_eq!(decide_key_mode("tsf", 0x1234, false, false, E, true), KeyMode::Tsf);
+        // 名单形式:名单外按 auto 判
+        assert_eq!(decide_key_mode("tsf:pebrel.exe", 0x1234, true, true, OTHER, true), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("tsf:pebrel.exe", 0x1234, true, true, E, true), KeyMode::Tsf);
         // on:强制 WM_CHAR
-        assert_eq!(decide_key_mode("on", 0x1234, false, false, E), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("on", 0x1234, false, false, E, false), KeyMode::WmChar(0x1234));
         // on 但拿不到窗口句柄 → 退回键盘(有句柄才谈得上投递消息)
-        assert_eq!(decide_key_mode("on", 0, true, true, E), KeyMode::Keys);
+        assert_eq!(decide_key_mode("on", 0, true, true, E, false), KeyMode::Keys);
         // auto:输入法 + 那类文本面才换
-        assert_eq!(decide_key_mode("auto", 0x1234, true, true, E), KeyMode::WmChar(0x1234));
-        assert_eq!(decide_key_mode("auto", 0x1234, true, false, E), KeyMode::Keys);
-        assert_eq!(decide_key_mode("auto", 0x1234, false, true, E), KeyMode::Keys);
-        assert_eq!(decide_key_mode("auto", 0, true, true, E), KeyMode::Keys);
+        assert_eq!(decide_key_mode("auto", 0x1234, true, true, E, false), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("auto", 0x1234, true, false, E, false), KeyMode::Keys);
+        assert_eq!(decide_key_mode("auto", 0x1234, false, true, E, false), KeyMode::Keys);
+        assert_eq!(decide_key_mode("auto", 0, true, true, E, false), KeyMode::Keys);
         // 没写这个键(或写错)按 auto 走
-        assert_eq!(decide_key_mode("", 0x1234, true, true, E), KeyMode::WmChar(0x1234));
-        assert_eq!(decide_key_mode("whatever", 0x1234, true, true, E), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("", 0x1234, true, true, E, false), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("whatever", 0x1234, true, true, E, false), KeyMode::WmChar(0x1234));
         // 名单形式:只对该程序生效(自绘终端就靠它试,不牵动别的窗口)
-        assert_eq!(decide_key_mode("on:pebrel.exe", 0x1234, false, false, E), KeyMode::WmChar(0x1234));
-        assert_eq!(decide_key_mode("on: Pebrel.EXE , zed.exe", 0x1234, false, false, E), KeyMode::WmChar(0x1234));
-        assert_eq!(decide_key_mode("on:pebrel.exe", 0x1234, true, true, OTHER), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("on:pebrel.exe", 0x1234, false, false, E, false), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("on: Pebrel.EXE , zed.exe", 0x1234, false, false, E, false), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("on:pebrel.exe", 0x1234, true, true, OTHER, false), KeyMode::WmChar(0x1234));
         // off 带名单:名单里的永远键盘,名单外仍享受 auto 兜底
-        assert_eq!(decide_key_mode("off:pebrel.exe", 0x1234, true, true, E), KeyMode::Keys);
-        assert_eq!(decide_key_mode("off:pebrel.exe", 0x1234, true, true, OTHER), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("off:pebrel.exe", 0x1234, true, true, E, false), KeyMode::Keys);
+        assert_eq!(decide_key_mode("off:pebrel.exe", 0x1234, true, true, OTHER, false), KeyMode::WmChar(0x1234));
         // auto 带名单:只有名单里的程序吃 auto 规则(写名单 = 收紧这条规则)
-        assert_eq!(decide_key_mode("auto:pebrel.exe", 0x1234, true, true, OTHER), KeyMode::Keys);
-        assert_eq!(decide_key_mode("auto:pebrel.exe", 0x1234, true, true, E), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("auto:pebrel.exe", 0x1234, true, true, OTHER, false), KeyMode::Keys);
+        assert_eq!(decide_key_mode("auto:pebrel.exe", 0x1234, true, true, E, false), KeyMode::WmChar(0x1234));
         // nostream:名单里走「整句一次投递」,名单外按 auto(不是一律键盘)
-        assert_eq!(decide_key_mode("nostream:pebrel.exe", 0x1234, false, false, E), KeyMode::WmCharFinal(0x1234));
-        assert_eq!(decide_key_mode("nostream:pebrel.exe", 0x1234, true, true, OTHER), KeyMode::WmChar(0x1234));
-        assert_eq!(decide_key_mode("nostream:pebrel.exe", 0x1234, true, false, OTHER), KeyMode::Keys);
-        assert_eq!(decide_key_mode("nostream", 0x1234, false, false, E), KeyMode::WmCharFinal(0x1234));
+        assert_eq!(decide_key_mode("nostream:pebrel.exe", 0x1234, false, false, E, false), KeyMode::WmCharFinal(0x1234));
+        assert_eq!(decide_key_mode("nostream:pebrel.exe", 0x1234, true, true, OTHER, false), KeyMode::WmChar(0x1234));
+        assert_eq!(decide_key_mode("nostream:pebrel.exe", 0x1234, true, false, OTHER, false), KeyMode::Keys);
+        assert_eq!(decide_key_mode("nostream", 0x1234, false, false, E, false), KeyMode::WmCharFinal(0x1234));
         // pebrel:组合态缓冲层。**不写名单 = 只对 Pebrel 自己的程序名生效** ——
         // 控制面在这台机上只有一份,把别的程序的文本塞进它的缓冲层是最难查的错误。
-        assert_eq!(decide_key_mode("pebrel", 0x1234, false, false, E), KeyMode::Pebrel);
+        assert_eq!(decide_key_mode("pebrel", 0x1234, false, false, E, false), KeyMode::Pebrel);
         assert_eq!(
-            decide_key_mode("pebrel", 0x1234, false, false, "nebula.exe"),
+            decide_key_mode("pebrel", 0x1234, false, false, "nebula.exe", false),
             KeyMode::Pebrel,
             "旧程序名 nebula.exe 也认"
         );
         assert_eq!(
-            decide_key_mode("pebrel:psql.exe", 0x1234, false, false, "psql.exe"),
+            decide_key_mode("pebrel:psql.exe", 0x1234, false, false, "psql.exe", false),
             KeyMode::Pebrel
         );
         // ⚠️ 回归(2026-10-30 微信「英文全被输入法吃掉」的现场):配了 `pebrel` 之后,
         // 名单外的窗口**必须继续按 auto 判** —— 用户日常配置就是 `ime_wmchar = pebrel`,
         // 一旦这里退回「一律键盘」,微信里说英文就又没了。
         assert_eq!(
-            decide_key_mode("pebrel", 0x1234, true, true, OTHER),
+            decide_key_mode("pebrel", 0x1234, true, true, OTHER, false),
             KeyMode::WmChar(0x1234),
             "配了 pebrel 也要保住名单外窗口的 auto 兜底"
         );
-        assert_eq!(decide_key_mode("pebrel", 0x1234, true, false, OTHER), KeyMode::Keys, "没输入法就不用换");
+        assert_eq!(decide_key_mode("pebrel", 0x1234, true, false, OTHER, false), KeyMode::Keys, "没输入法就不用换");
         assert_eq!(
-            decide_key_mode("pebrel:psql.exe", 0x1234, true, true, OTHER),
+            decide_key_mode("pebrel:psql.exe", 0x1234, true, true, OTHER, false),
             KeyMode::WmChar(0x1234),
             "名单外也不许静默换控制面,但要保住 auto 兜底"
         );
