@@ -58,13 +58,23 @@ def run(rec, wav):
                 mx=max(s), n=n, first_abs=first, on=on,
                 first_rel=(first-on) if first else None, final=fin)
 
-models = sys.argv[1:]
+# `--wavs <dir>`:用**同一批**音频跑所有模型(默认各用各的 test_wavs —— 那样比不公平,
+# 不同模型自带的样例不同,文本差异会被样例差异污染)。
+argv = sys.argv[1:]
+shared = None
+if "--wavs" in argv:
+    i = argv.index("--wavs")
+    shared = argv[i + 1]
+    argv = argv[:i] + argv[i + 2:]
+
+models = argv
 for md in models:
     name = os.path.basename(md.rstrip("\\/"))
     try: rec = build(md)
     except Exception as e: print(f"[{name}] 构建失败: {e}"); continue
-    wavs = sorted(glob.glob(os.path.join(md,"test_wavs","*.wav")))
-    wavs = [w for w in wavs if "8k" not in os.path.basename(w)][:3]
+    src = shared if shared else os.path.join(md, "test_wavs")
+    wavs = sorted(glob.glob(os.path.join(src, "*.wav")))
+    wavs = [w for w in wavs if "8k" not in os.path.basename(w)][:3 if not shared else 99]
     print(f"\n########## {name}")
     for w in wavs:
         r = run(rec, w)
