@@ -869,7 +869,52 @@ fn reset_writer(wr: &mut inject::StreamWriter) {
     }
 }
 
-fn handle_msg(m: Msg, wr: &mut inject::StreamWriter, ui: &Ui) {
+/// 决定并装上"这一句用哪种上屏方式"。
+///
+/// 抽出来是因为有**两个**地方要装:每句开始时按策略装一次;组合态通道坏了要**退一档重装**
+/// (见 worker 里的 `tsf_fallback`)。两处必须用同一套逻辑,否则"退档"会把日志和状态说岔。
+fn install_injection_mode(policy: &str, wr: &mut inject::StreamWriter, o: &RunOpts) {
+    let mode = inject::target_key_mode(policy);
+    if mode.is_wmchar() && !wr.mode().is_wmchar() {
+        let line = format!(
+            "[sainput] 上屏改用 WM_CHAR:{} —— 这类窗口里注入的字母会被输入法吃掉",
+            inject::describe_target(mode)
+        );
+        if let Some(l) = o.log.as_ref() {
+            l.line(&line);
+        }
+        println!("{line}");
+    }
+    if mode.is_compose() && !wr.mode().is_compose() {
+        // 隐藏控制台时 println 看不见:走了哪条上屏路必须能在会话日志里查
+        // —— 真机上正是靠日志才看出「前台不是 Pebrel」把整句拒掉这件事。
+        let line = if mode == inject::KeyMode::Tsf {
+            "[sainput] 上屏改用 TSF 组合态:文本写进那个应用自己的编辑上下文(不经键盘、不经消息)".to_string()
+        } else {
+            "[sainput] 上屏改用 Pebrel 组合态缓冲层:这一句先落在它自己的输入缓冲里,定稿才提交".to_string()
+        };
+        if let Some(l) = o.log.as_ref() {
+            l.line(&line);
+        }
+        println!("{line}");
+    }
+    wr.set_mode(mode);
+    // 组合态的传输层:每句装一个新的 —— 目标窗口、活动 pane 都可能换了。
+    // 别的模式必须卸掉,免得留下来像个「看不见的输入框」。
+    wr.set_composer(match mode {
+        // TSF:交给目标进程里的薄壳。端点按**焦点窗口的 pid** 算 ——
+        // 和刚才那次"该不该走 TSF"的决策同一个来源,不会错配到别的进程。
+        inject::KeyMode::Tsf => Some(Box::new(sainput_core::tsf::TsfComposer::new(
+            inject::focused_pid(),
+        )) as Box<dyn pebrel::Composer>),
+        m if m.is_compose() => Some(Box::new(pebrel::PebrelComposer::new())),
+        _ => None,
+    });
+}
+
+fn handle_msg(m: Msg, wr: &mut inject::StreamWriter, ui: &Ui) -> bool {
+    // 返回值 = **这次上屏失败了吗**。组合态失败要退一档重来(见 worker 里的 `tsf_fallback`)。
+    let mut failed = false;
     let ms = ui.t0.elapsed().as_millis();
     match m {
         Msg::Ready {
@@ -909,6 +954,7 @@ fn handle_msg(m: Msg, wr: &mut inject::StreamWriter, ui: &Ui) {
                         l.line(&format!("! partial 上屏失败: {e}"));
                     }
                     eprintln!("[inject] partial 失败: {e}");
+                    failed = true;
                 }
             }
         }
@@ -939,6 +985,7 @@ fn handle_msg(m: Msg, wr: &mut inject::StreamWriter, ui: &Ui) {
                             l.line(&format!("! final 上屏失败: {e}"));
                         }
                         eprintln!("[inject] final 失败: {e}");
+                        failed = true;
                     }
                 }
                 if overlay_mode() == 1 {
@@ -973,6 +1020,7 @@ fn handle_msg(m: Msg, wr: &mut inject::StreamWriter, ui: &Ui) {
             eprintln!("[asr] 错误: {msg}");
         }
     }
+    failed
 }
 
 // ------------------------------------------------------------------ replay
@@ -1693,6 +1741,9 @@ fn worker(
     // (屏幕上从「你好世界」变成「迟到的一帧」)。定稿就是定稿 —— 之后这一句的
     // streaming 一律不认,直到下一次按下。
     let mut finalized = false;
+    // TSF 通道这次运行里**坏过**吗(版本不匹配 / 端点没了 / 对面崩了)?
+    // 坏过就一直退到 auto 那条通道 —— 一句一句地重试一个坏通道,用户看到的是「说了半天一个字都没上屏」。
+    let mut tsf_fallback = false;
     // 上一句的 final 还在路上就又按下了热键：这时不能 wr.reset()，
     // 否则那条 final 会因为「屏幕上什么都没有」而把整句重打一遍。
     let mut defer_reset = false;
@@ -1864,6 +1915,12 @@ fn worker(
                     // 顺序反了就等于永远不补空格（我第一版就写反了）。
                     // 为什么只问一次：这一句的头定了就不该再变，中途重判会让已上屏的字被改来改去；
                     // 而且此刻用户还没说话，前台窗口/光标最稳定。
+                    // 上屏方式策略:TSF 通道这次运行里坏过就一直用 auto(见 `tsf_fallback`)。
+                    let policy: String = if tsf_fallback {
+                        "auto".to_string()
+                    } else {
+                        o.ime_wmchar.clone()
+                    };
                     if LEADING_SPACE.load(std::sync::atomic::Ordering::Relaxed) {
                         let lc = caretctx::left_context();
                         wr.set_prefix(if lc.wants_leading_space() { " " } else { "" });
@@ -1873,47 +1930,8 @@ fn worker(
                     // 句尾空格:和前置空格一样,每句开始时定一次(托盘点一下立刻生效)。
                     // 只管"补不补" —— 具体补几个由 writer 的 `want()` 去重(只补一个)。
                     wr.set_trailing_space(TRAILING_SPACE.load(std::sync::atomic::Ordering::Relaxed));
-                    // 上屏方式:①目标窗口挂着输入法时,注入的字母会被输入法当成它自己的
-                    // 输入(掉进组字串、弹出候选面板,程序一个字都收不到),中文却不受影响
-                    // —— 这就是「说英文它就被吃掉」。②输入法状态读不到也改不了(跨进程
-                    // ImmGetContext 返回 NULL),所以对这类窗口改用 PostMessage(WM_CHAR)。
-                    // 每句开始时重判一次:用户可能已经换了窗口。
-                    let mode = inject::target_key_mode(&o.ime_wmchar);
-                    if mode.is_wmchar() && !wr.mode().is_wmchar() {
-                        let line = format!(
-                            "[sainput] 上屏改用 WM_CHAR:{} —— 这类窗口里注入的字母会被输入法吃掉",
-                            inject::describe_target(mode)
-                        );
-                        if let Some(l) = o.log.as_ref() {
-                            l.line(&line);
-                        }
-                        println!("{line}");
-                    }
-                    if mode.is_compose() && !wr.mode().is_compose() {
-                        // 隐藏控制台时 println 看不见:走了哪条上屏路必须能在会话日志里查
-                        // —— 真机上正是靠日志才看出「前台不是 Pebrel」把整句拒掉这件事。
-                        let line = if mode == inject::KeyMode::Tsf {
-                            "[sainput] 上屏改用 TSF 组合态:文本写进那个应用自己的编辑上下文(不经键盘、不经消息)".to_string()
-                        } else {
-                            "[sainput] 上屏改用 Pebrel 组合态缓冲层:这一句先落在它自己的输入缓冲里,定稿才提交".to_string()
-                        };
-                        if let Some(l) = o.log.as_ref() {
-                            l.line(&line);
-                        }
-                        println!("{line}");
-                    }
-                    wr.set_mode(mode);
-                    // 组合态的传输层:每句装一个新的 —— 目标窗口、活动 pane 都可能换了。
-                    // 别的模式必须卸掉,免得留下来像个「看不见的输入框」。
-                    wr.set_composer(match mode {
-                        // TSF:交给目标进程里的薄壳。端点按**焦点窗口的 pid** 算 ——
-                        // 和刚才那次"该不该走 TSF"的决策同一个来源,不会错配到别的进程。
-                        inject::KeyMode::Tsf => Some(Box::new(sainput_core::tsf::TsfComposer::new(
-                            inject::focused_pid(),
-                        )) as Box<dyn pebrel::Composer>),
-                        m if m.is_compose() => Some(Box::new(pebrel::PebrelComposer::new())),
-                        _ => None,
-                    });
+                    install_injection_mode(&policy, &mut wr, &o);
+
                     // 上下文偏置：把「刚打出去的历史」抽成热词写盘，sidecar 在开新流时读。
                     // 必须在 reset 之前做（reset 之后 sidecar 才会重读文件）。
                     // 每句都问一次实时开关 —— 托盘里改了要立刻生效，不能要求重开。
@@ -2222,8 +2240,32 @@ fn worker(
                 let rec = if raw.is_empty() { text.as_str() } else { raw.as_str() };
                 history.push(rec);
             }
-            handle_msg(m, &mut wr, &ui);
+            // 组合态下 `injected` 一直是空的,所以"退档重来"就是整句一次落地,不丢字。
+            // 只在组合态才克隆消息(便宜),别的模式不白花这一次拷贝。
+            let retry = if wr.mode().is_compose() { Some(m.clone()) } else { None };
+            let failed = handle_msg(m, &mut wr, &ui);
             // finish 的 final = 这一句彻底定稿;尾巴期间的 endpoint 也已经定稿
+            if failed {
+                if let Some(msg) = retry {
+                    if wr.mode() == inject::KeyMode::Tsf && !tsf_fallback {
+                        tsf_fallback = true;
+                        let line = "[sainput] TSF 通道不可用(版本不匹配 / 端点没了 / 对面挂了)"
+                            .to_string()
+                            + " → 之后改走 auto 那条通道,这一句重试一次";
+                        if let Some(l) = o.log.as_ref() {
+                            l.line(&format!("! {line}"));
+                        }
+                        eprintln!("{line}");
+                    }
+                    // 退档用哪条策略:生产就是 `auto`(按窗口判,该 WM_CHAR 就 WM_CHAR)。
+                    // 【测试专用】`SAINPUT_DIAG_FALLBACK_POLICY=on` 可以把它钉死,
+                    // 好在私有桌面(那里 SendInput 进不去)上验"退档真的把字打上了"。
+                    let fb = std::env::var("SAINPUT_DIAG_FALLBACK_POLICY")
+                        .unwrap_or_else(|_| "auto".to_string());
+                    install_injection_mode(&fb, &mut wr, &o);
+                    let _ = handle_msg(msg, &mut wr, &ui);
+                }
+            }
             if is_final_finish || (is_final_endpoint && stage != Stage::Recording) {
                 if is_final_finish {
                     // 定稿之后这一句的 streaming 一律不认(见 `finalized` 的注释)

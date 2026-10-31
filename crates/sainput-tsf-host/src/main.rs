@@ -186,7 +186,7 @@ fn read_edit(edit: isize) -> String {
     }
 }
 
-fn pump(trace: Option<&Log>, translate: bool) {
+pub(crate) fn pump(trace: Option<&Log>, translate: bool) {
     const WM_KEYDOWN: u32 = 0x0100;
     const WM_KEYUP: u32 = 0x0101;
     let mut msg = Msg::default();
@@ -210,6 +210,8 @@ fn pump(trace: Option<&Log>, translate: bool) {
 }
 
 pub(crate) struct Log {
+    /// 逐条消息落盘开了吗(`--trace`)。`tip::run` 里的保持期也要能记。
+    pub(crate) tracing: bool,
     path: PathBuf,
     start: Instant,
 }
@@ -319,7 +321,7 @@ fn parse_args() -> Args {
 fn main() {
     let mut a = parse_args();
     let start = Instant::now();
-    let log = Log { path: a.log.clone(), start };
+    let log = Log { path: a.log.clone(), start, tracing: a.trace };
     log.line(&format!("host start pid={} log={}", std::process::id(), a.log.display()));
 
     if a.no_window {

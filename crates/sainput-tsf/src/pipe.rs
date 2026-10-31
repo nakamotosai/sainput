@@ -376,6 +376,18 @@ fn watchdog() {
     }
 }
 
+/// 报给客户端的协议版本。
+///
+/// 【测试专用】`SAINPUT_TSF_PROTOCOL_FAKE=<串>` 让薄壳**谎报**版本 ——
+/// 用来验引擎那边的退档(T2.4):版本不匹配时不许把整句丢掉,要退到旧通道。
+/// 不设这个环境变量时就是真实版本;生产路径上没有它的痕迹。
+fn version_reported() -> String {
+    match std::env::var("SAINPUT_TSF_PROTOCOL_FAKE") {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => PROTOCOL_VERSION.to_string(),
+    }
+}
+
 fn ok(extra: &str) -> Vec<u8> {
     let mut v = vec![b'O'];
     v.extend_from_slice(extra.as_bytes());
@@ -396,10 +408,11 @@ fn handle(payload: &[u8]) -> Vec<u8> {
     let arg = String::from_utf8_lossy(rest).to_string();
     match cmd {
         b'P' => {
-            if arg != PROTOCOL_VERSION {
-                return err(&format!("version mismatch: got {arg:?}"));
+            let ours = version_reported();
+            if arg != ours {
+                return err(&format!("version mismatch: got {arg:?} (want {ours}"));
             }
-            ok(&format!("{} pid={}", PROTOCOL_VERSION, unsafe { GetCurrentProcessId() }))
+            ok(&format!("{} pid={}", ours, unsafe { GetCurrentProcessId() }))
         }
         b'S' => with_state(|st| {
             let (id, text) = split_sentence(&arg);

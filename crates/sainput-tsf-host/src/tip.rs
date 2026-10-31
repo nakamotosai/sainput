@@ -100,6 +100,7 @@ pub unsafe fn focused_document(tm: *mut c_void) -> Option<*mut c_void> {
 
 /// 返回值:每一步是否都如预期。
 pub unsafe fn run_mode(dll: &str, hold_ms: u64, activate_for_process: bool, activate_legacy: bool, log: &Log) -> bool {
+    let trace_ref = if log.tracing { Some(log) } else { None };
     let path = wide(dll);
     let module = unsafe { LoadLibraryW(path.as_ptr()) };
     if module == 0 {
@@ -188,6 +189,10 @@ pub unsafe fn run_mode(dll: &str, hold_ms: u64, activate_for_process: bool, acti
         println!("[host] tip pipe live pid={}", std::process::id());
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_millis(hold_ms) {
+            // **必须继续泵消息**:激活窗口里投进来的 WM_CHAR 就排在队列上,
+            // 不泵的话它们要等到主循环才开始处理 —— 测出来的时序全是假的
+            // (2026-10-31 实测:字在队列里躺了 11 秒)。
+            crate::pump(trace_ref, true);
             std::thread::sleep(Duration::from_millis(20));
         }
     }
