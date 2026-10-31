@@ -87,7 +87,8 @@ fn usage() {
          --feed-release-at <S>  测试用:--feed 喂到第 S 秒自动松键(吞字回归)\n  \
          --twopass              二遍重打:松键后用更准的 480ms 档整句重解一遍\n  \
          --twopass-model-dir <DIR>  二遍重打用的模型目录(默认 models 下的 480ms 档)\n  \
-         --no-focus-guard       关掉焦点守卫(默认开:按住说话途中切了窗口就中止本句注入)\n  \
+         --focus-guard          打开焦点守卫(默认**关**:按住说话途中切了窗口就中止本句注入。\n  \
+                                默认关是用户定的 —— 他说话时就会切窗口,开着等于丢整句)\n  \
          --python <EXE>         Python 解释器(默认按 PATH 里的绝对路径探测,\n  \
                                  可用 SAINPUT_PYTHON 固定)\n  \
          --dry-run              不真的注入,只打印文本(replay / run 都可用;\n  \
@@ -2022,6 +2023,15 @@ fn worker(
                     // 目标模式原来只在按下时判一次「往哪个窗口打」,之后每次上屏用的都是
                     // **当时的**焦点窗口 —— 于是「按住说话途中切窗」会把后半句打进别的窗口。
                     guard_hwnd = if o.focus_guard { inject::focused_window() } else { 0 };
+                    if o.focus_guard {
+                        // 记下这一句盯的是哪个窗口 —— 守卫不生效时,这一行就是现场:
+                        // `0x0` 说明按下那一刻拿不到前台窗口(复核会被跳过,守卫等于没开)。
+                        let line = format!("[sainput] 焦点守卫:本句目标 0x{guard_hwnd:X}");
+                        println!("{line}");
+                        if let Some(l) = o.log.as_ref() {
+                            l.line(&line);
+                        }
+                    }
                     focus_lost = false;
                     // 上一句的尾巴还在收就又要说下一句:先把尾巴收干净再开新的,
                     // 否则两句音频会混进同一个 stream。
