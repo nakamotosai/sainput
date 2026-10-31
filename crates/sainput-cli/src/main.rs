@@ -793,6 +793,22 @@ fn edge_demo() {
 ///
 /// 用"最接近"而不是"记住上次点了哪档":配置里可能写的是任意数值(比如 `edge_spread = 63`),
 /// 菜单得显示它落在哪一档附近,而不是显示一个从来没被点过的档位。
+/// 当前边缘光帧率落在哪一档(托盘勾选用)。
+fn edge_fps_idx() -> usize {
+    use sainput_core::overlay as O;
+    let cur = O::edge_fps();
+    let mut best = 0;
+    let mut best_d = u32::MAX;
+    for (i, v) in sainput_core::tray::EDGE_FPS_CHOICES.iter().enumerate() {
+        let d = v.abs_diff(cur);
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    best
+}
+
 fn edge_param_idxs() -> (usize, usize, usize) {
     use sainput_core::tray as T;
     let nearest = |vals: &[f32], cur: f32| -> usize {
@@ -1284,13 +1300,19 @@ fn cmd_config(a: &Args, root: &Path) -> Result<()> {
         let spread = raw_spread.clamp(ov::EDGE_SPREAD_MIN, ov::EDGE_SPREAD_MAX);
         let peak = raw_peak.clamp(ov::EDGE_PEAK_MIN, ov::EDGE_PEAK_MAX);
         let speed = raw_speed.clamp(ov::EDGE_SPEED_MIN, ov::EDGE_SPEED_MAX);
+        let fps = if a.u("edge_fps", "--edge-fps", 60)? <= 45 {
+            30
+        } else {
+            60
+        };
         let clamped = if spread != raw_spread || peak != raw_peak || speed != raw_speed {
             "(越界已夹到上下限)"
         } else {
             ""
         };
         println!(
-            "边缘光参数: 带宽 {spread}px / 亮度 {peak:.2} / 速度 {speed:.1}×{clamped}(托盘三项都能现场改,改完写回配置)"
+            "边缘光参数: 带宽 {spread}px / 亮度 {peak:.2} / 速度 {speed:.1}× / 帧率 {fps}(托盘改前三项;帧率与越界值都会就近夹到合法档){clamped}",
+            fps = if a.u("edge_fps", "--edge-fps", 60)? <= 45 { 30 } else { 60 },
         );
     }
     println!("上下文偏置: {}", if c.ctx_bias { "开" } else { "关" });
@@ -2517,6 +2539,7 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
         sainput_core::overlay::set_edge_spread(a.u("edge_spread", "--edge-spread", 56)? as i32);
         sainput_core::overlay::set_edge_peak(a.f("edge_peak", "--edge-peak", 0.42)? as f32);
         sainput_core::overlay::set_edge_speed(a.f("edge_speed", "--edge-speed", 1.0)? as f32);
+        sainput_core::overlay::set_edge_fps(a.u("edge_fps", "--edge-fps", 60)? as u32);
         tray::set_flags(tray::TrayFlags {
             punct_to_space: c.punct_mode == "space",
             merge_terms: c.merge_terms,
@@ -2531,6 +2554,7 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
                 edge_spread_idx: edge_param_idxs().0,
                 edge_peak_idx: edge_param_idxs().1,
                 edge_speed_idx: edge_param_idxs().2,
+                edge_fps_idx: edge_fps_idx(),
             hotkey: cur_hotkey_conf,
             autostart: autostart::is_enabled(),
         });
@@ -2835,6 +2859,7 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
                 edge_spread_idx: edge_param_idxs().0,
                 edge_peak_idx: edge_param_idxs().1,
                 edge_speed_idx: edge_param_idxs().2,
+                edge_fps_idx: edge_fps_idx(),
                     hotkey: CUR_HOTKEY.lock().map(|g| *g).unwrap_or("rightctrl"),
                     autostart: autostart::is_enabled(),
                 });
@@ -2960,6 +2985,7 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
                 edge_spread_idx: edge_param_idxs().0,
                 edge_peak_idx: edge_param_idxs().1,
                 edge_speed_idx: edge_param_idxs().2,
+                edge_fps_idx: edge_fps_idx(),
                     hotkey: CUR_HOTKEY.lock().map(|g| *g).unwrap_or("rightctrl"),
                     autostart: autostart::is_enabled(),
                 });
@@ -3006,6 +3032,15 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
                 edge_demo();
                 println!("[sainput] 边缘光带宽 → {px}px");
                 ("edge_spread", tray::EDGE_SPREAD_CONF[i], format!("边缘光带宽:{px}px"))
+            }
+            tray::TrayToggle::SetEdgeFps(i) => {
+                let Some(v) = tray::EDGE_FPS_CHOICES.get(i).copied() else {
+                    return;
+                };
+                sainput_core::overlay::set_edge_fps(v);
+                edge_demo();
+                println!("[sainput] 边缘光帧率 → {v}fps");
+                ("edge_fps", tray::EDGE_FPS_CONF[i], format!("边缘光帧率:{v}fps"))
             }
             tray::TrayToggle::SetEdgePeak(i) => {
                 let Some(v) = tray::EDGE_PEAK_CHOICES.get(i).copied() else {
@@ -3082,6 +3117,7 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
                 edge_spread_idx: edge_param_idxs().0,
                 edge_peak_idx: edge_param_idxs().1,
                 edge_speed_idx: edge_param_idxs().2,
+                edge_fps_idx: edge_fps_idx(),
             hotkey: CUR_HOTKEY.lock().map(|g| *g).unwrap_or("rightctrl"),
             autostart: autostart::is_enabled(),
         });

@@ -70,6 +70,8 @@ const ID_EDGE_SPREAD_BASE: usize = 340;
 const ID_EDGE_PEAK_BASE: usize = 350;
 /// 边缘光**速度**子菜单基址(慢/中/快)
 const ID_EDGE_SPEED_BASE: usize = 360;
+/// 边缘光**重绘帧率**子菜单基址(60fps / 30fps 省电)
+const ID_EDGE_FPS_BASE: usize = 370;
 
 /// 带宽/亮度/速度的预置档位。
 ///
@@ -85,6 +87,10 @@ pub const EDGE_SPEED_NAMES: [&str; 3] = ["慢", "中", "快"];
 pub const EDGE_SPREAD_CONF: [&str; 3] = ["40", "56", "76"];
 pub const EDGE_PEAK_CONF: [&str; 3] = ["0.28", "0.42", "0.62"];
 pub const EDGE_SPEED_CONF: [&str; 3] = ["0.6", "1.0", "1.8"];
+/// 边缘光重绘帧率(两档;实测 60fps 自身吃 0.578 核、30fps 吃 0.255 核 —— 省 56%)。
+pub const EDGE_FPS_CHOICES: [u32; 2] = [60, 30];
+pub const EDGE_FPS_NAMES: [&str; 2] = ["60fps(默认,最滑)", "30fps(省电,省一半绘制)"];
+pub const EDGE_FPS_CONF: [&str; 2] = ["60", "30"];
 /// 释放卡住的修饰键（键盘失灵时自救）
 const ID_RELEASE_KEYS: usize = 19;
 /// 热键子菜单的基址：ID_HOTKEY_BASE + 序号。
@@ -124,6 +130,8 @@ pub enum TrayToggle {
     SetEdgeSpread(usize),
     SetEdgePeak(usize),
     SetEdgeSpeed(usize),
+    /// 边缘光重绘帧率:两档(下标见 `EDGE_FPS_CHOICES`)
+    SetEdgeFps(usize),
     /// 释放卡住的修饰键（键盘失灵时自救）
     ReleaseKeys,
 }
@@ -163,6 +171,7 @@ static FLAGS: std::sync::Mutex<TrayFlags> = std::sync::Mutex::new(TrayFlags {
     edge_spread_idx: 1,
     edge_peak_idx: 1,
     edge_speed_idx: 1,
+    edge_fps_idx: 0,
     hotkey: "rightctrl",
     autostart: false,
 });
@@ -190,6 +199,8 @@ pub struct TrayFlags {
     pub edge_spread_idx: usize,
     pub edge_peak_idx: usize,
     pub edge_speed_idx: usize,
+    /// 边缘光帧率档位下标(见 `EDGE_FPS_CHOICES`)
+    pub edge_fps_idx: usize,
     /// 当前热键的配置写法（用来在子菜单里打勾），例如 "mousex1"。
     pub hotkey: &'static str,
     /// 是否已设置开机自启。
@@ -747,6 +758,7 @@ unsafe fn show_menu(hwnd: isize) {
         edge_spread_idx: 1,
         edge_peak_idx: 1,
         edge_speed_idx: 1,
+        edge_fps_idx: 0,
         hotkey: "rightctrl",
         autostart: false,
     });
@@ -836,6 +848,7 @@ unsafe fn show_menu(hwnd: isize) {
             (ID_EDGE_SPREAD_BASE, &EDGE_SPREAD_NAMES, f.edge_spread_idx, "边缘光带宽"),
             (ID_EDGE_PEAK_BASE, &EDGE_PEAK_NAMES, f.edge_peak_idx, "边缘光亮度"),
             (ID_EDGE_SPEED_BASE, &EDGE_SPEED_NAMES, f.edge_speed_idx, "边缘光速度"),
+            // 帧率:**只有两档**,所以单列(三档那张表是 `[&str; 3]`,塞不进来)
         ];
         for (base, names, cur, title) in submenus {
             let sub = CreatePopupMenu();
@@ -852,6 +865,22 @@ unsafe fn show_menu(hwnd: isize) {
                 names.get(cur).copied().unwrap_or("-")
             ));
             AppendMenuW(ovl_menu, MF_STRING | MF_POPUP, sub as usize, t.as_ptr());
+        }
+        // 帧率单列:上面那张表是 `[&str; 3]`,这里是两档
+        {
+            let sub = CreatePopupMenu();
+            if sub != 0 {
+                for (i, name) in EDGE_FPS_NAMES.iter().enumerate() {
+                    let l = wide(name);
+                    let checked = if i == f.edge_fps_idx { MF_CHECKED } else { 0 };
+                    AppendMenuW(sub, MF_STRING | checked, ID_EDGE_FPS_BASE + i, l.as_ptr());
+                }
+                let t = wide(&format!(
+                    "边缘光帧率(当前:{})",
+                    EDGE_FPS_NAMES.get(f.edge_fps_idx).copied().unwrap_or("-")
+                ));
+                AppendMenuW(ovl_menu, MF_STRING | MF_POPUP, sub as usize, t.as_ptr());
+            }
         }
         AppendMenuW(menu, MF_STRING | MF_POPUP, ovl_menu as usize, ovl_title.as_ptr());
     }
@@ -928,6 +957,9 @@ fn queue_toggle(id: usize) {
         }
         _ if id >= ID_EDGE_SPEED_BASE && id < ID_EDGE_SPEED_BASE + 3 => {
             Some(TrayToggle::SetEdgeSpeed(id - ID_EDGE_SPEED_BASE))
+        }
+        _ if id >= ID_EDGE_FPS_BASE && id < ID_EDGE_FPS_BASE + 2 => {
+            Some(TrayToggle::SetEdgeFps(id - ID_EDGE_FPS_BASE))
         }
         _ => None,
     };

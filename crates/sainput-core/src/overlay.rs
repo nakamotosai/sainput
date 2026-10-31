@@ -117,6 +117,11 @@ fn edge_clock() -> (f32, f32) {
     (breath, flow)
 }
 
+/// 边缘光**缓动**的上一拍时刻(用来把"每帧 6%"折算成与帧率无关的等效系数)。
+static EDGE_LAST_TICK: std::sync::OnceLock<Mutex<std::time::Instant>> = std::sync::OnceLock::new();
+/// 边缘光**上一次真正重画**的时刻(30fps 时靠它隔拍跳过整屏绘制)。
+static EDGE_LAST_PAINT: std::sync::OnceLock<Mutex<std::time::Instant>> = std::sync::OnceLock::new();
+
 // ---- 设计规格 ----
 const PAD_X: i32 = 24;          // 左右内边距（放大后按比例加宽）
 const PAD_TOP: i32 = 18;
@@ -212,6 +217,28 @@ pub fn set_edge_speed(v: f32) {
     EDGE_SPEED_MILLI.store((v * 1000.0) as u32, Ordering::Relaxed);
 }
 /// 最亮处的白色不透明度（0..1）。
+/// 边缘光重绘帧率(**只有 60 和 30 两档**)。
+///
+/// 为什么要它:边缘光是**整屏**逐帧重绘 + 整屏 `UpdateLayeredWindow`,60fps 下这一项
+/// 就能吃掉一个核的可观份额(T6.6)。30fps 把它砍一半,代价是动画少一半帧 ——
+/// 呼吸(2200ms)和流动(8000ms)都是慢动画,少一半帧看不太出来。
+///
+/// ⚠️ 降帧率**不能改动画时长**:缓动原来是"每帧走 6%",帧率一砍半淡入淡出就慢一倍
+/// (用户看到的是"变迟钝"而不是"省电")。所以缓动改成了按实际间隔折算等效系数
+/// (见 `EDGE_LAST_TICK` 那段),这样两档的淡入时长一致,只有平滑度不同。
+static EDGE_FPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(60);
+
+/// 边缘光重绘帧率(60 或 30)。
+pub fn edge_fps() -> u32 {
+    EDGE_FPS.load(Ordering::Relaxed)
+}
+
+/// 设边缘光重绘帧率:只认 30 和 60,其它值就近夹到这两档
+/// (写 45 只会让人以为"生效了",其实两档之外没有第三条路)。
+pub fn set_edge_fps(v: u32) {
+    EDGE_FPS.store(if v <= 45 { 30 } else { 60 }, Ordering::Relaxed);
+}
+
 const EDGE_PEAK_DEFAULT: f32 = 0.42;
 pub const EDGE_PEAK_MIN: f32 = 0.10;
 pub const EDGE_PEAK_MAX: f32 = 0.90;
@@ -913,13 +940,23 @@ unsafe fn sync(hwnd: isize) {
         };
         let target = g.edge_target;
         let cur = g.edge_level;
-        // 每 16ms 一拍(≈60fps)。系数 0.06 → 淡入约 350ms、淡出约 500ms。
-        // 早先 40ms + 0.18,理论 200ms 就该亮完,但实测每帧要 247ms,
-        // 十几帧被拖成好几秒 —— 用户看到的是"啪一下出现"。帧率才是丝滑的前提。
+        // 缓动系数按**实际间隔**折算:60fps(16ms)时等效于原来的 0.06 ——
+        // 淡入约 350ms、淡出约 500ms;30fps(33ms)时系数自动变大,
+        // **时长不变**(只有平滑度降低)。写死"每帧 6%"会在降帧率时把时长翻倍。
+        let dt_ms = {
+            let mut last = EDGE_LAST_TICK
+                .get_or_init(|| Mutex::new(std::time::Instant::now()))
+                .lock()
+                .unwrap();
+            let dt = last.elapsed().as_secs_f32() * 1000.0;
+            *last = std::time::Instant::now();
+            dt.clamp(1.0, 100.0)
+        };
+        let k = 1.0 - (1.0 - 0.06f32).powf(dt_ms / 16.0);
         let next = if (target - cur).abs() < 0.006 {
             target
         } else {
-            cur + (target - cur) * 0.06
+            cur + (target - cur) * k
         };
         g.edge_level = next;
         if target == 0.0 && next <= 0.01 {
@@ -956,7 +993,22 @@ unsafe fn sync(hwnd: isize) {
     //
     // 边缘光**保留逐帧**:它的呼吸(2200ms)和流动(8000ms)是连续动画,门控会看出卡顿。
     // 降帧率是另一条(有观感代价)的选项,不在本次改动里。
-    let repaint = changed || mode == Mode::Edge || (mode == Mode::Orb && orb_levels_changed());
+    // 边缘光按 `edge_fps()` 的节拍重画:30fps 时**隔一拍才画一次**(省一半整屏绘制)。
+    // 注意缓动在上面已经按真实间隔算过,所以"少画"只影响平滑度,不影响时长。
+    let edge_due = mode == Mode::Edge && {
+        let budget = std::time::Duration::from_millis((1000 / edge_fps().max(1)) as u64);
+        let mut last = EDGE_LAST_PAINT
+            .get_or_init(|| Mutex::new(std::time::Instant::now() - budget))
+            .lock()
+            .unwrap();
+        if last.elapsed() >= budget {
+            *last = std::time::Instant::now();
+            true
+        } else {
+            false
+        }
+    };
+    let repaint = changed || edge_due || (mode == Mode::Orb && orb_levels_changed());
 
     // 这块窗口是整屏的,所以「画布坐标 == 屏幕坐标」;
     // 下面算出来的 (x,y,w,h) 是**内容在画布里的矩形**(不再是窗口的位置/尺寸)。

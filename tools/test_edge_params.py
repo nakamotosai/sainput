@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""T6.1 回归:边缘光的带宽/亮度/速度能在托盘里现场改,并且写回 sainput.conf。
+"""T6.1/T6.6 回归:边缘光的帧率/带宽/亮度/速度能在托盘里现场改,并且写回 sainput.conf。
 
 为什么这么测(和仓库既有的 `tools/test_tray_menu.ps1` 同一套原理):
 截图只能看"长相",验证不了"点完配置有没有变"。这里直接给托盘窗口发
 `WM_COMMAND(id)`,然后读配置文件 —— 判据是**可机检**的:
+  帧率 30fps(370+1) → edge_fps  = 30
   带宽 宽(340+2) → edge_spread = 76
   亮度 亮(350+2) → edge_peak   = 0.62
   速度 慢(360+0) → edge_speed  = 0.6
@@ -37,6 +38,7 @@ TRAY_CLASS = "SainputTrayWnd"
 ID_EDGE_SPREAD_BASE = 340
 ID_EDGE_PEAK_BASE = 350
 ID_EDGE_SPEED_BASE = 360
+ID_EDGE_FPS_BASE = 370
 
 
 def find(rel, what):
@@ -94,6 +96,7 @@ def main():
         print(f"托盘窗口 = {tray:#x} (pid {epid})")
 
         cases = [
+            ("帧率 → 30fps(省电)", ID_EDGE_FPS_BASE + 1, "edge_fps", "30"),
             ("带宽 → 宽(76px)", ID_EDGE_SPREAD_BASE + 2, "edge_spread", "76"),
             ("亮度 → 亮(0.62)", ID_EDGE_PEAK_BASE + 2, "edge_peak", "0.62"),
             ("速度 → 慢(0.6×)", ID_EDGE_SPEED_BASE + 0, "edge_speed", "0.6"),
