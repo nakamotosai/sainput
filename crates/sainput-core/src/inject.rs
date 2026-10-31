@@ -556,7 +556,12 @@ fn post_chars(hwnd: isize, s: &str) -> Result<()> {
     for unit in s.encode_utf16() {
         let ok = unsafe { PostMessageW(hwnd, WM_CHAR, unit as usize, 0) };
         if ok == 0 {
-            anyhow::bail!("PostMessage(WM_CHAR) 失败:窗口句柄 {hwnd:#x}");
+            let err = unsafe { GetLastError() };
+            let alive = unsafe { IsWindow(hwnd) } != 0;
+            anyhow::bail!(
+                "PostMessage(WM_CHAR) 失败:窗口句柄 {hwnd:#x} win32_err={err} 句柄有效={alive} 字符={:?}",
+                char::from_u32(unit as u32)
+            );
         }
     }
     Ok(())
@@ -571,6 +576,20 @@ fn post_chars(_hwnd: isize, _s: &str) -> Result<()> {
 #[link(name = "user32")]
 extern "system" {
     fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+    /// 报错时带上 win32 错误码 —— 只给一个句柄等于没给现场(2026-10-31 加)。
+    fn IsWindow(hwnd: isize) -> i32;
+}
+
+#[cfg(not(windows))]
+unsafe fn IsWindow(_h: isize) -> i32 { 0 }
+
+#[cfg(not(windows))]
+unsafe fn GetLastError() -> u32 { 0 }
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetLastError() -> u32;
 }
 
 /// 消息通道里「退格之后要等多久才补打下一个字符」。

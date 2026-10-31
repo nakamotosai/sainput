@@ -6,6 +6,7 @@
 
 # ── Rust 构建产物 ──
 /target
+/target-test
 
 # ── 个人配置与运行时状态（提交同名 .example，不提交真实文件）──
 /sainput.conf

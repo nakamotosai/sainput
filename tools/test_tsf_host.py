@@ -16,8 +16,8 @@ import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 CANDIDATES = [
-    REPO / "target/x86_64-pc-windows-gnu/release/sainput-tsf-host.exe",
-    REPO / "target/release/sainput-tsf-host.exe",
+    REPO / "target-test/x86_64-pc-windows-gnu/release/sainput-tsf-host.exe",
+    REPO / "target-test/release/sainput-tsf-host.exe",
     REPO / "target/x86_64-pc-windows-msvc/release/sainput-tsf-host.exe",
 ]
 CN = "你好abc123,这是宿主壳自检。"

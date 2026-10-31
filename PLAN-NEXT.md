@@ -39,8 +39,14 @@ sainput 的快通道(M1)与质量层(M2)已交付并冻结;剩下的是**上屏�
 
 **结论**:私有桌面上 TSF 运行时可用,级别 A 测试床成立。
 
-### 1.2 两个已踩到的坑(自建启动器必须规避)
+### 1.2 三个已踩到的坑(自建启动器 / 测试必须规避)
 
+0. **窗口句柄是"桌面作用域"的 —— 但作用域按"谁持有那张桌面的句柄"算,不是按进程跑在哪张桌面**
+   (2026-10-31 实测)。同一个进程里:调用过 `CreateDesktop` 的那个进程能寻址那张桌上的窗口
+   (`IsWindow` 为真、`PostMessage` 成功),而它**派生出去的子进程**(没继承桌面句柄)
+   对同一个句柄 `IsWindow` 返回假、`PostMessage` 报 `1400 ERROR_INVALID_WINDOW_HANDLE`。
+   后果:引擎与宿主壳**必须一起起在同一张私有桌面上**(`tools/test_compose_path.py` 就是这么做的);
+   TSF 那条线不受影响 —— DLL 就跑在宿主进程里,而引擎与 DLL 之间走命名管道(与桌面无关)。
 1. **`CREATE_NO_WINDOW(0x8)` 会让私有桌面上的 `powershell.exe` 子进程秒退**(退出码 0、什么都不执行)。
    自建启动器一律 `dwCreationFlags = 0`。
 2. `windows-hidden-desktop-verify` 技能里的 `hidden-desktop-launch.ps1` 在本机 PS 5.1 上
@@ -80,7 +86,7 @@ sainput 的快通道(M1)与质量层(M2)已交付并冻结;剩下的是**上屏�
 |---|---|---|---|---|
 | T0.1 | `tools/hdesk.py`:自建私有桌面启动器(建桌面 / 起进程 / 等退出或常驻 / 枚举窗口计数 / 回收) | 能把一个窗口程序跑在私有桌面,且 console 桌面枚举该 pid 顶层窗口 = 0 | A | ✅ |
 | T0.2 | `crates/sainput-tsf-host`:测试目标壳(窗口 + `EDIT` + 落日志)+ `hdesk readtext` 跨进程读回 | 私有桌面上自检通过,内容一字不差写进日志 | A | ✅ |
-| T0.3 | 引擎确定性入口:`sainput --selftest compose "文本"`(不走麦克风/热键,直接喂 composer) | 现有 SendInput 通道下,host 里能看到该文本 | A | ⬜ |
+| T0.3 | 引擎确定性入口:`sainput selftest compose <文本> --hwnd … --mode wmchar`(不走麦克风/热键;可 `--frames` 模拟流式、`--pre` 先投错版) | 私有桌面宿主壳里读回一字不差 | A | ✅ |
 
 ### 阶段 1 —— TSF 最小可运行纵向切片
 
@@ -126,6 +132,7 @@ sainput 的快通道(M1)与质量层(M2)已交付并冻结;剩下的是**上屏�
 | T4.2 | final 之后丢弃迟到 streaming | 定稿不再被改写 | A | ⬜ |
 | T4.3 | 焦点变更丢弃提交 | 半句不落到别的窗口 | A | ⬜ |
 | T4.4 | 上述三条的回归脚本 | 一条命令跑完、结论可读 | A | ⬜ |
+| **T4.5** | **消息通道退格落点**(T0.3 现场抓到的既有缺陷):经典控件不处理 posted 的 `WM_KEYDOWN VK_BACK`,真正删除来自应用自己 `TranslateMessage` 生成的 `WM_CHAR(0x08)`,而那条被排在"补打文本"之后 → **删掉的是句尾而不是该删的那几个字**。修法:按目标类决定退格方式(经典 `Edit`/RichEdit 用 `WM_CHAR(0x08)`;Qt/终端等仍用 `WM_KEYDOWN/UP`),判据从 `decide_key_mode` 已有的类名判断拿 | 私有桌面宿主壳上「先投错版再定稿」读回一字不差 | A | ⬜ |
 
 ### 阶段 5 —— 慢路径纠错(M4)
 

@@ -2943,8 +2943,89 @@ fn cmd_selftest(args: &[String]) -> Result<()> {
             println!("[selftest] SendInput 已接受全部事件（目标窗口是否显示取决于它是否接受注入）");
             Ok(())
         }
+        Some("compose") => {
+            // 确定性入口(测试床 T0.3):**不走麦克风、不走热键**,直接把文本喂给上屏器
+            // (`StreamWriter`)—— 回归脚本靠它驱动真实的上屏算术(前缀/退格/补打),
+            // 靶子是跑在私有桌面上的 `sainput-tsf-host`(见 tools/hdesk.py)。
+            let text = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "sainput 上屏自检 ABC 123".to_string());
+            let hwnd = match opt(args, "--hwnd") {
+                Some(v) => {
+                    let v = v.trim().to_string();
+                    match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+                        Some(h) => isize::from_str_radix(h, 16)
+                            .with_context(|| format!("--hwnd 不是十六进制: {v}"))?,
+                        None => v
+                            .parse::<isize>()
+                            .with_context(|| format!("--hwnd 不是数字: {v}"))?,
+                    }
+                }
+                None => 0,
+            };
+            let mode = match opt(args, "--mode").as_deref() {
+                Some("keys") | None => inject::KeyMode::Keys,
+                Some("wmchar") => inject::KeyMode::WmChar(hwnd),
+                Some("wmchar-final") => inject::KeyMode::WmCharFinal(hwnd),
+                Some(other) => anyhow::bail!("--mode 只支持 keys / wmchar / wmchar-final,收到 {other}"),
+            };
+            if mode.is_wmchar() && hwnd == 0 {
+                anyhow::bail!("消息通道模式必须给 --hwnd 0x…(SendInput 到不了别的桌面)");
+            }
+            let prefix = match opt(args, "--prefix").as_deref() {
+                Some("space") => " ".to_string(),
+                Some(other) => other.to_string(),
+                None => String::new(),
+            };
+            let frames: usize = opt(args, "--frames")
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(1)
+                .max(1);
+            let max_bs: usize = opt(args, "--max-backspace")
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(usize::MAX);
+
+            let mut w = inject::StreamWriter::new(max_bs, true);
+            w.set_mode(mode);
+            if !prefix.is_empty() {
+                w.set_prefix(&prefix);
+            }
+            // `--pre`:先投递一个**错的**版本,再定稿成正确的 —— 走的是退格改写那段算术
+            // (识别结果回头改字就是这条路),也是回归里最容易踩坏的一段。
+            if let Some(pre) = opt(args, "--pre") {
+                w.update(&pre)?;
+            }
+            // 模拟流式:把文本切成 `frames` 段逐段 update,最后 finalize 定稿。
+            let chars: Vec<char> = text.chars().collect();
+            if frames > 1 && !chars.is_empty() {
+                for f in 1..frames {
+                    let upto = chars.len() * f / frames;
+                    let partial: String = chars[..upto].iter().collect();
+                    w.update(&partial)?;
+                }
+            }
+            w.finalize(&text, max_bs)?;
+            println!(
+                "[selftest] compose 已投递 mode={} frames={frames}",
+                inject::describe_target(w.mode())
+            );
+            println!("           text={text:?} prefix={prefix:?}");
+            println!(
+                "           typed_chars={} backspaces={}",
+                w.typed_chars, w.backspaces
+            );
+            Ok(())
+        }
         _ => {
-            println!("用法: sainput selftest inject <text>");
+            println!("用法:");
+            println!("  sainput selftest inject <text>              # 3 秒后打进当前焦点窗口");
+            println!("  sainput selftest compose <text> [选项]      # 确定性入口,直接喂 composer");
+            println!("      --hwnd 0x…          目标窗口(消息通道必给;SendInput 到不了别的桌面)");
+            println!("      --mode keys|wmchar|wmchar-final");
+            println!("      --prefix space      句首补一个空格(进同一条退格算术)");
+            println!("      --frames N          模拟流式:切成 N 段逐段 update");
+            println!("      --pre <文本>        先投一个错的版本再定稿(走退格改写算术)");
             Ok(())
         }
     }

@@ -157,11 +157,24 @@ fn read_edit(edit: isize) -> String {
     }
 }
 
-fn pump() {
+fn pump(trace: Option<&Log>, translate: bool) {
+    const WM_KEYDOWN: u32 = 0x0100;
+    const WM_KEYUP: u32 = 0x0101;
     let mut msg = Msg::default();
     unsafe {
         while PeekMessageW(&mut msg, 0, 0, 0, PM_REMOVE) != 0 {
-            TranslateMessage(&msg);
+            if let Some(lg) = trace {
+                match msg.message {
+                    WM_CHAR | WM_KEYDOWN | WM_KEYUP => lg.line(&format!(
+                        "  msg 0x{:04x} wparam=0x{:x} lparam=0x{:x} -> edit 0x{:x}",
+                        msg.message, msg.w_param, msg.l_param, msg.l_param
+                    )),
+                    _ => {}
+                }
+            }
+            if translate {
+                TranslateMessage(&msg);
+            }
             DispatchMessageW(&msg);
         }
     }
@@ -191,6 +204,12 @@ struct Args {
     selftest_file: Option<PathBuf>,
     dump_every: u64,
     title: String,
+    /// 不调 `TranslateMessage`(`--no-translate`):用来把「posted 的 WM_KEYDOWN 到底
+    /// 有没有被控件处理」和「TranslateMessage 生成的那条 WM_CHAR(0x08)」分开。
+    no_translate: bool,
+    /// 逐条消息落盘(`--trace`):哪个字符/按键什么时候真的到了窗口 —— 排查
+    /// 「上屏顺序/丢字」这类问题时,只有这条记录是现场。
+    trace: bool,
 }
 
 fn parse_args() -> Args {
@@ -201,6 +220,8 @@ fn parse_args() -> Args {
         selftest_file: None,
         dump_every: 250,
         title: "sainput tsf host".into(),
+        trace: false,
+        no_translate: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -212,6 +233,8 @@ fn parse_args() -> Args {
             "--selftest-file" => a.selftest_file = it.next().map(PathBuf::from),
             "--dump-every" => a.dump_every = it.next().and_then(|v| v.parse().ok()).unwrap_or(250),
             "--title" => a.title = it.next().unwrap_or(a.title),
+            "--trace" => a.trace = true,
+            "--no-translate" => a.no_translate = true,
             other => eprintln!("[host] unknown arg: {other}"),
         }
     }
@@ -241,6 +264,7 @@ fn main() {
         };
         let atom = RegisterClassW(&wc);
         log.line(&format!("RegisterClass atom={atom}"));
+        let trace_ref = if a.trace { Some(&log) } else { None };
 
         let title = wide(&a.title);
         let hwnd = CreateWindowExW(
@@ -286,7 +310,7 @@ fn main() {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, edit);
         ShowWindow(hwnd, SW_SHOW);
         SetFocus(edit);
-        pump();
+        pump(trace_ref, !a.no_translate);
 
         log.line(&format!(
             "window=0x{hwnd:x} edit=0x{edit:x} focused={}",
@@ -311,7 +335,7 @@ fn main() {
             }
             let t0 = Instant::now();
             while t0.elapsed() < Duration::from_millis(400) {
-                pump();
+                pump(trace_ref, !a.no_translate);
                 std::thread::sleep(Duration::from_millis(5));
             }
             let after = read_edit(edit);
@@ -330,7 +354,7 @@ fn main() {
         let deadline = start + Duration::from_millis(a.life_ms);
         let mut last_dump = Instant::now();
         while !DESTROYED.load(Ordering::SeqCst) && Instant::now() < deadline {
-            pump();
+            pump(trace_ref, !a.no_translate);
             std::thread::sleep(Duration::from_millis(5));
             if last_dump.elapsed() >= Duration::from_millis(a.dump_every.max(20)) {
                 last_dump = Instant::now();
@@ -346,6 +370,6 @@ fn main() {
         log.line(&format!("final text={final_text:?}"));
         println!("[host] final text={final_text:?}");
         DestroyWindow(hwnd);
-        pump();
+        pump(None, false);
     }
 }
