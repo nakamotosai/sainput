@@ -141,6 +141,18 @@ const IID_IUNKNOWN: Guid =
 const IID_ITF_CONTEXT_COMPOSITION: Guid =
     Guid::from_parts(0xD40C_8AAE, 0xAC92, 0x4FC7, [0x9A, 0x11, 0x0E, 0xE0, 0xE2, 0x3A, 0xA3, 0x9B]);
 /// `ITfCompositionSink`(msctf.idl:`uuid(A781718C-579A-4B15-A280-32B8577ACC5E)` = 本机 SDK 抄的)。
+/// `ITfThreadMgrEventSink`(msctf.idl:aa80e80e-2021-11d2-93e0-0060b067b86e)。
+///
+/// **为什么必须有它**:上下文只在 `Activate` 那一刻取一次是错的 —— 真实应用被激活时
+/// 通常**没有**焦点输入框(用户是后来才点进搜索框/编辑区的)。2026-10-31 在 ego(Chromium)
+/// 里实测:日志是 `compose request:没有上下文(attach 没成功)`,而我们的 harness 之所以
+/// "有上下文",只是因为它的控件在激活前就建好了 —— 靶子的巧合掩盖了缺陷。
+/// 正解就是 TSF 本来的机制:焦点一变(`OnSetFocus`)就重挂当前上下文。
+const IID_ITF_THREAD_MGR_EVENT_SINK: Guid =
+    Guid::from_parts(0xAA80_E80E, 0x2021, 0x11D2, [0x93, 0xE0, 0x00, 0x60, 0xB0, 0x67, 0xB8, 0x6E]);
+/// `ITfSource`(msctf.idl:4ea48a35-60ae-446f-8fd6-e6a8d82459f7)。
+const IID_ITF_SOURCE: Guid =
+    Guid::from_parts(0x4EA4_8A35, 0x60AE, 0x446F, [0x8F, 0xD6, 0xE6, 0xA8, 0xD8, 0x24, 0x59, 0xF7]);
 /// `IID_IMarshal`(objidl.h:00000003-0000-0000-C000-000000000046)。
 const IID_IMARSHAL: Guid =
     Guid::from_parts(0x0000_0003, 0x0000, 0x0000, [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46]);
@@ -436,6 +448,114 @@ static SESSION_VTBL: EditSessionVtbl = EditSessionVtbl {
     do_edit_session: session_do_edit,
 };
 
+// ---------------------------------------------------------------- 焦点变化(重挂上下文)
+
+#[repr(C)]
+struct FocusSinkVtbl {
+    base: UnknownVtbl,
+    on_init_document_mgr: unsafe extern "system" fn(*mut c_void, *mut c_void) -> Hresult,
+    on_uninit_document_mgr: unsafe extern "system" fn(*mut c_void, *mut c_void) -> Hresult,
+    on_set_focus: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> Hresult,
+    on_push_context: unsafe extern "system" fn(*mut c_void, *mut c_void) -> Hresult,
+    on_pop_context: unsafe extern "system" fn(*mut c_void, *mut c_void) -> Hresult,
+}
+
+#[repr(C)]
+struct FocusSink {
+    vtbl: *const FocusSinkVtbl,
+    refs: AtomicU32,
+}
+
+unsafe extern "system" fn focus_qi(this: *mut c_void, riid: *const Guid, ppv: *mut *mut c_void) -> Hresult {
+    if riid.is_null() || ppv.is_null() {
+        return E_FAIL;
+    }
+    let want = unsafe { *riid };
+    if want == IID_IUNKNOWN || want == IID_ITF_THREAD_MGR_EVENT_SINK {
+        unsafe { *ppv = this };
+        unsafe { focus_add_ref(this) };
+        S_OK
+    } else {
+        unsafe { *ppv = std::ptr::null_mut() };
+        E_NOINTERFACE
+    }
+}
+
+unsafe extern "system" fn focus_add_ref(this: *mut c_void) -> u32 {
+    let s = unsafe { &*(this as *const FocusSink) };
+    s.refs.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+unsafe extern "system" fn focus_release(this: *mut c_void) -> u32 {
+    let s = unsafe { &*(this as *const FocusSink) };
+    s.refs.fetch_sub(1, Ordering::SeqCst) - 1
+}
+
+unsafe extern "system" fn focus_on_init(_t: *mut c_void, _dim: *mut c_void) -> Hresult {
+    S_OK
+}
+unsafe extern "system" fn focus_on_uninit(_t: *mut c_void, _dim: *mut c_void) -> Hresult {
+    S_OK
+}
+
+/// **焦点变了**:把当前上下文换成新的那个。`pdimFocus` 为空 = 焦点离开了所有文档。
+unsafe extern "system" fn focus_on_set_focus(
+    _t: *mut c_void,
+    dim_focus: *mut c_void,
+    _dim_prev: *mut c_void,
+) -> Hresult {
+    attach_from_doc_mgr(dim_focus, "OnSetFocus");
+    S_OK
+}
+
+unsafe extern "system" fn focus_on_push(_t: *mut c_void, _ctx: *mut c_void) -> Hresult {
+    S_OK
+}
+unsafe extern "system" fn focus_on_pop(_t: *mut c_void, _ctx: *mut c_void) -> Hresult {
+    S_OK
+}
+
+static FOCUS_SINK_VTBL: FocusSinkVtbl = FocusSinkVtbl {
+    base: UnknownVtbl {
+        query_interface: focus_qi,
+        add_ref: focus_add_ref,
+        release: focus_release,
+    },
+    on_init_document_mgr: focus_on_init,
+    on_uninit_document_mgr: focus_on_uninit,
+    on_set_focus: focus_on_set_focus,
+    on_push_context: focus_on_push,
+    on_pop_context: focus_on_pop,
+};
+
+static FOCUS_SINK: LazyLock<usize> = LazyLock::new(|| {
+    let s = Box::new(FocusSink {
+        vtbl: &FOCUS_SINK_VTBL,
+        refs: AtomicU32::new(1),
+    });
+    Box::into_raw(s) as usize
+});
+
+/// 把某个文档管理器(焦点那一个)的顶层上下文记下来 —— 组合态写的就是它。
+unsafe fn attach_from_doc_mgr(dim: *mut c_void, why: &str) {
+    if dim.is_null() {
+        CURRENT_CTX.store(0, Ordering::SeqCst);
+        trace(&format!("compose {why}:焦点离开文档,清空上下文"));
+        return;
+    }
+    let dvt = unsafe { *(dim as *const *const DocMgrPrefix) };
+    let mut ctx: *mut c_void = std::ptr::null_mut();
+    let hr = unsafe { ((*dvt).get_top)(dim, &mut ctx) };
+    if hr == 0 && !ctx.is_null() {
+        CURRENT_CTX.store(ctx as usize, Ordering::SeqCst);
+        CURRENT_TID.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
+        trace(&format!("compose {why}:上下文已更新 ctx={ctx:p} hr=0x0"));
+        ensure_owner_window();
+    } else {
+        trace(&format!("compose {why}:GetTop hr={} ctx={ctx:p}(没拿到)", hr_string(hr)));
+    }
+}
+
 // ---------------------------------------------------------------- 组合态接收端(sink)
 
 unsafe extern "system" fn sink_qi(this: *mut c_void, riid: *const Guid, ppv: *mut *mut c_void) -> Hresult {
@@ -519,6 +639,55 @@ pub unsafe fn attach_context(tm: *mut c_void, tid: u32) {
         // 组合态要在这个线程上执行(见 `owner_wndproc` 的说明)。这里就是属主线程 ——
         // 建一个消息窗口当投递口。
         ensure_owner_window();
+    }
+    advise_focus_sink(tm);
+}
+
+/// 挂上 `ITfThreadMgrEventSink`:此后**焦点一变**我们就会收到 `OnSetFocus`。
+///
+/// 只挂一次(重复 Activate 时不重复挂)。挂不上不影响其它功能,只是"激活时没有焦点"的应用
+/// 我们会一直拿不到上下文 —— 那就退回旧通道,不丢字。
+fn advise_focus_sink(tm: *mut c_void) {
+    use std::sync::atomic::AtomicBool;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    unsafe {
+        // 线程管理器的 QI:用标准的 UnknownVtbl 视图(前缀结构里那个槽位只是占位 usize)
+        let uvt = *(tm as *const *const UnknownVtbl);
+        let iid = IID_ITF_SOURCE;
+        let mut src: *mut c_void = std::ptr::null_mut();
+        let hr = ((*uvt).query_interface)(tm, &iid, &mut src);
+        if hr != 0 || src.is_null() {
+            trace(&format!(
+                "compose 拿不到 ITfSource(hr={})(挂不上焦点 sink,只能是 Activate 那一刻的上下文)",
+                hr_string(hr)
+            ));
+            DONE.store(false, Ordering::SeqCst);
+            return;
+        }
+        // ITfSource 的槽位:QI/AddRef/Release/AdviseSink/UnadviseSink
+        #[repr(C)]
+        struct SourceVtbl {
+            query_interface: usize,
+            add_ref: usize,
+            release: usize,
+            advise_sink: unsafe extern "system" fn(*mut c_void, *const Guid, *mut c_void, *mut u32) -> Hresult,
+            unadvise_sink: usize,
+        }
+        let svt = *(src as *const *const SourceVtbl);
+        let sink = *FOCUS_SINK as *mut c_void;
+        let mut cookie: u32 = 0;
+        let sid = IID_ITF_THREAD_MGR_EVENT_SINK;
+        let hr = ((*svt).advise_sink)(src, &sid, sink, &mut cookie);
+        trace(&format!(
+            "compose 焦点 sink 挂载 hr={} cookie={cookie}(从此焦点变化会重挂上下文)",
+            hr_string(hr)
+        ));
+        if hr != 0 {
+            DONE.store(false, Ordering::SeqCst);
+        }
     }
 }
 

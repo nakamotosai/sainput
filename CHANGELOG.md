@@ -7,6 +7,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **TSF:焦点一变就重挂上下文(组合态的前置缺陷)**。原来只在 `ITfTextInputProcessor::Activate`
+  那一刻取一次焦点上下文 —— 真实应用被激活时通常**没有**焦点输入框(用户是后来才点进搜索框的),
+  于是在真应用里组合态连上下文都没有(`compose request:没有上下文`),永远不可能工作;我们的
+  测试宿主之所以"有上下文",只是因为它把控件建在了激活之前,靶子的巧合把缺陷盖住了。
+  现在实现 `ITfThreadMgrEventSink::OnSetFocus` 并用 `ITfSource::AdviseSink` 挂上,焦点变化即重挂。
+  实测:挂载 `hr=0x0 cookie=67108866`,随后收到 `OnSetFocus` 并更新上下文(含焦点离开文档时清空)。
+
 ### Changed
 
 - **TSF 回调对象改为可编组(组合态仍不通,但这本身是对的)**。给组合态 sink 聚合
