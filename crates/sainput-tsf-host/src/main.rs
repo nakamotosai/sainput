@@ -263,6 +263,8 @@ struct Args {
     tfstore: bool,
     /// 假存储里的初始文本(空上下文会被 TSF 判定 `TF_E_EMPTYCONTEXT` 驳回写事务)。
     store_seed: String,
+    /// `--probe-ctx`:探一探**当前焦点上下文**支持哪些 TSF 接口(不用假存储)。
+    probe_ctx: bool,
     /// `--enum-profiles`:把 msctf 眼里的输入法列出来(T1.1 排障用)。
     enum_profiles: bool,
     /// `--activate-hold <ms>`:激活后停这么久再做别的(T1.4 实验窗口)。
@@ -293,6 +295,7 @@ fn parse_args() -> Args {
         report_profile: false,
         enum_profiles: false,
         tfstore: false,
+        probe_ctx: false,
         store_seed: "这是窗口里原有的文本。".into(),
         set_default: None,
         activate_legacy: false,
@@ -319,6 +322,7 @@ fn parse_args() -> Args {
             "--report-profile" => a.report_profile = true,
             "--enum-profiles" => a.enum_profiles = true,
             "--tfstore" => a.tfstore = true,
+            "--probe-ctx" => a.probe_ctx = true,
             "--store-seed" => a.store_seed = it.next().unwrap_or(a.store_seed),
             "--activate-legacy" => a.activate_legacy = true,
             "--set-default" => {
@@ -362,7 +366,7 @@ fn main() {
                 profile::snapshot(&log, "旁观");
             }
             if let Some(dll) = a.load_tip.clone() {
-                let ok = tip::run_mode(&dll, a.tip_hold, a.activate_profile, a.activate_legacy, a.activate_hold, &log);
+                let ok = tip::run_mode(&dll, a.tip_hold, a.activate_profile, a.activate_legacy, a.activate_hold, a.probe_ctx, &log);
                 log.line(&format!("tip RESULT {}", if ok { "PASS" } else { "FAIL" }));
             }
         }
@@ -473,7 +477,15 @@ fn main() {
             unsafe { store::create_context(&log, a.log.clone(), &a.store_seed) };
         }
         if let Some(dll) = a.load_tip.clone() {
-            let ok = tip::run_mode(&dll, a.tip_hold, a.activate_profile, a.activate_legacy, a.activate_hold, &log);
+            let ok = tip::run_mode(
+                &dll,
+                a.tip_hold,
+                a.activate_profile,
+                a.activate_legacy,
+                a.activate_hold,
+                a.probe_ctx,
+                &log,
+            );
             log.line(&format!("tip RESULT {}", if ok { "PASS" } else { "FAIL" }));
             println!("[host] tip {}", if ok { "PASS" } else { "FAIL" });
         }

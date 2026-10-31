@@ -115,6 +115,7 @@ pub unsafe fn run_mode(
     activate_for_process: bool,
     activate_legacy: bool,
     activate_hold_ms: u64,
+    probe_ctx: bool,
     log: &Log,
 ) -> bool {
     let trace_ref = if log.tracing { Some(log) } else { None };
@@ -216,6 +217,9 @@ pub unsafe fn run_mode(
 
     // 4b) T1.1:按 TF_IPPMF_FORPROCESS 在本进程激活我们的 TIP,
     //     并且看焦点文档管理器到底有没有出现(有它才谈得上组合态)。
+    if probe_ctx {
+        unsafe { crate::store::probe_focus_context(tm, log) };
+    }
     if activate_legacy {
         let ok11 = unsafe { crate::profile::activate_legacy(log, tm) };
         ok &= ok11;

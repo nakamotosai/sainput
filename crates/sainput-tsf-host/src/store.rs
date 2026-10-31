@@ -865,6 +865,52 @@ unsafe fn mark_thread_not_empty(tm: *mut c_void, tid: u32, log: &Log) {
     log.line(&format!("store 全局 SetValue(EMPTYCONTEXT=FALSE) hr={hr:#x}"));
 }
 
+/// 拿"当前焦点上下文"来探(不用假存储那条路:真实会话里标准控件的 TSF 兼容存储
+/// 本来就会出现,那才是生产形态)。
+pub unsafe fn probe_focus_context(tm: *mut c_void, log: &Log) -> bool {
+    if tm.is_null() {
+        log.line("probe 焦点上下文:没有线程管理器");
+        return false;
+    }
+    let mut dim: *mut c_void = std::ptr::null_mut();
+    let tvt2 = unsafe { *(tm as *const *const crate::tip::ThreadMgrVtblPrefix) };
+    let hr = unsafe { ((*tvt2).get_focus)(tm, &mut dim) };
+    log.line(&format!("probe GetFocus hr={hr:#x} dim={dim:p}"));
+    if hr != 0 || dim.is_null() {
+        return false;
+    }
+    let mut ctx: *mut c_void = std::ptr::null_mut();
+    let dvt = unsafe { *(dim as *const *const DocMgrVtbl) };
+    let hr = unsafe { ((*dvt).get_top)(dim, &mut ctx) };
+    log.line(&format!("probe GetTop hr={hr:#x} ctx={ctx:p}"));
+    if hr != 0 || ctx.is_null() {
+        return false;
+    }
+    unsafe { probe_context_interfaces(ctx, log) };
+    true
+}
+
+/// 逐个 QI 我们关心的几个 IID,把结果记下来。
+///
+/// 为什么值得单独做一遍:TSF 拒绝写事务时只说一句 `TF_E_EMPTYCONTEXT`,
+/// 而"这个上下文支不支持组合态"是它的**能力**问题 —— 直接问比猜快。
+pub unsafe fn probe_context_interfaces(ctx: *mut c_void, log: &Log) {
+    const PROBES: [(u32, u16, u16, [u8; 8], &str); 5] = [
+        (0xD40C_8AAE, 0xAC92, 0x4FC7, [0x9A, 0x11, 0x0E, 0xE0, 0xE2, 0x3A, 0xA3, 0x9B], "ITfContextComposition"),
+        (0x8646_2810, 0x593B, 0x4916, [0x97, 0x64, 0x19, 0xC0, 0x8E, 0x9C, 0xE1, 0x10], "ITfContextOwnerCompositionServices"),
+        (0x7DCF_57AC, 0x18AD, 0x438B, [0x82, 0x4D, 0x97, 0x9B, 0xFF, 0xB7, 0x4B, 0x7C], "ITfCompartmentMgr"),
+        (0xAA80_E7F4, 0x2021, 0x11D2, [0x93, 0xE0, 0x00, 0x60, 0xB0, 0x67, 0xB8, 0x6E], "ITfRange(乱试)"),
+        (0xAA80_E801, 0x2021, 0x11D2, [0x93, 0xE0, 0x00, 0x60, 0xB0, 0x67, 0xB8, 0x6E], "ITfThreadMgr(乱试)"),
+    ];
+    let cvt = unsafe { *(ctx as *const *const UnknownVtbl) };
+    for (d1, d2, d3, d4, name) in PROBES {
+        let iid = Guid::from_parts(d1, d2, d3, d4);
+        let mut out: *mut c_void = std::ptr::null_mut();
+        let hr = unsafe { ((*cvt).query_interface)(ctx, &iid, &mut out) };
+        log.line(&format!("store ctx QI {name} -> {hr:#x} out={out:p}"));
+    }
+}
+
 #[repr(C)]
 struct DocMgrVtbl {
     query_interface: usize,
@@ -940,6 +986,8 @@ pub unsafe fn create_context(
     // 能直接 QI 的接口指针 —— 拿它当 vtable 解引用会访问违例)。
     unsafe { mark_context_not_empty(top, tid, log) };
     unsafe { mark_thread_not_empty(tm, tid, log) };
+    // 诊断:这个**上下文对象**到底支持哪些接口 —— 它决定 TSF 认不认这个上下文能接组合态。
+    unsafe { probe_context_interfaces(top, log) };
     log.line("store 上下文就绪:接下来薄壳可以 ITfContextComposition::StartComposition 了");
     Some((store_ptr, tm))
 }
