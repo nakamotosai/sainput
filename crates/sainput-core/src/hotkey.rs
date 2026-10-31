@@ -463,12 +463,159 @@ pub fn parse_vk(s: &str) -> Result<u32> {
 /// 不按当前触发类型挑着装（只装一个）：因为托盘里能**随时换键**，
 /// 换一次重装一次会有一瞬间热键失效；两个都常驻就永远不用重装。
 /// 代价可以忽略：两个低层钩子都是被动回调，没有键被按时不产生开销。
+/// 看门狗用的**共享标志**(T6.7):钩子活着 = 1。
+///
+/// 引擎在 `install()` 置 1、`uninstall()` 置 0;进程外的看门狗在父进程死掉之后读它 ——
+/// 读到 1 说明"死在钩子活着的那一刻"(硬崩、被任务管理器杀、断点卡死),那一发抬起
+/// 我们根本没机会补,必须由外面补。
+///
+/// 为什么用**命名共享内存**而不是文件:① 硬崩时文件可能只写了一半(这不是读文件的时候);
+/// ② 内核对象在进程死掉后依然在,只要还有句柄(看门狗持有)就能读到最后写的值;
+/// ③ 写 4 字节是原子的,不需要锁。
+///
+/// 名字带**命名空间**:`SAINPUT_SINGLE_NS` 是"单实例隔离"用的那个环境变量,
+/// 测试(私有桌面)和你日常那个实例各用各的。不带的话,两个引擎会共享同一个标志 ——
+/// 一边死了另一边也会被"补发"一次(而且带着自己那份状态),这种事只能靠隔离避免。
+fn guard_map_name() -> String {
+    match std::env::var("SAINPUT_SINGLE_NS") {
+        Ok(ns) if !ns.is_empty() => format!("Local\\sainput-guard-v1-{ns}"),
+        _ => "Local\\sainput-guard-v1".to_string(),
+    }
+}
+/// 映射视图地址(0 = 还没建)。只在 `install`/`uninstall` 里写。
+static GUARD_VIEW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateFileMappingW(
+        h: isize,
+        attr: *const std::ffi::c_void,
+        protect: u32,
+        hi: u32,
+        lo: u32,
+        name: *const u16,
+    ) -> isize;
+    fn OpenFileMappingW(access: u32, inherit: i32, name: *const u16) -> isize;
+    fn MapViewOfFile(h: isize, access: u32, hi: u32, lo: u32, bytes: usize) -> *mut std::ffi::c_void;
+    fn UnmapViewOfFile(p: *const std::ffi::c_void) -> i32;
+}
+
+/// UTF-16 终止串(只给上面的映射名用)。
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 共享块大小(字节)。布局:`[0]` = 标志(1 = 钩子活着),`[1..5]` = **父进程 pid**。
+///
+/// 带 pid 是为了**认领**:看门狗只认"这块内存属于我要守的那个进程"。否则上一轮硬崩
+/// 残留的块(标志还是 1,被某个还活着的看门狗句柄撑着)会让新看门狗误补一发。
+const GUARD_MAP_BYTES: usize = 8;
+
+/// 建/取共享标志(引擎侧)。返回视图地址;失败返回 0(看门狗就变成"看不见状态",
+/// 那也只会退化成"什么都不补",不会误伤)。
+fn open_guard_map(create: bool) -> isize {
+    let name = wide(&guard_map_name());
+    let h = unsafe {
+        if create {
+            CreateFileMappingW(-1_isize, std::ptr::null(), 0x04 /* PAGE_READWRITE */, 0, GUARD_MAP_BYTES as u32, name.as_ptr())
+        } else {
+            OpenFileMappingW(0x04 /* FILE_MAP_READ */, 0, name.as_ptr())
+        }
+    };
+    if h == 0 {
+        return 0;
+    }
+    // ⚠️ 三个 0x04 是**不同的**常量,别混:PAGE_READWRITE=0x04(建映射的页保护)、
+    // FILE_MAP_READ=0x04(只读视图)、FILE_MAP_WRITE=0x02(可写视图)。
+    // 第一版把"建映射"那一路也用了 FILE_MAP_READ,然后往视图里写标志 ——
+    // 直接 ACCESS_VIOLATION(单元测试当场抓到)。
+    let access = if create { 0x02 /* FILE_MAP_WRITE */ } else { 0x04 /* FILE_MAP_READ */ };
+    unsafe { MapViewOfFile(h, access, 0, 0, GUARD_MAP_BYTES) as isize }
+}
+
+/// 引擎侧:建好标志并归零(刚开机时没有"活着的手势")。
+pub fn arm_guard_state() {
+    let view = open_guard_map(true);
+    GUARD_VIEW.store(view, Ordering::Relaxed);
+    if view != 0 {
+        set_guard_flag(0);
+        // 认领:把本进程 pid 写进去,看门狗据此确认"这块内存是我的"
+        let pid = std::process::id();
+        unsafe {
+            let p = view as *mut u8;
+            *p.add(1) = (pid & 0xff) as u8;
+            *p.add(2) = ((pid >> 8) & 0xff) as u8;
+            *p.add(3) = ((pid >> 16) & 0xff) as u8;
+            *p.add(4) = ((pid >> 24) & 0xff) as u8;
+        }
+    }
+}
+
+/// 读块里记的父进程 pid(0 = 没写/块是空的)。
+pub fn read_guard_pid(view: isize) -> u32 {
+    if view == 0 {
+        return 0;
+    }
+    unsafe {
+        let p = view as *const u8;
+        (*p.add(1) as u32)
+            | ((*p.add(2) as u32) << 8)
+            | ((*p.add(3) as u32) << 16)
+            | ((*p.add(4) as u32) << 24)
+    }
+}
+
+/// 写标志(0/1)。没建起来就是空操作。
+pub fn set_guard_flag(v: u8) {
+    let view = GUARD_VIEW.load(Ordering::Relaxed);
+    if view != 0 {
+        unsafe { *(view as *mut u8) = v };
+    }
+}
+
+/// 看门狗侧:打开并**持有**视图(必须在父进程还活着的时候打开)。
+///
+/// 🔴 这是这条功能唯一容易写错的地方:命名内核对象(共享内存)在**最后一个句柄**关掉时就消失。
+/// 父进程被硬杀 → 它的句柄被系统收走 → 如果那时才 `OpenFileMapping`,什么都打不开,
+/// 于是"标志为 1"这件事就永远读不到 —— 第一版就是这么写的,回归直接逮住(NO-STATE)。
+/// 所以看门狗要在等父进程死**之前**把视图拿在手里,之后一直读这块内存。
+///
+/// 返回视图地址(0 = 没拿到,可能是父进程还没建;调用方可以重试)。
+pub fn open_guard_view_held() -> isize {
+    open_guard_map(false)
+}
+
+/// 读某个已持有的视图里的标志。
+pub fn read_flag_at(view: isize) -> u8 {
+    if view == 0 {
+        return 0;
+    }
+    unsafe { *(view as *const u8) }
+}
+
+/// 看门狗侧:读标志(自己开、读完就关 —— 只在**父进程还活着**时用得上,见上)。
+pub fn read_guard_flag() -> Option<u8> {
+    let view = open_guard_map(false);
+    if view == 0 {
+        return None;
+    }
+    let v = unsafe { *(view as *const u8) };
+    unsafe { UnmapViewOfFile(view as *const std::ffi::c_void) };
+    Some(v)
+}
+
 pub fn install(t: Trigger, tx: Sender<HookEvent>) -> Result<()> {
     set_trigger(t);
     let _ = TX.set(Mutex::new(tx));
     // 记下这个线程 —— 只有它能"卸了再装"(见 HOOK_THREAD 的注释)
     HOOK_THREAD.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
-    attach_hooks()
+    // 看门狗标志:钩子活着就置 1。硬崩时外面那只看门狗读到 1 → 补发全部抬起(T6.7)。
+    arm_guard_state();
+    let r = attach_hooks();
+    if r.is_ok() {
+        set_guard_flag(1);
+    }
+    r
 }
 
 /// 装两个低级钩子(键盘必须成功,鼠标失败只告警)。
@@ -614,6 +761,8 @@ fn send_all_keyups() {
 }
 
 pub fn uninstall() {
+    // 先摘掉看门狗标志:走到这里说明我们有机会自己补抬起了,外面那只看门狗不必再动手。
+    set_guard_flag(0);
     // 顺序:**先卸钩子,再补 keyup**(§7-3)。
     //
     // 原来写反了,注释里那句"趁钩子在时发得干净"是错的:钩子活着的时候,被它 `return 1`
@@ -893,5 +1042,22 @@ mod tests {
             "cbSize=32 应当报 ERROR_INVALID_PARAMETER(87)"
         );
         assert_eq!(n_full, 1, "cbSize=40 应当接受(否则自救依然是死的)");
+    }
+}
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    /// T6.7 的判据原子:引擎侧置位/清零,看门狗侧读得到同样的值。
+    ///
+    /// 只写一条:共享内存是**进程级**的,多条测试并行跑会互相踩同一个名字。
+    #[test]
+    fn 看门狗标志置位与清零() {
+        arm_guard_state();
+        assert_eq!(read_guard_flag(), Some(0), "刚武装好应该是 0(没有活着的手势)");
+        set_guard_flag(1);
+        assert_eq!(read_guard_flag(), Some(1), "钩子活着时必须读得到 1");
+        set_guard_flag(0);
+        assert_eq!(read_guard_flag(), Some(0), "正常退出后必须归零,否则看门狗会误补一发");
     }
 }

@@ -2475,6 +2475,96 @@ fn tail_of(a: &Args) -> Result<TailCfg> {
     })
 }
 
+/// 拉起进程外看门狗(见 `cmd_guard`)。失败只告警 —— 它只是"硬崩时的最后一道保险",
+/// 拉不起来不该拖累正常运行。
+fn spawn_key_guard() {
+    use std::os::windows::process::CommandExt;
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    // 绝对路径 + **单一日志文件**:看门狗是另起的进程,它的 CWD 未必是仓库根;
+    // 而每次启动留一个 `guard-<pid>.log` 会攒出一堆一次性文件 —— 统一写 `logs/guard.log`,
+    // 每行带 `parent=<pid>`,谁是谁一眼看得出。
+    let log = find_root().join("logs").join("guard.log");
+    let pid = std::process::id().to_string();
+    // CREATE_NO_WINDOW:别给用户弹第二个黑窗口
+    let spawned = std::process::Command::new(exe)
+        .args(["guard", "--parent", &pid, "--log"])
+        .arg(&log)
+        .creation_flags(0x0800_0000)
+        .spawn();
+    match spawned {
+        Ok(_) => eprintln!("[sainput] 键看门狗已就位(硬崩时补发抬起): {}", log.display()),
+        Err(e) => eprintln!("[sainput] 键看门狗没起来({e});硬崩时按键可能残留,可手动 sainput release-keys"),
+    }
+}
+
+/// 进程外看门狗(T6.7):**硬崩**之后把抬起补上。
+///
+/// 进程内那条路(`uninstall()` / 每拍失同步自检)只在"还有机会跑代码"时有效;
+/// 段错误、被任务管理器结束、断点卡死这些情况下什么都没跑,系统那边(以及被我们
+/// 的钩子吃掉了抬起的那一方)就永久闩着 —— 用户表现是"整个鼠标点不活"、
+/// "空格打不出",2026-10-28 真卡了 20 分钟。
+///
+/// 这个进程由引擎在装钩子时拉起,只做三件事:等父进程退出 → 读共享标志 → 该补就补。
+/// 补的动作复用 `panic_release()`:本进程里没有钩子,注入就是"先卸钩子再注入"
+/// 那条正确顺序(见 hotkey.rs 里 `release-keys` 的说明)。
+fn cmd_guard(a: &Args) -> Result<()> {
+    let parent = a.u("parent", "--parent", 0)? as u32;
+    let log = a.s("log", "--log");
+    if parent == 0 {
+        anyhow::bail!("guard 需要 --parent <pid>");
+    }
+    // 每行都带 `parent=<pid>`:单文件里要能分清是哪次引擎的看门狗写的
+    // (测试也靠它做机检判据,所以这行格式别随手改)。
+    let note = |msg: &str| {
+        if let Some(p) = &log {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                let _ = writeln!(f, "parent={parent} {msg}");
+            }
+        }
+    };
+    // ⚠️ 顺序要紧:**先把共享视图拿到手再等父进程死**。命名内核对象在最后一个句柄
+    // 关掉时消失,父进程一死它的句柄就没了 —— 那时再 OpenFileMapping 只会失败,
+    // 于是"标志为 1"永远读不到(第一版就这么写的,回归逮住了)。
+    let mut view = 0isize;
+    for _ in 0..20 {
+        view = hotkey::open_guard_view_held();
+        if view != 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    // 等父进程退出(句柄没了就直接往下走 —— 结果一样是"读标志")
+    let h = unsafe { OpenProcess(0x0010_0000 /* SYNCHRONIZE */, 0, parent) };
+    if h != 0 {
+        unsafe {
+            WaitForSingleObject(h, u32::MAX);
+            CloseHandle(h);
+        }
+    }
+    // 认领:块里记的 pid 必须就是我守的那个,否则视为"不是我的"(可能是上一轮残留)
+    let owner = hotkey::read_guard_pid(view);
+    let mine = view != 0 && (owner == 0 || owner == parent);
+    match (mine, hotkey::read_flag_at(view)) {
+        (true, 1) => {
+            hotkey::panic_release();
+            note("VIOLENT-EXIT: 父进程死在钩子活着的时候 → 已补发全部抬起");
+        }
+        (true, _) => note("CLEAN: 父进程正常退出(标志已归零),无需补发"),
+        (false, _) => note("NO-STATE: 没有属于这个父进程的共享标志,无需补发"),
+    }
+    Ok(())
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+    fn WaitForSingleObject(h: isize, ms: u32) -> u32;
+    fn CloseHandle(h: isize) -> i32;
+}
+
 fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
     // 单实例：两个 sainput 同时跑会各挂一个全局钩子，说一句话屏幕上打两遍。
     // 后启动的接管：先让旧实例退出（优先托盘退出，退不掉才硬杀），再自己拿锁。
@@ -2774,6 +2864,7 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
         println!("[sainput] 【诊断】自动热键已开启:按住 {ms}ms / 间隔 1500ms");
     }
     hotkey::install(trigger, tx)?;
+    spawn_key_guard();
     println!(
         "[sainput] ✅ 就绪。{} [{}] {}。",
         if toggle { "按一下" } else { "按住" },
@@ -3391,6 +3482,7 @@ fn main() -> Result<()> {
         "render" => cmd_render(&body, &a),
         "config" => cmd_config(&a, &root),
         "overlay-demo" => cmd_overlay_demo(&a),
+        "guard" => cmd_guard(&a),
         "release-keys" => {
             // 救命命令：进程被强杀后，热键可能卡在「按下」状态，
             // 表现为空格打不出 / 滚轮变缩放 / 整个键盘失灵。
