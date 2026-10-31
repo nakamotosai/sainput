@@ -20,6 +20,8 @@
 //!
 //! 运行时输出一律 ASCII(本机控制台 CP936,中文会串码);日志文件是 UTF-8。
 
+mod tip;
+
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -142,7 +144,7 @@ fn get_edit_handle(h: isize) -> isize {
 
 // ---------------- 工具 ----------------
 
-fn wide(s: &str) -> Vec<u16> {
+pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
@@ -180,13 +182,13 @@ fn pump(trace: Option<&Log>, translate: bool) {
     }
 }
 
-struct Log {
+pub(crate) struct Log {
     path: PathBuf,
     start: Instant,
 }
 
 impl Log {
-    fn line(&self, s: &str) {
+    pub(crate) fn line(&self, s: &str) {
         let ms = self.start.elapsed().as_millis();
         let mut f = match OpenOptions::new().create(true).append(true).open(&self.path) {
             Ok(f) => f,
@@ -204,6 +206,8 @@ struct Args {
     selftest_file: Option<PathBuf>,
     dump_every: u64,
     title: String,
+    /// 装一遍 TSF 薄壳并走完整条 COM 激活链(`--load-tip <dll>`)。
+    load_tip: Option<String>,
     /// 不调 `TranslateMessage`(`--no-translate`):用来把「posted 的 WM_KEYDOWN 到底
     /// 有没有被控件处理」和「TranslateMessage 生成的那条 WM_CHAR(0x08)」分开。
     no_translate: bool,
@@ -220,6 +224,7 @@ fn parse_args() -> Args {
         selftest_file: None,
         dump_every: 250,
         title: "sainput tsf host".into(),
+        load_tip: None,
         trace: false,
         no_translate: false,
     };
@@ -233,6 +238,7 @@ fn parse_args() -> Args {
             "--selftest-file" => a.selftest_file = it.next().map(PathBuf::from),
             "--dump-every" => a.dump_every = it.next().and_then(|v| v.parse().ok()).unwrap_or(250),
             "--title" => a.title = it.next().unwrap_or(a.title),
+            "--load-tip" => a.load_tip = it.next(),
             "--trace" => a.trace = true,
             "--no-translate" => a.no_translate = true,
             other => eprintln!("[host] unknown arg: {other}"),
@@ -316,6 +322,12 @@ fn main() {
             "window=0x{hwnd:x} edit=0x{edit:x} focused={}",
             GetFocus() == edit
         ));
+
+        if let Some(dll) = a.load_tip.clone() {
+            let ok = tip::run(&dll, &log);
+            log.line(&format!("tip RESULT {}", if ok { "PASS" } else { "FAIL" }));
+            println!("[host] tip {}", if ok { "PASS" } else { "FAIL" });
+        }
 
         // WM_CHAR 往返自检:证明壳真的能收字符、能读回。
         if let Some(path) = a.selftest_file.clone() {

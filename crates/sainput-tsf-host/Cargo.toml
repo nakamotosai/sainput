@@ -12,3 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+# 只借它的 GUID 常量与 Guid 布局:宿主必须按**同一个** CLSID/IID 去 QI,
+# 复制一份迟早会漂。
+sainput-tsf = { path = "../sainput-tsf" }

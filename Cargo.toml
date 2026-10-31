@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sainput-core", "crates/sainput-cli", "crates/sainput-tsf-host"]
+members = ["crates/sainput-core", "crates/sainput-cli", "crates/sainput-tsf-host", "crates/sainput-tsf"]
 
 [workspace.package]
 version = "0.2.5"

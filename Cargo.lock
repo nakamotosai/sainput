@@ -617,10 +617,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sainput-tsf"
+version = "0.2.5"
+
+[[package]]
 name = "sainput-tsf-host"
 version = "0.2.5"
 dependencies = [
  "anyhow",
+ "sainput-tsf",
 ]
 
 [[package]]

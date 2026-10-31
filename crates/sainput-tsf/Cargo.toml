@@ -1,0 +1,14 @@
+[package]
+name = "sainput-tsf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "sainput 的 TSF 文本服务(TIP):装进目标进程,转发组合态上屏"
+
+[lib]
+name = "sainput_tsf"
+# 这是一个**进程内 COM 服务器**:被 msctf 加载进目标应用进程里运行。
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
