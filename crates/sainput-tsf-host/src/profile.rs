@@ -369,6 +369,9 @@ pub unsafe fn activate_for_process(log: &Log, tm: *mut c_void, hold_ms: u64) -> 
     // 收尾:**把默认输入法还给用户**(不还就等于把用户的输入法弄坏了)。
     if let Some((c, p)) = saved {
         unsafe { set_default(log, &c, &p) };
+        // 写下去之后 msctf 不是立刻反映到读取侧(实测:同一毫秒读回还是我们那条,
+        // 于是把"已还原"记成了"⚠ 没还原成功" —— 又一条谎报)。给一拍再确认。
+        std::thread::sleep(std::time::Duration::from_millis(600));
         let back = unsafe { default_profile() };
         let ok = matches!(&back, Some((c2, _)) if c2.to_hyphen_string() == c.to_hyphen_string());
         log.line(&format!("profile 默认输入法已还原:{}", if ok { "确认" } else { "⚠ 没还原成功" }));

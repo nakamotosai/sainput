@@ -33,6 +33,12 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 
+#[link(name = "kernel32")]
+extern "system" {
+    /// 只为日志取证:同步编辑会话卡住时,得知道"谁在等谁"。
+    fn GetCurrentThreadId() -> u32;
+}
+
 type Hresult = i32;
 const S_OK: Hresult = 0;
 const E_FAIL: Hresult = 0x8000_4005u32 as i32;
@@ -212,6 +218,13 @@ unsafe extern "system" fn session_release(this: *mut c_void) -> u32 {
 
 /// 真正干活的地方:TSF 已经把锁给了我们,`ec` 是这次写事务的 cookie。
 unsafe extern "system" fn session_do_edit(this: *mut c_void, ec: u32) -> Hresult {
+    // 每步都记 tid:同步会话一旦卡住,"谁停在哪个调用"是唯一能查的东西。
+    macro_rules! step {
+        ($what:expr) => {
+            trace(&format!("compose 步骤[{}] 线程={}", $what, unsafe { GetCurrentThreadId() }))
+        };
+    }
+    step!("DoEditSession 进入");
     let s = unsafe { &*(this as *const EditSession) };
     let intent = s.intent.lock().map(|g| g.clone()).unwrap_or(Intent::Cancel);
     // 从这里开始,**任何 TSF 调用之前不要持有 STATE 的锁**(它会回调我们)。
@@ -235,10 +248,13 @@ unsafe extern "system" fn session_do_edit(this: *mut c_void, ec: u32) -> Hresult
     }
 
     // 已经开着组合态就复用,否则开一个。
+    step!("准备取 composition 状态锁");
     let mut comp = with_state(|st| st.composition) as *mut c_void;
+    step!("状态锁已放开");
     if comp.is_null() {
         let ccvt = unsafe { *(comp_obj as *const *const ContextCompositionVtbl) };
         let sink = *SINK as *mut c_void;
+        step!("准备 StartComposition");
         let hr = unsafe { ((*ccvt).start_composition)(comp_obj, ec, sink, &mut comp) };
         trace(&format!("compose StartComposition hr={}", hr_string(hr)));
         if hr != 0 || comp.is_null() {
@@ -392,6 +408,12 @@ fn request(intent: Intent) -> Hresult {
     let sp = Box::into_raw(session) as *mut c_void;
     let cvt = unsafe { *(ctx as *const *const ContextVtbl) };
     let mut session_hr: Hresult = E_FAIL;
+    // **请求前**就要把 tid 记下来:同步请求一旦没人服务,这一行之后就没有日志了 ——
+    // "到底把会话投给了哪个线程"必须在这之前落盘(2026-10-31:卡在这一步查了半天)。
+    trace(&format!(
+        "compose RequestEditSession 投递 ctx={ctx:p} tid={tid} 本线程={} 同步=1",
+        unsafe { GetCurrentThreadId() }
+    ));
     let hr = unsafe {
         ((*cvt).request_edit_session)(ctx, tid, sp, TF_ES_SYNC | TF_ES_READWRITE, &mut session_hr)
     };

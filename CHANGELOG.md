@@ -7,6 +7,19 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **TSF 那条路的根因定位(测试床,不是产品行为)**:`--tip-hold keep`(薄壳装好保持激活到进程
+  结束,管道服务端跟着激活活)、真桌面实验、以及 `tools/t24_cycle.ps1`(升级/降级/重复注册/
+  残留,一次升权跑完)。**查出来的两条硬事实**:
+  1. `ActivateProfile(FORPROCESS)` 在**私有桌面**上直接 `E_FAIL` —— 之前记的一批
+     `E_NOINTERFACE` / `TF_E_EMPTYCONTEXT` 结论都是这个造成的假象;真桌面 + RichEdit 下
+     `GetFocus hr=0x0`、`QI(ITfContextComposition) hr=0x0` 全都正常;
+  2. 组合态卡在 `StartComposition`:管道线程(非属主线程)直接拿主线程取到的 TSF 接口调用,
+     公寓模型下 msctf 等属主线程 → 死锁。修法是**回到属主线程执行**(隐藏窗口 + `PostMessage`)。
+  另外修掉两处**验证器谎报**:同进程内读回"默认输入法已还原"读的是旧值(要在新进程里读);
+  本进程走过注册表激活时 msctf 自己持有活对象,`DllCanUnloadNow=S_FALSE` 本来就是对的。
+
 ### Fixed
 
 - **overlay 每帧重建 DWrite 资源**(T6.4)—— 文字这条路上每帧重建 `IDWriteFactory` /

@@ -328,7 +328,17 @@ fn parse_args() -> Args {
             "--dump-every" => a.dump_every = it.next().and_then(|v| v.parse().ok()).unwrap_or(250),
             "--title" => a.title = it.next().unwrap_or(a.title),
             "--load-tip" => a.load_tip = it.next(),
-            "--tip-hold" => a.tip_hold = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            // `--tip-hold keep`:装好就不主动收摊(管道服务端随进程活着)。
+            // 为什么需要它:固定时长的等待会把后面的"激活"挡在门外,而组合态测试
+            // 要求**同时**成立 —— 薄壳可连 + profile 已激活。测试床用 keep。
+            "--tip-hold" => {
+                let v = it.next().unwrap_or_default();
+                a.tip_hold = if v.eq_ignore_ascii_case("keep") {
+                    u64::MAX
+                } else {
+                    v.parse().unwrap_or(0)
+                };
+            }
             "--control" => a.control = it.next().unwrap_or(a.control),
             "--trace" => a.trace = true,
             "--no-translate" => a.no_translate = true,

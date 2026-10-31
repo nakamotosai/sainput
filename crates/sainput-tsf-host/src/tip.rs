@@ -128,6 +128,10 @@ pub unsafe fn run_mode(
     log.line(&format!("tip LoadLibrary ok module=0x{module:x}"));
 
     let mut ok = true;
+    // `--tip-hold keep`:装好之后**保持激活**(管道服务端跟着激活活,Deactivate 才收摊)。
+    // 不这么做的话,手工那条链走完自己就把薄壳反激活了 —— 端点随之消失,
+    // 组合态测试还没开始就连不上(2026-10-31 实测踩到)。
+    let keep = hold_ms == u64::MAX;
     let check = |what: &str, got: i32, want: i32, l: &Log| {
         let good = got == want;
         l.line(&format!(
@@ -199,7 +203,7 @@ pub unsafe fn run_mode(
     let svc_vt = unsafe { *(svc as *const *const TipVtbl) };
     let h = unsafe { ((*svc_vt).activate)(svc, tm, tid) };
     ok &= check("ITfTextInputProcessor::Activate", h, S_OK, log);
-    if hold_ms > 0 {
+    if hold_ms > 0 && hold_ms != u64::MAX {
         log.line(&format!(
             "tip 保持激活 {hold_ms}ms:管道 \\\\.\\pipe\\sainput-tsf-{} 现在可连",
             std::process::id()
@@ -238,6 +242,10 @@ pub unsafe fn run_mode(
     ok &= check("DllCanUnloadNow(有活对象)", h, S_FALSE, log);
 
     // 6) 收尾:反激活 + 释放;全部释放后必须允许卸载
+    if keep {
+        log.line("tip keep 模式:链到此为止,薄壳保持激活(管道服务端活着)到进程结束");
+        return ok;
+    }
     let h = unsafe { ((*svc_vt).deactivate)(svc) };
     ok &= check("ITfTextInputProcessor::Deactivate", h, S_OK, log);
     unsafe { ((*svc_vt).release)(svc) };
@@ -250,7 +258,18 @@ pub unsafe fn run_mode(
         std::thread::sleep(Duration::from_millis(20));
         h = unsafe { cun() };
     }
-    ok &= check("DllCanUnloadNow(释放后)", h, S_OK, log);
+    // ⚠ 这里判不判"能卸"要看**谁还持有引用**:命令行上带了 `--activate-profile` 时,
+    // msctf 自己会按注册表把同一个 DLL 装进本进程的一份 TextService —— 它那份活对象
+    // 不受我们 Release 影响,此时 `DllCanUnloadNow` **就该**是 S_FALSE。
+    // 2026-10-31 实测:在真桌面上激活成功后它一直 S_FALSE 到 10s,而被记成了 FAIL
+    // (谎报 —— 验证器把自己的前提搞错了)。
+    if activate_for_process {
+        log.line(&format!(
+            "tip DllCanUnloadNow(释放后) hr={h:#x} —— 但本进程走过注册表激活,msctf 自己还有活对象,S_FALSE 是对的(不判)"
+        ));
+    } else {
+        ok &= check("DllCanUnloadNow(释放后)", h, S_OK, log);
+    }
 
     // 7) 线程管理器还回去
     unsafe { ((*tm_vt).deactivate)(tm) };
