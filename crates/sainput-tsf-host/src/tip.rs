@@ -82,8 +82,24 @@ fn hr(v: i32) -> String {
 const S_OK: i32 = 0;
 const S_FALSE: i32 = 1;
 
+/// 问一次"这个线程现在的焦点文档管理器是谁"。
+/// 非空 = 已经有 TSF 文本存储 —— 组合态上屏(T1.4)的前提。
+pub unsafe fn focused_document(tm: *mut c_void) -> Option<*mut c_void> {
+    if tm.is_null() {
+        return None;
+    }
+    let vt = unsafe { *(tm as *const *const ThreadMgrVtbl) };
+    let mut doc: *mut c_void = std::ptr::null_mut();
+    let hr = unsafe { ((*vt).get_focus)(tm, &mut doc) };
+    if hr == 0 && !doc.is_null() {
+        Some(doc)
+    } else {
+        None
+    }
+}
+
 /// 返回值:每一步是否都如预期。
-pub unsafe fn run(dll: &str, hold_ms: u64, log: &Log) -> bool {
+pub unsafe fn run_mode(dll: &str, hold_ms: u64, activate_for_process: bool, activate_legacy: bool, log: &Log) -> bool {
     let path = wide(dll);
     let module = unsafe { LoadLibraryW(path.as_ptr()) };
     if module == 0 {
@@ -174,6 +190,19 @@ pub unsafe fn run(dll: &str, hold_ms: u64, log: &Log) -> bool {
         while t0.elapsed() < Duration::from_millis(hold_ms) {
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    // 4b) T1.1:按 TF_IPPMF_FORPROCESS 在本进程激活我们的 TIP,
+    //     并且看焦点文档管理器到底有没有出现(有它才谈得上组合态)。
+    if activate_legacy {
+        let ok11 = unsafe { crate::profile::activate_legacy(log, tm) };
+        ok &= ok11;
+        log.line(&format!("profile T1.1(老 API)结果 {}", if ok11 { "PASS" } else { "FAIL" }));
+    }
+    if activate_for_process {
+        let ok11 = unsafe { crate::profile::activate_for_process(log, tm) };
+        ok &= ok11;
+        log.line(&format!("profile T1.1 结果 {}", if ok11 { "PASS" } else { "FAIL" }));
     }
 
     // 5) 还活着的时候不允许卸载(引用计数没算错)

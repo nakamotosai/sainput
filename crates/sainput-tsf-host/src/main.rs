@@ -20,6 +20,7 @@
 //!
 //! 运行时输出一律 ASCII(本机控制台 CP936,中文会串码);日志文件是 UTF-8。
 
+mod profile;
 mod tip;
 
 use std::fs::OpenOptions;
@@ -149,6 +150,27 @@ unsafe extern "system" fn wnd_proc(h: isize, m: u32, w: usize, l: isize) -> isiz
 
 // ---------------- 工具 ----------------
 
+/// `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX` -> `Guid`(诊断用,不追求宽容)。
+fn parse_guid(s: &str) -> Option<sainput_tsf::Guid> {
+    let t = s.trim().trim_matches(|c| c == '{' || c == '}');
+    let parts: Vec<&str> = t.split('-').collect();
+    if parts.len() != 5 || parts[0].len() != 8 || parts[3].len() != 4 {
+        return None;
+    }
+    let d1 = u32::from_str_radix(parts[0], 16).ok()?;
+    let d2 = u16::from_str_radix(parts[1], 16).ok()?;
+    let d3 = u16::from_str_radix(parts[2], 16).ok()?;
+    let mut d4 = [0u8; 8];
+    let bytes = format!("{}{}", parts[3], parts[4]);
+    if bytes.len() != 16 {
+        return None;
+    }
+    for i in 0..8 {
+        d4[i] = u8::from_str_radix(&bytes[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(sainput_tsf::Guid::from_parts(d1, d2, d3, d4))
+}
+
 pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -218,6 +240,21 @@ struct Args {
     tip_hold: u64,
     /// 文本控件的类名(`--control edit|rich50`)。T4.5 要在**不同控件类**上量
     /// "退格吃哪种消息",所以靶子得能换。
+    /// `--report-profile`:只当"旁观者",把默认输入法与当前输入法打出来(T1.1 用)。
+    report_profile: bool,
+    /// `--hide-window`:建窗口但**不显示**(真实会话里跑 T1.1 用:一个像素都不露)。
+    hide_window: bool,
+    /// `--no-window`:只做非 GUI 的活(枚举/旁观/装薄壳),一个窗口都不建。
+    /// 排障时要在**真实会话**里跑又不想打扰用户,就靠它。
+    no_window: bool,
+    /// `--activate-legacy`:`ActivateLanguageProfile`(老 API)那条路的 T1.1 复测。
+    activate_legacy: bool,
+    /// `--set-default <CLSID> <PROFILE>`:把 zh-CN 的默认输入法设回去(撤销我们自己的激活)。
+    set_default: Option<(String, String)>,
+    /// `--enum-profiles`:把 msctf 眼里的输入法列出来(T1.1 排障用)。
+    enum_profiles: bool,
+    /// `--activate-profile`:在本进程里按 `TF_IPPMF_FORPROCESS` 激活我们的 TIP(T1.1 用)。
+    activate_profile: bool,
     /// 不调 `TranslateMessage`(`--no-translate`):用来把「posted 的 WM_KEYDOWN 到底
     /// 有没有被控件处理」和「TranslateMessage 生成的那条 WM_CHAR(0x08)」分开。
     no_translate: bool,
@@ -239,6 +276,13 @@ fn parse_args() -> Args {
         control: "edit".into(),
         trace: false,
         no_translate: false,
+        report_profile: false,
+        enum_profiles: false,
+        set_default: None,
+        activate_legacy: false,
+        no_window: false,
+        hide_window: false,
+        activate_profile: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -255,6 +299,17 @@ fn parse_args() -> Args {
             "--control" => a.control = it.next().unwrap_or(a.control),
             "--trace" => a.trace = true,
             "--no-translate" => a.no_translate = true,
+            "--report-profile" => a.report_profile = true,
+            "--enum-profiles" => a.enum_profiles = true,
+            "--activate-legacy" => a.activate_legacy = true,
+            "--set-default" => {
+                let c = it.next().unwrap_or_default();
+                let p = it.next().unwrap_or_default();
+                a.set_default = Some((c, p));
+            }
+            "--no-window" => a.no_window = true,
+            "--hide-window" => a.hide_window = true,
+            "--activate-profile" => a.activate_profile = true,
             other => eprintln!("[host] unknown arg: {other}"),
         }
     }
@@ -266,6 +321,38 @@ fn main() {
     let start = Instant::now();
     let log = Log { path: a.log.clone(), start };
     log.line(&format!("host start pid={} log={}", std::process::id(), a.log.display()));
+
+    if a.no_window {
+        // 无窗口模式:不建类、不建窗口 —— 一个像素都不出现在桌面上。
+        log.line("no-window 模式:跳过窗口创建");
+        unsafe {
+            if let Some((c, p)) = a.set_default.clone() {
+                let (c, p) = (parse_guid(&c), parse_guid(&p));
+                match (c, p) {
+                    (Some(c), Some(p)) => {
+                        profile::set_default(&log, &c, &p);
+                    }
+                    _ => log.line("set-default 参数不是合法 GUID"),
+                }
+            }
+            if a.enum_profiles {
+                profile::enum_profiles(&log);
+            }
+            if a.report_profile {
+                profile::snapshot(&log, "旁观");
+            }
+            if let Some(dll) = a.load_tip.clone() {
+                let ok = tip::run_mode(&dll, a.tip_hold, a.activate_profile, a.activate_legacy, &log);
+                log.line(&format!("tip RESULT {}", if ok { "PASS" } else { "FAIL" }));
+            }
+        }
+        let deadline = start + Duration::from_millis(a.life_ms);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        log.line("no-window 模式结束");
+        return;
+    }
 
     unsafe {
         let inst = GetModuleHandleW(std::ptr::null());
@@ -337,8 +424,12 @@ fn main() {
             std::process::exit(1);
         }
         EDIT_HANDLE.store(edit, Ordering::SeqCst);
-        ShowWindow(hwnd, SW_SHOW);
-        let fg = SetForegroundWindow(hwnd);
+        let fg = if a.hide_window {
+            0 // 不显示、也不抢前台:只要控件存在于本进程,焦点在**自己的线程内**就够了
+        } else {
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd)
+        };
         SetFocus(edit);
         pump(trace_ref, !a.no_translate);
 
@@ -347,8 +438,16 @@ fn main() {
             GetFocus() == edit
         ));
 
+        if a.enum_profiles {
+            profile::enum_profiles(&log);
+            println!("[host] enum-profiles 完成");
+        }
+        if a.report_profile {
+            profile::snapshot(&log, "旁观");
+            println!("[host] report-profile 完成");
+        }
         if let Some(dll) = a.load_tip.clone() {
-            let ok = tip::run(&dll, a.tip_hold, &log);
+            let ok = tip::run_mode(&dll, a.tip_hold, a.activate_profile, a.activate_legacy, &log);
             log.line(&format!("tip RESULT {}", if ok { "PASS" } else { "FAIL" }));
             println!("[host] tip {}", if ok { "PASS" } else { "FAIL" });
         }

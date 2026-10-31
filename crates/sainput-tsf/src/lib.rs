@@ -65,6 +65,28 @@ const fn guid(d1: u32, d2: u16, d3: u16, d4: [u8; 8]) -> Guid {
     Guid { d1, d2, d3, d4 }
 }
 
+impl Guid {
+    /// 按 COM 的四段写一个 GUID(字段是主机序整数,不是字节数组)。
+    pub const fn from_parts(d1: u32, d2: u16, d3: u16, d4: [u8; 8]) -> Self {
+        Guid { d1, d2, d3, d4 }
+    }
+
+    /// `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX`,日志里认人用。
+    pub fn to_hyphen_string(&self) -> String {
+        let d4 = self.d4;
+        format!(
+            "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+            self.d1, self.d2, self.d3, d4[0], d4[1], d4[2], d4[3], d4[4], d4[5], d4[6], d4[7]
+        )
+    }
+}
+
+impl Default for Guid {
+    fn default() -> Self {
+        Guid { d1: 0, d2: 0, d3: 0, d4: [0; 8] }
+    }
+}
+
 /// 本服务的 CLSID。注册表与"按进程激活"都按它认人,**一旦发布不能再改**。
 pub const CLSID_SAINPUT_TSF: Guid = guid(
     0xFCC4_5A5E,
