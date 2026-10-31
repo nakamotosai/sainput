@@ -1,1 +1,0 @@
-F:\projects\sainput\target-t14b\x86_64-pc-windows-gnu\release\sainput_tsf.dll: F:\projects\sainput\crates\sainput-tsf\src\compose.rs F:\projects\sainput\crates\sainput-tsf\src\lib.rs F:\projects\sainput\crates\sainput-tsf\src\pipe.rs

@@ -7,6 +7,9 @@
 # ── Rust 构建产物 ──
 /target
 /target-test
+# 任何新命名的 target 目录都不许进仓库(2026-10-31 踩过:新建 target-t14b 被 git add -A 扫进去,
+# 58MB 的 rlib 直接推上了远端 —— .gitignore 只认老名字等于没拦)
+/target-*
 
 # ── 个人配置与运行时状态（提交同名 .example，不提交真实文件）──
 /sainput.conf
