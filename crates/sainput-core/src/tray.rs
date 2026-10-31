@@ -64,6 +64,27 @@ const ID_AUTOSTART: usize = 18;
 const ID_OVERLAY_BASE: usize = 300;
 /// 边缘光颜色子菜单基址（white/rainbow/amber/cyan/aurora）
 const ID_EDGE_TINT_BASE: usize = 320;
+/// 边缘光**带宽**子菜单基址(细/中/宽)
+const ID_EDGE_SPREAD_BASE: usize = 340;
+/// 边缘光**亮度**子菜单基址(淡/中/亮)
+const ID_EDGE_PEAK_BASE: usize = 350;
+/// 边缘光**速度**子菜单基址(慢/中/快)
+const ID_EDGE_SPEED_BASE: usize = 360;
+
+/// 带宽/亮度/速度的预置档位。
+///
+/// 为什么给三档而不是让用户填数字:托盘里没有输入框,而这三档覆盖了
+/// "几乎看不见 / 刚好 / 很显眼"的实际需求;真要精确值就走配置项。
+pub const EDGE_SPREAD_CHOICES: [i32; 3] = [40, 56, 76];
+pub const EDGE_SPREAD_NAMES: [&str; 3] = ["细(40px)", "中(56px)", "宽(76px)"];
+pub const EDGE_PEAK_CHOICES: [f32; 3] = [0.28, 0.42, 0.62];
+pub const EDGE_PEAK_NAMES: [&str; 3] = ["淡", "中", "亮"];
+pub const EDGE_SPEED_CHOICES: [f32; 3] = [0.6, 1.0, 1.8];
+pub const EDGE_SPEED_NAMES: [&str; 3] = ["慢", "中", "快"];
+/// 写回 `sainput.conf` 时用的字面量(必须是 `&'static str`:托盘那条路只吃静态串)。
+pub const EDGE_SPREAD_CONF: [&str; 3] = ["40", "56", "76"];
+pub const EDGE_PEAK_CONF: [&str; 3] = ["0.28", "0.42", "0.62"];
+pub const EDGE_SPEED_CONF: [&str; 3] = ["0.6", "1.0", "1.8"];
 /// 释放卡住的修饰键（键盘失灵时自救）
 const ID_RELEASE_KEYS: usize = 19;
 /// 热键子菜单的基址：ID_HOTKEY_BASE + 序号。
@@ -99,6 +120,10 @@ pub enum TrayToggle {
     SetOverlayMode(usize),
     /// 边缘光颜色：0=白 1=彩虹 2=暖橙 3=青蓝 4=极光
     SetEdgeTint(usize),
+    /// 边缘光带宽/亮度/速度:各三档(下标见 `EDGE_*_CHOICES`)
+    SetEdgeSpread(usize),
+    SetEdgePeak(usize),
+    SetEdgeSpeed(usize),
     /// 释放卡住的修饰键（键盘失灵时自救）
     ReleaseKeys,
 }
@@ -135,6 +160,9 @@ static FLAGS: std::sync::Mutex<TrayFlags> = std::sync::Mutex::new(TrayFlags {
     silence_sec: 15,
     overlay_mode: 0,
     edge_tint: 0,
+    edge_spread_idx: 1,
+    edge_peak_idx: 1,
+    edge_speed_idx: 1,
     hotkey: "rightctrl",
     autostart: false,
 });
@@ -158,6 +186,10 @@ pub struct TrayFlags {
     pub overlay_mode: usize,
     /// 边缘光颜色：0=白 1=彩虹 2=暖橙 3=青蓝 4=极光。
     pub edge_tint: usize,
+    /// 边缘光带宽/亮度/速度当前档位(0..2),用来在子菜单里打勾。
+    pub edge_spread_idx: usize,
+    pub edge_peak_idx: usize,
+    pub edge_speed_idx: usize,
     /// 当前热键的配置写法（用来在子菜单里打勾），例如 "mousex1"。
     pub hotkey: &'static str,
     /// 是否已设置开机自启。
@@ -165,6 +197,12 @@ pub struct TrayFlags {
 }
 
 /// 主循环把当前生效状态推给托盘（决定菜单里哪几项打勾）。
+/// 托盘**图标**注册成功了吗(窗口本身与它无关 —— 见 `Tray::start` 里的说明)。
+///
+/// 为什么单独一个标志:没有 shell 的桌面(自动化用的私有桌面)上注册必然失败,
+/// 但托盘窗口照样要跑起来 —— 它是菜单的宿主、也是 `WM_COMMAND` 的去处。
+static ICON_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn set_flags(f: TrayFlags) {
     if let Ok(mut g) = FLAGS.lock() {
         *g = f;
@@ -394,6 +432,12 @@ pub struct Tray {
 
 impl Tray {
     /// 记录主线程 id，退出时用它唤醒热键消息循环。
+    /// 托盘图标注册成功了吗。`false` = 这个桌面上没有 shell(私有桌面/自动化),
+    /// 窗口仍然在、菜单仍然能点,只是看不到图标。
+    pub fn icon_ok() -> bool {
+        ICON_OK.load(Ordering::Relaxed)
+    }
+
     pub fn note_main_thread() {
         MAIN_THREAD.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
     }
@@ -420,12 +464,17 @@ impl Tray {
                 nid.u_callback_message = WM_TRAY;
                 nid.h_icon = icon;
                 set_fixed(&mut nid.sz_tip, &tip);
-                if Shell_NotifyIconW(NIM_ADD, &mut nid) == 0 {
-                    let _ = tx.send(false);
-                    return;
-                }
-                if let Ok(mut g) = TRAY_NID.lock() {
-                    *g = Some(nid);
+                // 图标注册失败**不代表托盘窗口没用**:窗口是右键菜单的宿主,
+                // 也是 `WM_COMMAND` 的去处(测试/诊断就靠它)。没有 shell 的桌面上
+                // (例如自动化用的私有桌面)注册必然失败,以前这里直接 return 把整条
+                // 都关掉了 —— 于是"点菜单"这件事实测不了。现在照样把窗口跑起来,
+                // 只把"图标没注册"如实报出去。
+                let icon_ok = Shell_NotifyIconW(NIM_ADD, &mut nid) != 0;
+                ICON_OK.store(icon_ok, Ordering::Relaxed);
+                if icon_ok {
+                    if let Ok(mut g) = TRAY_NID.lock() {
+                        *g = Some(nid);
+                    }
                 }
                 let _ = tx.send(true);
                 let mut msg: Msg = std::mem::zeroed();
@@ -433,7 +482,9 @@ impl Tray {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
-                Shell_NotifyIconW(NIM_DELETE, &mut nid);
+                if ICON_OK.load(Ordering::Relaxed) {
+                    Shell_NotifyIconW(NIM_DELETE, &mut nid);
+                }
                 if icon != 0 {
                     DeleteObject(icon);
                 }
@@ -692,6 +743,10 @@ unsafe fn show_menu(hwnd: isize) {
         silence_sec: 15,
         overlay_mode: 0,
         edge_tint: 0,
+        // 默认档:中带宽 / 中亮度 / 中速度(与 overlay 的默认值一致)
+        edge_spread_idx: 1,
+        edge_peak_idx: 1,
+        edge_speed_idx: 1,
         hotkey: "rightctrl",
         autostart: false,
     });
@@ -776,6 +831,28 @@ unsafe fn show_menu(hwnd: isize) {
             AppendMenuW(ovl_menu, MF_SEPARATOR, 0, sep.as_ptr());
             AppendMenuW(ovl_menu, MF_STRING | MF_POPUP, tint_menu as usize, tint_title.as_ptr());
         }
+        // 带宽/亮度/速度:各三档,勾在当前档上
+        let submenus: [(usize, &[&str], usize, &str); 3] = [
+            (ID_EDGE_SPREAD_BASE, &EDGE_SPREAD_NAMES, f.edge_spread_idx, "边缘光带宽"),
+            (ID_EDGE_PEAK_BASE, &EDGE_PEAK_NAMES, f.edge_peak_idx, "边缘光亮度"),
+            (ID_EDGE_SPEED_BASE, &EDGE_SPEED_NAMES, f.edge_speed_idx, "边缘光速度"),
+        ];
+        for (base, names, cur, title) in submenus {
+            let sub = CreatePopupMenu();
+            if sub == 0 {
+                continue;
+            }
+            for (i, name) in names.iter().enumerate() {
+                let l = wide(name);
+                let checked = if i == cur { MF_CHECKED } else { 0 };
+                AppendMenuW(sub, MF_STRING | checked, base + i, l.as_ptr());
+            }
+            let t = wide(&format!(
+                "{title}(当前:{})",
+                names.get(cur).copied().unwrap_or("-")
+            ));
+            AppendMenuW(ovl_menu, MF_STRING | MF_POPUP, sub as usize, t.as_ptr());
+        }
         AppendMenuW(menu, MF_STRING | MF_POPUP, ovl_menu as usize, ovl_title.as_ptr());
     }
     AppendMenuW(menu, MF_STRING | tick(f.fix_case), ID_FIX_CASE, fixc.as_ptr());
@@ -842,6 +919,15 @@ fn queue_toggle(id: usize) {
         }
         _ if id >= ID_EDGE_TINT_BASE && id < ID_EDGE_TINT_BASE + 5 => {
             Some(TrayToggle::SetEdgeTint(id - ID_EDGE_TINT_BASE))
+        }
+        _ if id >= ID_EDGE_SPREAD_BASE && id < ID_EDGE_SPREAD_BASE + 3 => {
+            Some(TrayToggle::SetEdgeSpread(id - ID_EDGE_SPREAD_BASE))
+        }
+        _ if id >= ID_EDGE_PEAK_BASE && id < ID_EDGE_PEAK_BASE + 3 => {
+            Some(TrayToggle::SetEdgePeak(id - ID_EDGE_PEAK_BASE))
+        }
+        _ if id >= ID_EDGE_SPEED_BASE && id < ID_EDGE_SPEED_BASE + 3 => {
+            Some(TrayToggle::SetEdgeSpeed(id - ID_EDGE_SPEED_BASE))
         }
         _ => None,
     };

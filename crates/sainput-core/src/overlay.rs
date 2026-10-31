@@ -108,8 +108,12 @@ fn edge_clock() -> (f32, f32) {
     let start = START.get_or_init(Instant::now);
     let ms = start.elapsed().as_millis() as f64;
 
-    let breath = ((ms % EDGE_BREATH_MS as f64) / EDGE_BREATH_MS as f64) as f32;
-    let flow = ((ms % EDGE_FLOW_MS as f64) / EDGE_FLOW_MS as f64) as f32;
+    // 速度倍率直接作用在周期上(周期越短越快),下限留 200ms —— 再快就不是"呼吸"是闪了。
+    let speed = edge_speed() as f64;
+    let breath_ms = (EDGE_BREATH_MS as f64 / speed).max(200.0);
+    let flow_ms = (EDGE_FLOW_MS as f64 / speed).max(600.0);
+    let breath = ((ms % breath_ms) / breath_ms) as f32;
+    let flow = ((ms % flow_ms) / flow_ms) as f32;
     (breath, flow)
 }
 
@@ -157,9 +161,63 @@ const BAR_INK: u32 = 0xF2_F5F0E8;
 // ---- 屏幕边缘光（Edge）----
 /// 光带从屏幕边缘往内延伸多少设计像素。
 /// 太大就挡内容，太小看不出来 —— 110 在 225% 缩放下约 248 物理像素，够"晕开"又不挡字。
-const EDGE_SPREAD: i32 = 56;
+const EDGE_SPREAD_DEFAULT: i32 = 56;
+pub const EDGE_SPREAD_MIN: i32 = 24;
+pub const EDGE_SPREAD_MAX: i32 = 140;
+
+// 带宽/亮度/速度做成**运行时**可调(HANDOFF 里那条已知限制:以前写死,托盘只能换色)。
+//
+// 为什么不是常量:这三个是纯**观感**参数,用户看一眼就知道要往哪边调;写死等于每次微调
+// 都要改代码重编译。颜色早就做成了运行时的(`set_edge_tint`),这三个跟它同一套:
+// 配置项给初值、托盘现场改、改完写回配置。
+//
+// f32 不放进原子量,存成千分位整数(量级足够、读回稳定)。
+static EDGE_SPREAD_PX: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(EDGE_SPREAD_DEFAULT);
+static EDGE_PEAK_MILLI: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new((EDGE_PEAK_DEFAULT * 1000.0) as u32);
+static EDGE_SPEED_MILLI: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new((EDGE_SPEED_DEFAULT * 1000.0) as u32);
+
+/// 边缘光带宽(px)。
+pub fn edge_spread() -> i32 {
+    EDGE_SPREAD_PX
+        .load(Ordering::Relaxed)
+        .clamp(EDGE_SPREAD_MIN, EDGE_SPREAD_MAX)
+}
+
+/// 设带宽。越界自动夹到合法区间 —— 配置写错不该让 HUD 变成一堵墙、也不该让它消失。
+pub fn set_edge_spread(px: i32) {
+    EDGE_SPREAD_PX.store(px.clamp(EDGE_SPREAD_MIN, EDGE_SPREAD_MAX), Ordering::Relaxed);
+}
+
+/// 边缘光亮度(最亮处的 alpha,0..1)。
+pub fn edge_peak() -> f32 {
+    (EDGE_PEAK_MILLI.load(Ordering::Relaxed) as f32 / 1000.0).clamp(EDGE_PEAK_MIN, EDGE_PEAK_MAX)
+}
+
+pub fn set_edge_peak(v: f32) {
+    let v = v.clamp(EDGE_PEAK_MIN, EDGE_PEAK_MAX);
+    EDGE_PEAK_MILLI.store((v * 1000.0) as u32, Ordering::Relaxed);
+}
+
+/// 边缘光动画速度倍率(1.0 = 默认节奏)。
+pub fn edge_speed() -> f32 {
+    (EDGE_SPEED_MILLI.load(Ordering::Relaxed) as f32 / 1000.0)
+        .clamp(EDGE_SPEED_MIN, EDGE_SPEED_MAX)
+}
+
+pub fn set_edge_speed(v: f32) {
+    let v = v.clamp(EDGE_SPEED_MIN, EDGE_SPEED_MAX);
+    EDGE_SPEED_MILLI.store((v * 1000.0) as u32, Ordering::Relaxed);
+}
 /// 最亮处的白色不透明度（0..1）。
-const EDGE_PEAK_ALPHA: f32 = 0.42;
+const EDGE_PEAK_DEFAULT: f32 = 0.42;
+pub const EDGE_PEAK_MIN: f32 = 0.10;
+pub const EDGE_PEAK_MAX: f32 = 0.90;
+const EDGE_SPEED_DEFAULT: f32 = 1.0;
+pub const EDGE_SPEED_MIN: f32 = 0.4;
+pub const EDGE_SPEED_MAX: f32 = 3.0;
 /// 呼吸周期（毫秒）。录音时亮度在这个周期里来回起伏。
 const EDGE_BREATH_MS: u64 = 2200;
 /// 彩色沿周长流动一圈的时间（毫秒）。8 秒是"看得出在动但不晃眼"的节奏。
@@ -1246,7 +1304,7 @@ fn content_rects(mode: Mode, panel: &Rect, sw: i32, sh: i32) -> [Rect; DIRTY_MAX
     match mode {
         Mode::Bar | Mode::Orb => out[0] = pad1(panel),
         Mode::Edge => {
-            let spread = px(EDGE_SPREAD) as f32;
+            let spread = px(edge_spread()) as f32;
             for (i, g) in edge_geometry(sw as f32, sh as f32, spread).iter().enumerate() {
                 let (l, t, r, b) = g.4;
                 out[i] = pad1(&Rect {
@@ -1810,7 +1868,7 @@ impl EdgeBrushes {
         use windows::Win32::Graphics::Direct2D::Common as d2dc;
 
         let per = 2.0 * (w + h);
-        let spread = px(EDGE_SPREAD) as f32;
+        let spread = px(edge_spread()) as f32;
 
         // 蒙版色标:边缘不透明 → 向内透明。**alpha 烘焙成 1**,
         // 整体亮度每帧用 SetOpacity 给 —— 这样这条色标集合是常量,只建一次。
@@ -1945,7 +2003,7 @@ fn d2d_paint_edge(hdc: isize, canvas: &Rect, clear: &[Rect], rc: &Rect, offset: 
         let target = t.target;
         let w = (rc.right - rc.left) as f32;
         let h = (rc.bottom - rc.top) as f32;
-        let spread = px(EDGE_SPREAD) as f32;
+        let spread = px(edge_spread()) as f32;
 
         // 呼吸:0.86~1.0 之间缓慢起伏。相位都在 0..1,见 edge_clock。
         let (breath_ph, flow_ph) = edge_clock();
@@ -1956,7 +2014,7 @@ fn d2d_paint_edge(hdc: isize, canvas: &Rect, clear: &[Rect], rc: &Rect, offset: 
             EdgeTint::White => 1.0,
             _ => 0.92,
         };
-        let peak = EDGE_PEAK_ALPHA * level * breath * tint_boost;
+        let peak = edge_peak() * level * breath * tint_boost;
         if peak <= 0.002 {
             return;
         }

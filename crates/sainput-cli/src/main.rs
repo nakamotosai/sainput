@@ -760,6 +760,58 @@ fn overlay_mode() -> u32 {
 }
 
 /// 当前边缘光颜色的菜单序号（0=白 1=彩虹 2=暖橙 3=青蓝 4=极光）。
+/// 调完边缘光参数后"亮一下"给即时反馈(和换颜色一样)。
+///
+/// 为什么要有:带宽/亮度/速度改完如果什么都不发生,用户根本看不出改没改 —— 边缘光
+/// 平时只在录音时亮。这里主动切到边缘光并亮 1.5 秒。
+fn edge_demo() {
+    use std::sync::atomic::Ordering as O;
+    if overlay_mode() != 3 {
+        OVERLAY_MODE.store(3, O::Relaxed);
+        if ov_get().is_none() {
+            if let Some(o) = Overlay::ensure() {
+                ov_put(Some(o));
+            }
+        }
+    }
+    if let Some(o) = ov_get() {
+        o.show_edge();
+        let ov2 = o.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            ov2.fade_edge();
+        });
+    }
+}
+
+/// 当前边缘光三档参数最接近哪一档(托盘菜单打勾用)。
+///
+/// 用"最接近"而不是"记住上次点了哪档":配置里可能写的是任意数值(比如 `edge_spread = 63`),
+/// 菜单得显示它落在哪一档附近,而不是显示一个从来没被点过的档位。
+fn edge_param_idxs() -> (usize, usize, usize) {
+    use sainput_core::tray as T;
+    let nearest = |vals: &[f32], cur: f32| -> usize {
+        let mut best = 0;
+        let mut best_d = f32::MAX;
+        for (i, v) in vals.iter().enumerate() {
+            let d = (v - cur).abs();
+            if d < best_d {
+                best_d = d;
+                best = i;
+            }
+        }
+        best
+    };
+    let spread = sainput_core::overlay::edge_spread() as f32;
+    let spread_vals: Vec<f32> = T::EDGE_SPREAD_CHOICES.iter().map(|v| *v as f32).collect();
+    (
+        nearest(&spread_vals, spread),
+        nearest(&T::EDGE_PEAK_CHOICES, sainput_core::overlay::edge_peak()),
+        nearest(&T::EDGE_SPEED_CHOICES, sainput_core::overlay::edge_speed()),
+    )
+}
+
+/// 当前边缘光颜色的菜单序号(0=白 1=彩虹 2=暖橙 3=青蓝 4=极光)。
 fn tint_code_of() -> usize {
     match sainput_core::overlay::edge_tint() {
         EdgeTint::White => 0,
@@ -1215,6 +1267,26 @@ fn cmd_config(a: &Args, root: &Path) -> Result<()> {
         println!("上屏方式  : {label}");
     } else {
         println!("上屏方式  : {label},名单 {list}(名单外按 auto 判)");
+    }
+    // 边缘光三项:显示**配置里那份**(命令行 > conf > 默认),和别的项一个口径。
+    // 这里不能用 overlay 的运行时值 —— 那是 `run` 启动时才设的,`config` 不跑那条路。
+    // 越界按 overlay 的上下限夹住后再显示:写 `9999` 与实际生效不一致时,得看得出来。
+    {
+        use sainput_core::overlay as ov;
+        let raw_spread = a.u("edge_spread", "--edge-spread", 56)? as i32;
+        let raw_peak = a.f("edge_peak", "--edge-peak", 0.42)? as f32;
+        let raw_speed = a.f("edge_speed", "--edge-speed", 1.0)? as f32;
+        let spread = raw_spread.clamp(ov::EDGE_SPREAD_MIN, ov::EDGE_SPREAD_MAX);
+        let peak = raw_peak.clamp(ov::EDGE_PEAK_MIN, ov::EDGE_PEAK_MAX);
+        let speed = raw_speed.clamp(ov::EDGE_SPEED_MIN, ov::EDGE_SPEED_MAX);
+        let clamped = if spread != raw_spread || peak != raw_peak || speed != raw_speed {
+            "(越界已夹到上下限)"
+        } else {
+            ""
+        };
+        println!(
+            "边缘光参数: 带宽 {spread}px / 亮度 {peak:.2} / 速度 {speed:.1}×{clamped}(托盘三项都能现场改,改完写回配置)"
+        );
     }
     println!("上下文偏置: {}", if c.ctx_bias { "开" } else { "关" });
     println!("渲染节拍  : {}ms", c.throttle_ms);
@@ -2353,6 +2425,10 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
             &a.s("edge_tint", "--edge-tint").unwrap_or_else(|| "white".to_string()),
         );
         sainput_core::overlay::set_edge_tint(tint);
+        // 边缘光的带宽/亮度/速度:配置给初值,托盘现场改。越界在 set_* 里夹住。
+        sainput_core::overlay::set_edge_spread(a.u("edge_spread", "--edge-spread", 56)? as i32);
+        sainput_core::overlay::set_edge_peak(a.f("edge_peak", "--edge-peak", 0.42)? as f32);
+        sainput_core::overlay::set_edge_speed(a.f("edge_speed", "--edge-speed", 1.0)? as f32);
         tray::set_flags(tray::TrayFlags {
             punct_to_space: c.punct_mode == "space",
             merge_terms: c.merge_terms,
@@ -2364,6 +2440,9 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
             silence_sec: c.rule2.round() as u32,
             overlay_mode: overlay_mode_init as usize,
             edge_tint: tint_code_of(),
+                edge_spread_idx: edge_param_idxs().0,
+                edge_peak_idx: edge_param_idxs().1,
+                edge_speed_idx: edge_param_idxs().2,
             hotkey: cur_hotkey_conf,
             autostart: autostart::is_enabled(),
         });
@@ -2665,6 +2744,9 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
                     silence_sec: sec,
                     overlay_mode: overlay_mode() as usize,
                     edge_tint: tint_code_of(),
+                edge_spread_idx: edge_param_idxs().0,
+                edge_peak_idx: edge_param_idxs().1,
+                edge_speed_idx: edge_param_idxs().2,
                     hotkey: CUR_HOTKEY.lock().map(|g| *g).unwrap_or("rightctrl"),
                     autostart: autostart::is_enabled(),
                 });
@@ -2787,6 +2869,9 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
                     silence_sec: SILENCE_SEC.load(O::Relaxed),
                     overlay_mode: overlay_mode() as usize,
                     edge_tint: tint_code_of(),
+                edge_spread_idx: edge_param_idxs().0,
+                edge_peak_idx: edge_param_idxs().1,
+                edge_speed_idx: edge_param_idxs().2,
                     hotkey: CUR_HOTKEY.lock().map(|g| *g).unwrap_or("rightctrl"),
                     autostart: autostart::is_enabled(),
                 });
@@ -2824,6 +2909,33 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
                 println!("[sainput] 边缘光颜色 → {}", t.label());
                 ("edge_tint", t.as_conf(),
                  format!("边缘光颜色:{}", t.label()))
+            }
+            tray::TrayToggle::SetEdgeSpread(i) => {
+                let Some(px) = tray::EDGE_SPREAD_CHOICES.get(i).copied() else {
+                    return;
+                };
+                sainput_core::overlay::set_edge_spread(px);
+                edge_demo();
+                println!("[sainput] 边缘光带宽 → {px}px");
+                ("edge_spread", tray::EDGE_SPREAD_CONF[i], format!("边缘光带宽:{px}px"))
+            }
+            tray::TrayToggle::SetEdgePeak(i) => {
+                let Some(v) = tray::EDGE_PEAK_CHOICES.get(i).copied() else {
+                    return;
+                };
+                sainput_core::overlay::set_edge_peak(v);
+                edge_demo();
+                println!("[sainput] 边缘光亮度 → {v:.2}");
+                ("edge_peak", tray::EDGE_PEAK_CONF[i], format!("边缘光亮度:{v:.2}"))
+            }
+            tray::TrayToggle::SetEdgeSpeed(i) => {
+                let Some(v) = tray::EDGE_SPEED_CHOICES.get(i).copied() else {
+                    return;
+                };
+                sainput_core::overlay::set_edge_speed(v);
+                edge_demo();
+                println!("[sainput] 边缘光速度 → {v:.1}×");
+                ("edge_speed", tray::EDGE_SPEED_CONF[i], format!("边缘光速度:{v:.1}×"))
             }
             tray::TrayToggle::SetHotkey(i) => {
                 let Some((conf, _)) = tray::HOTKEY_CANDIDATES.get(i) else {
@@ -2879,6 +2991,9 @@ fn cmd_run(_args: &[String], a: &Args) -> Result<()> {
             silence_sec: SILENCE_SEC.load(O::Relaxed),
             overlay_mode: overlay_mode() as usize,
                     edge_tint: tint_code_of(),
+                edge_spread_idx: edge_param_idxs().0,
+                edge_peak_idx: edge_param_idxs().1,
+                edge_speed_idx: edge_param_idxs().2,
             hotkey: CUR_HOTKEY.lock().map(|g| *g).unwrap_or("rightctrl"),
             autostart: autostart::is_enabled(),
         });
@@ -2934,6 +3049,10 @@ fn cmd_overlay_demo(a: &Args) -> Result<()> {
             if let Some(t) = a.s("tint", "--tint") {
                 let tint = EdgeTint::from_conf(&t);
                 sainput_core::overlay::set_edge_tint(tint);
+        // 边缘光的带宽/亮度/速度:配置给初值,托盘现场改。越界在 set_* 里夹住。
+        sainput_core::overlay::set_edge_spread(a.u("edge_spread", "--edge-spread", 56)? as i32);
+        sainput_core::overlay::set_edge_peak(a.f("edge_peak", "--edge-peak", 0.42)? as f32);
+        sainput_core::overlay::set_edge_speed(a.f("edge_speed", "--edge-speed", 1.0)? as f32);
                 println!("[sainput] overlay-demo: 边缘光 · {} ×{cycles} 轮", tint.label());
             } else {
                 println!("[sainput] overlay-demo: 屏幕边缘光 ×{cycles} 轮(尺寸恒定)");
