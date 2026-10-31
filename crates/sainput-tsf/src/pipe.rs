@@ -30,7 +30,7 @@
 //! 绝不让宿主应用崩掉。诊断照旧落文件(`trace`)。
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 #[link(name = "kernel32")]
@@ -52,6 +52,7 @@ extern "system" {
     fn WriteFile(h: isize, buf: *const u8, n: u32, written: *mut u32, ov: *mut c_void) -> i32;
     fn CloseHandle(h: isize) -> i32;
     fn GetCurrentProcessId() -> u32;
+    fn GetTickCount64() -> u64;
     fn CreateFileW(
         name: *const u16,
         access: u32,
@@ -80,9 +81,12 @@ const MAX_FRAME: usize = 1 << 20;
 /// 协议版本 —— 引擎拿它做握手,不匹配就退回别的通道,而不是发一堆没人懂的命令。
 pub const PROTOCOL_VERSION: &str = "sainput-tsf/1";
 
-/// 服务端线程还活着吗。`DllCanUnloadNow` 必须认它 ——
-/// 线程还在跑就被 `FreeLibrary` 卸掉,等于让宿主应用跳进一片已解除映射的代码(必崩)。
-static SERVER_ALIVE: AtomicBool = AtomicBool::new(false);
+/// 服务端循环还在跑(决定 `ensure_server` 要不要重新起)。
+static SERVER_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// **我们自己的线程**还有几个活着。`DllCanUnloadNow` 必须认它 ——
+/// 任何一条线程还在跑就被 `FreeLibrary` 卸掉,等于让宿主应用跳进一片已解除映射的代码。
+/// (服务端、看门狗、唤醒线程都算;只算服务端是不够的 —— 看门狗漏算过一次,实测崩。)
+static LIVE_THREADS: AtomicU32 = AtomicU32::new(0);
 static STOP: AtomicBool = AtomicBool::new(false);
 
 
@@ -92,7 +96,16 @@ struct State {
     preedit: String,
     /// 已经定稿的累计字节数(只用于应答,不存正文 —— 正文的归属在应用那边)。
     committed_bytes: usize,
+    /// 最后一次动组合态的时刻(看门狗按它判"这句是不是没人管了")。
+    last_activity_ms: u64,
 }
+
+/// 组合态多久没人动就自动取消。
+///
+/// 为什么必须有:组合态是**留在别人文档里**的一段 preedit。要是引擎崩了、热键被吞了、
+/// 或者用户直接切走了窗口,这一版就会一直挂在那儿 —— 用户看到的是"输入法卡住了,
+/// 打不出字也退不掉"。宁可自己撤掉(屏幕上恢复原样),也不能把烂摊子留给应用。
+const PREEDIT_IDLE_TIMEOUT_MS: u64 = 5000;
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
@@ -105,6 +118,22 @@ pub fn pipe_name(pid: u32) -> String {
     format!(r"\\.\pipe\sainput-tsf-{pid}")
 }
 
+fn spawn_counted(name: &str, f: impl FnOnce() + Send + 'static) {
+    LIVE_THREADS.fetch_add(1, Ordering::SeqCst);
+    let started = std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+                trace("thread died (panic caught)");
+            }
+            LIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
+        });
+    if started.is_err() {
+        LIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
+        trace(&format!("thread {name} failed to start"));
+    }
+}
+
 /// 起服务端(在 `Activate` 里调)。已经活着就不重复起。
 ///
 /// 生命周期**跟着激活走**:TSF 反激活(`Deactivate`)就收摊。
@@ -113,7 +142,7 @@ pub fn ensure_server() {
     // 先撤销"待停止":TSF 有可能 Deactivate 之后马上又 Activate,
     // 那一次反激活已经把停止位标上了,这里不撤的话服务端会白死一次。
     STOP.store(false, Ordering::SeqCst);
-    if SERVER_ALIVE.swap(true, Ordering::SeqCst) {
+    if SERVER_ACTIVE.swap(true, Ordering::SeqCst) {
         return; // 已经在跑
     }
     // 已知的窄竞态:线程正在退出的那一瞬间(ALIVE 还没落成 false)重复激活会拿不到服务端。
@@ -125,19 +154,16 @@ pub fn ensure_server() {
     let h = create_server(&name);
     if h == 0 {
         trace("pipe CreateNamedPipe failed");
-        SERVER_ALIVE.store(false, Ordering::SeqCst);
+        SERVER_ACTIVE.store(false, Ordering::SeqCst);
         return;
     }
     trace(&format!("pipe server starting at {name} (handle 0x{h:x})"));
-    let _ = std::thread::Builder::new()
-        .name("sainput-tsf-pipe".into())
-        .spawn(move || {
-            if std::panic::catch_unwind(|| serve(h)).is_err() {
-                trace("pipe server died (panic caught)");
-            }
-            SERVER_ALIVE.store(false, Ordering::SeqCst);
-            trace("pipe server thread exited");
-        });
+    spawn_counted("sainput-tsf-pipe", move || {
+        serve(h);
+        SERVER_ACTIVE.store(false, Ordering::SeqCst);
+        trace("pipe server thread exited");
+    });
+    spawn_counted("sainput-tsf-watchdog", watchdog);
 }
 
 /// 收摊(在 `Deactivate` 里调)。
@@ -152,18 +178,16 @@ pub fn ensure_server() {
 /// 唤醒动作放独立线程,调用方立刻返回。
 pub fn request_stop() {
     STOP.store(true, Ordering::SeqCst);
-    if !SERVER_ALIVE.load(Ordering::SeqCst) {
+    if !SERVER_ACTIVE.load(Ordering::SeqCst) {
         return;
     }
     let name = pipe_name(unsafe { GetCurrentProcessId() });
-    let _ = std::thread::Builder::new()
-        .name("sainput-tsf-wake".into())
-        .spawn(move || {
-            // 只为了把服务端叫醒;连上就关。
-            if let Some(h) = open_client(&name, 1000) {
-                unsafe { CloseHandle(h) };
-            }
-        });
+    spawn_counted("sainput-tsf-wake", move || {
+        // 只为了把服务端叫醒;连上就关。
+        if let Some(h) = open_client(&name, 1000) {
+            unsafe { CloseHandle(h) };
+        }
+    });
 }
 
 /// 以客户端身份连一次(给唤醒用,也给 `is_available` 用)。返回 0 = 没连上。
@@ -190,9 +214,9 @@ pub fn open_client(name: &str, wait_ms: u32) -> Option<isize> {
     }
 }
 
-/// 服务端线程还活着?
-pub fn server_alive() -> bool {
-    SERVER_ALIVE.load(Ordering::SeqCst)
+/// 我们还有线程活着吗?(`DllCanUnloadNow` 用)
+pub fn threads_alive() -> bool {
+    LIVE_THREADS.load(Ordering::SeqCst) > 0
 }
 
 /// 建服务端点。返回 0 = 失败。
@@ -302,6 +326,33 @@ fn write_frame(h: isize, payload: &[u8]) -> Result<(), ()> {
     Ok(())
 }
 
+fn now_ms() -> u64 {
+    unsafe { GetTickCount64() }
+}
+
+/// 看门狗:组合态闲置超过 `PREEDIT_IDLE_TIMEOUT_MS` 就自己撤掉。
+fn watchdog() {
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if STOP.load(Ordering::SeqCst) {
+            return;
+        }
+        let dropped = with_state(|st| {
+            if !st.preedit.is_empty()
+                && now_ms().saturating_sub(st.last_activity_ms) > PREEDIT_IDLE_TIMEOUT_MS
+            {
+                st.preedit.clear();
+                true
+            } else {
+                false
+            }
+        });
+        if dropped {
+            trace("pipe watchdog: 组合态闲置超时,已取消(不让半句话留在应用里)");
+        }
+    }
+}
+
 fn ok(extra: &str) -> Vec<u8> {
     let mut v = vec![b'O'];
     v.extend_from_slice(extra.as_bytes());
@@ -329,6 +380,7 @@ fn handle(payload: &[u8]) -> Vec<u8> {
         }
         b'S' => with_state(|st| {
             st.preedit = arg.clone();
+            st.last_activity_ms = now_ms();
             trace(&format!("pipe set preedit={arg:?}"));
             ok(&st.preedit)
         }),
@@ -336,11 +388,13 @@ fn handle(payload: &[u8]) -> Vec<u8> {
             let n = arg.len();
             st.committed_bytes += n;
             st.preedit.clear();
+            st.last_activity_ms = now_ms();
             trace(&format!("pipe commit {n} bytes"));
             ok(&format!("{}", st.committed_bytes))
         }),
         b'X' => with_state(|st| {
             st.preedit.clear();
+            st.last_activity_ms = now_ms();
             trace("pipe cancel");
             ok("")
         }),

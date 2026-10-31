@@ -122,6 +122,13 @@ def main():
             r = exchange(f, b"X")
             check("X 取消", r == b"O", repr(r))
 
+            # 看门狗:组合态闲置超时自动取消 —— 不让半句话留在别人的文档里
+            r = exchange(f, b"S" + "会被丢弃的组合态".encode())
+            check("S 再设一次组合态", r[:1] == b"O", repr(r))
+            time.sleep(6.5)
+            r = exchange(f, b"Q")
+            check("闲置 5s 后组合态被自动取消", r == b"O|" + str(len(cn.encode())).encode(), repr(r))
+
             r = exchange(f, b"Z")
             check("未知命令回 E", r[:1] == b"E", repr(r))
 

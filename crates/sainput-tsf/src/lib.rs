@@ -390,7 +390,7 @@ pub unsafe extern "system" fn DllGetClassObject(
 #[no_mangle]
 pub extern "system" fn DllCanUnloadNow() -> Hresult {
     // 有活对象、或管道线程还在跑,都不能卸 —— 后者尤其致命:线程会跳进已解除映射的代码。
-    if LIVE_OBJECTS.load(Ordering::SeqCst) == 0 && !pipe::server_alive() {
+    if LIVE_OBJECTS.load(Ordering::SeqCst) == 0 && !pipe::threads_alive() {
         S_OK
     } else {
         S_FALSE

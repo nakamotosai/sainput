@@ -99,7 +99,7 @@ sainput 的快通道(M1)与质量层(M2)已交付并冻结;剩下的是**上屏�
 |---|---|---|---|---|
 | T1.1 | **可行性 spike**:按 `TF_IPPMF_FORPROCESS`(SDK 实测值 `0x10000000`)激活自己的 TIP,是否会改用户的全局输入法状态;TIP 激活后标准 EDIT 是否出现文本存储 | ① 前后用户全局 profile 不变 ② `ITfThreadMgr::GetFocus` 非空 | A | ⛔ 依赖 T1.3(没有注册好的 profile 就激活不了) |
 | T1.2 | ✅ `crates/sainput-tsf`(cdylib,手写 COM)+ 宿主 `--load-tip`(走 msctf 装 TIP 的整条链) | DLL 被宿主加载并 `Activate` 成功 | A | ✅ |
-| T1.3 | 注册/注销脚本(一次升权):COM in-proc server + TIP profile;卸载可彻底注销、无残留 | 注册后 TIP 列表可见;卸载后注册表无残留、应用照常输入 | B(一次性) | ⛔ **要你点一次 UAC** —— 实测:`HKLM\SOFTWARE\Microsoft\CTF\TIP`、`HKLM\SOFTWARE\Classes\CLSID` 普通用户都拒写,`HKCU\Software\Microsoft\CTF` 连读都拒,没有 per-user 绕路 |
+| T1.3 | 注册/注销脚本(一次升权):COM in-proc server + TIP profile;卸载可彻底注销、无残留 | 注册后 TIP 列表可见;卸载后注册表无残留、应用照常输入 | B(一次性) | ⛔ **脚本已就绪,等你点一次 UAC**:`tools/tsf_register.ps1`(register/unregister/verify,dry-run 默认),注册表形状照本机水杉输入法**实测**抄的;只注册 `GUID_TFCAT_TIP_KEYBOARD`,不冒领 secure mode 之类的能力 |
 | T1.4 | 组合态上屏:`StartComposition` → 逐帧 `SetText` 改写 → `EndComposition` | host 的 EDIT 文本等于期望值;**中途不留半句残字** | A | ⬜ |
 | T1.5 | ✅ 跨进程通道:引擎 ↔ DLL 命名管道(`compose`/`commit`/`cancel` + 版本握手) | 引擎发一句,宿主窗口一次到位;断开时链路干净退出 | A | ✅ **两侧都通**(18 条判据全过)。实测引擎在 console 桌面、薄壳在私有桌面宿主里,3 帧 + 定稿全部落地 —— 管道跨桌面。"窗口一次到位"要等 T1.4(卡注册) |
 | T1.6 | ✅ Rust 侧 `TsfComposer` 接上 `Composer` trait;策略沿用**既有** `ime_wmchar` 键新增 `tsf` 头(不另起 `tsf` 键 —— 上屏方式只该有一个真相源);可用性判据 = 目标进程的管道在不在(`WaitNamedPipeW(…,0)`,不占连接槽) | `tsf` 下薄壳活着的窗口走 TSF、其余按 `auto` 判;没端点绝不误伤 | A | ✅ |
@@ -110,7 +110,7 @@ sainput 的快通道(M1)与质量层(M2)已交付并冻结;剩下的是**上屏�
 | ID | 任务 | 验收判据 | 级别 | 状态 |
 |---|---|---|---|---|
 | T2.1 | 宿主进程内异常隔离(COM 边界 `catch_unwind`;绝不把宿主带崩) | 注入失败只丢本句,宿主进程存活 | A | ⬜ |
-| T2.2 | 生命周期:失焦 / 切换文档 / 应用退出 / 超时未提交 → 取消组合 | 每种情形都不留半句、不卡住 | A | ⬜ |
+| T2.2 | 生命周期:失焦 / 切换文档 / 应用退出 / 超时未提交 → 取消组合 | 每种情形都不留半句、不卡住 | A | 🔄 **超时那条已做并验**:组合态闲置 5s 自动取消(看门狗),`tools/test_tsf_pipe.py` 有专项;失焦/切文档那半要等 T1.4 |
 | T2.3 | 幂等与乱序:重复 `commit`、迟到帧、取消后到达的帧 | 不重复上屏、不写进错误的文档 | A | ⬜ |
 | T2.4 | 升级/降级:版本不匹配时自动禁用 TSF 回退旧通道;注册表残留清理 | 装旧版不炸、装新版不重复注册 | B | ⬜ |
 | T2.5 | 与水杉/微软拼音共存策略(白名单 + 热键开关) | 用户日常输入法不受影响 | B | ⬜ |
