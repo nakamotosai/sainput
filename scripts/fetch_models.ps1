@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Download and verify the sherpa-onnx models sainput needs.
@@ -23,12 +23,12 @@
     powershell -ExecutionPolicy Bypass -File scripts\fetch_models.ps1 -Variant 480ms
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File scripts\fetch_models.ps1 -Variant all -NoPunct
+    powershell -ExecutionPolicy Bypass -File scripts\fetch_models.ps1 -Variant sensevoice -NoPunct
 #>
 [CmdletBinding()]
 param(
     # 160ms is the default model compiled into sainput (see crates/sainput-cli/src/main.rs).
-    [ValidateSet('160ms', '480ms', '960ms', 'nemotron', 'bilingual', 'zh14m', 'all')]
+    [ValidateSet('160ms', '480ms', '960ms', 'nemotron', 'bilingual', 'zh14m', 'sensevoice', 'all')]
     [string]$Variant = '160ms',
 
     # Re-download / re-extract even when the target folder already looks complete.
@@ -73,6 +73,9 @@ $AsrVariants = [ordered]@{
     'nemotron'  = @{ Asset = 'sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-80ms-int8-2026-06-11';                          Size = 0 }
     'bilingual' = @{ Asset = 'sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20';                                Size = 0 }
     'zh14m'     = @{ Asset = 'sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23';                                        Size = 0 }
+    # 非流式(离线):给"松手后整段重解"当候选。中英日韩粤五语一个模型,文件是
+    # 单个 model.int8.onnx —— 所以它要用的必检文件和流式那几档不同(见 Patterns)。
+    'sensevoice' = @{ Asset = 'sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17';                                        Size = 0; Patterns = @('tokens.txt', 'model*.onnx') }
 }
 
 $PunctAsset = 'sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8'
@@ -255,7 +258,10 @@ foreach ($name in $names) {
         continue
     }
     $url = $AsrBase + '/' + $v.Asset + '.tar.bz2'
-    $r = Install-Model -Asset $v.Asset -Url $url -ExpectedSize $v.Size -RequiredFiles $AsrPatterns -Kind "ASR $name"
+    # 必检文件按档给:流式那几档是 encoder/decoder/joiner int8 三件套,
+    # 非流式的 sensevoice 只有一个 model.int8.onnx。
+    $need = if ($v.ContainsKey('Patterns')) { $v['Patterns'] } else { $AsrPatterns }
+    $r = Install-Model -Asset $v.Asset -Url $url -ExpectedSize $v.Size -RequiredFiles $need -Kind "ASR $name"
     if (-not $r) { $ok = $false }
 }
 

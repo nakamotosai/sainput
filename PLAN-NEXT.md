@@ -53,6 +53,15 @@
 不变量:①**只提前定稿,绝不重复上屏**(T4.1/T4.2 的守卫仍然在);②**定稿文本 = 超时那一刻的最后一条 partial**
 (不拼接、不猜测);③默认值保守,**先用 latency_report 做 A/B,不达标就回退**。
 
+**⚠️ 今天第二次踩到同一个坑(2026-10-31 晚)**:`edit` 工具会**抹掉 .ps1 的 UTF-8 BOM**。
+后果不是"中文注释难看",而是 **PowerShell 5.1 按 ANSI 解码 → 注释里的中文变成乱码字节 →
+解析在注释行断掉** → 表现为 `ERROR unknown variant 'sensevoice'`(其实代码是对的)。
+- 症状识别:**脚本改完突然说某个参数/键"未知"**,先看 BOM,别去读逻辑 ✗;
+- 修法(一条命令,不改内容):`powershell -c "$p='x.ps1'; $t=[IO.File]::ReadAllText($p,[Text.Encoding]::UTF8); [IO.File]::WriteAllText($p,$t,(New-Object Text.UTF8Encoding $true))"`;
+- 检查:`head -c 3 x.ps1 | od -An -tx1` 必须是 `ef bb bf`。
+- 仓库里所有 .ps1 都要带 BOM(`_hygiene.ps1`/`make_test_wav.ps1`/`swap_engine.ps1` 都有);
+  `tools/swap_engine.ps1` 是我新建的,当时就是按这个经验加了 BOM,才没出事。
+
 **⚠️ 部署与踩坑(2026-10-31 晚,务必记住)**
 
 1. **跑 `sainput run` 做任何测试前,必须设 `SAINPUT_SINGLE_NS`**(如
