@@ -444,6 +444,24 @@ mod target {
 
     /// 焦点控件(拿不到就退回前台窗口)。
     pub fn focused_hwnd() -> isize {
+        // 【回归/诊断专用】`SAINPUT_DIAG_TARGET_HWND=0x…` 直接指定目标窗口。
+        //
+        // 为什么需要:私有桌面(自动化测试用的那种)上**谁都抢不到前台** ——
+        // `SetForegroundWindow` 返回 0,于是 `GetForegroundWindow()` 也是 0,
+        // 上屏方式按"没有目标"退化成 SendInput,而 SendInput 在非交互桌面上
+        // 事件全被丢(实测 0/6)。要给"worker + 上屏算术"整条链路做无人值守回归,
+        // 只能把目标窗口显式给出来。
+        if let Some(h) = std::env::var("SAINPUT_DIAG_TARGET_HWND").ok().and_then(|v| {
+            let v = v.trim().to_string();
+            match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+                Some(hex) => isize::from_str_radix(hex, 16).ok(),
+                None => v.parse::<isize>().ok(),
+            }
+        }) {
+            if h != 0 {
+                return h;
+            }
+        }
         let mut info: GuiThreadInfo = unsafe { std::mem::zeroed() };
         info.cb_size = std::mem::size_of::<GuiThreadInfo>() as u32;
         if unsafe { GetGUIThreadInfo(0, &mut info) } != 0 && info.hwnd_focus != 0 {

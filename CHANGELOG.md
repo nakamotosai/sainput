@@ -9,6 +9,14 @@
 
 ### Fixed
 
+- **定稿之后迟到的 streaming 仍会改掉屏幕上那句话** —— 2026-10-31 用假侧车把真实
+  `Msg` 序列喂进真 worker 时抓到的:`stage` 会在 finish 之后先回 Idle,但用户**一松手**
+  又进尾巴阶段,尾巴期内到达的迟到 streaming 帧就照样打字 —— 屏幕上是
+  「你好世界」被改成「迟到的一帧」。修法:一句 finish 定稿后打一个 `finalized` 标记,
+  这一句的 streaming 一律不认,直到下一次按下(丢弃动作会留一行日志,
+  「为什么这句没上屏」有据可查)。
+  验证:`tools/test_race_guards.py`(假侧车 + 私有桌面 + 真注入,两条判据全过)。
+
 - **消息通道的退格改错了地方(经典控件)** —— 2026-10-31 在私有桌面靶子上量出来的:
   `ime_wmchar` 模式下,退格用的是 `PostMessage(WM_KEYDOWN/UP, VK_BACK)`。实测
   **经典 `Edit` 根本不处理这条 posted 按键** —— 关掉应用自己的 `TranslateMessage`

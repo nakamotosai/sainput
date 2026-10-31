@@ -43,6 +43,41 @@ const RUN_MUTEX: &str = r"Local\sainput-single-instance-v1";
 /// 「换人」动作的闸：两个新实例同时启动时串行执行，避免互相乱杀。
 const TAKEOVER_MUTEX: &str = r"Local\sainput-takeover-v1";
 
+/// 【回归/诊断专用】`SAINPUT_SINGLE_NS=<名字>` 换一套"单实例命名空间"。
+///
+/// 为什么必须有:不带命名空间时,**任何**用 `sainput run` 做的自动化测试都会
+/// "接管"掉用户正在用的那个实例(按 exe 名找进程、请它退出、赖着不走就硬杀)——
+/// 也就是说测试会把用户的输入法踢下线。带上命名空间之后:
+///   * 锁名换成 `Local\<ns>-single-instance-v1`;
+///   * "接管"只找 `<ns>.exe`,于是永远不会碰到真正的 `sainput.exe`。
+/// 不设这个环境变量时,行为与从前**完全一致**。
+fn ns() -> String {
+    std::env::var("SAINPUT_SINGLE_NS")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| {
+            !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+        .unwrap_or_else(|| "sainput".to_string())
+}
+
+fn run_mutex_name() -> String {
+    format!(r"Local\{}-single-instance-v1", ns())
+}
+
+fn takeover_mutex_name() -> String {
+    format!(r"Local\{}-takeover-v1", ns())
+}
+
+fn exe_name() -> String {
+    let n = ns();
+    if n == "sainput" {
+        EXE_NAME.to_string()
+    } else {
+        format!("{n}.exe")
+    }
+}
+
 #[repr(C)]
 struct ProcessEntry32W {
     dw_size: u32,
@@ -75,7 +110,7 @@ fn wide(s: &str) -> Vec<u16> {
 /// 用 `Local\` 前缀：锁的作用域是当前登录会话，不是整台机器 ——
 /// 同一台机器上两个用户各跑一个自己的输入法是合理的。
 fn try_acquire() -> Option<Guard> {
-    let name = wide(RUN_MUTEX);
+    let name = wide(&run_mutex_name());
     let h = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
     if h == 0 {
         // 建不出来就当没锁 —— 宁可多开也不要因为一个保护措施起不来。
@@ -102,7 +137,7 @@ pub fn acquire_or_take_over() -> Option<Guard> {
 
     // 串行化「换人」：两个新实例同时启动时，一个先换完并跑起来，另一个再换它。
     // 最终仍然只有一个进程，且是最新启动的那个。
-    let gate = unsafe { CreateMutexW(ptr::null(), 0, wide(TAKEOVER_MUTEX).as_ptr()) };
+    let gate = unsafe { CreateMutexW(ptr::null(), 0, wide(&takeover_mutex_name()).as_ptr()) };
     if gate != 0 {
         unsafe {
             WaitForSingleObject(gate, 15_000);
@@ -141,7 +176,7 @@ fn replace_others() {
     let me = unsafe { GetCurrentProcessId() };
     let old: Vec<u32> = snapshot()
         .into_iter()
-        .filter(|p| p.pid != me && p.exe.eq_ignore_ascii_case(EXE_NAME))
+        .filter(|p| p.pid != me && p.exe.eq_ignore_ascii_case(&exe_name()))
         .map(|p| p.pid)
         .collect();
     if old.is_empty() {
@@ -179,7 +214,7 @@ fn hard_kill(pids: &[u32]) {
     for pid in pids.iter().copied() {
         let still_ours = table
             .iter()
-            .any(|p| p.pid == pid && p.exe.eq_ignore_ascii_case(EXE_NAME));
+            .any(|p| p.pid == pid && p.exe.eq_ignore_ascii_case(&exe_name()));
         if !still_ours {
             continue;
         }

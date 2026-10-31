@@ -1685,6 +1685,14 @@ fn worker(
     // 这一句走到哪一步了。Idle 之后到达的 partial / final 一律丢掉：
     // 模型偶尔会把静音「听」出字来，落到屏幕上就是垃圾。
     let mut stage = Stage::Idle;
+    // 这一句**已经被 finish 定稿了**吗?
+    //
+    // 光看 `stage` 不够(2026-10-31 实测抓到的真缺陷):模型可能在用户**还按着**的时候就
+    // 给出 finish(端点检测 / 它自己判断说完了),于是 stage 先回 Idle;用户一松手又进
+    // `Stage::Tail`,尾巴期内到达的迟到 streaming 帧就会**把已经定稿的那句改掉**
+    // (屏幕上从「你好世界」变成「迟到的一帧」)。定稿就是定稿 —— 之后这一句的
+    // streaming 一律不认,直到下一次按下。
+    let mut finalized = false;
     // 上一句的 final 还在路上就又按下了热键：这时不能 wr.reset()，
     // 否则那条 final 会因为「屏幕上什么都没有」而把整句重打一遍。
     let mut defer_reset = false;
@@ -1925,6 +1933,7 @@ fn worker(
                         }
                     }
                     stage = Stage::Recording;
+                    finalized = false;
                     utterances += 1;
                     // feed 测试模式：新的一句从 wav 头重放（否则第二句只有静音）
                     fst.begin_utterance();
@@ -2185,6 +2194,14 @@ fn worker(
             if stage == Stage::Idle {
                 continue;
             }
+            // 这一句已经定稿了:迟到的 streaming 一律不认(见 `finalized` 的注释)。
+            // 留一行日志 —— 「为什么这句没上屏」是用户真会问的问题。
+            if finalized && matches!(&m, Msg::Partial { .. }) {
+                if let Some(l) = o.log.as_ref() {
+                    l.line("[sainput] ! 丢弃已定稿后的迟到 streaming(不回头改屏幕上那句话)");
+                }
+                continue;
+            }
             let is_final_finish = matches!(&m, Msg::Final { reason, .. } if reason == "finish");
             let is_final_endpoint = matches!(&m, Msg::Final { reason, .. } if reason == "endpoint");
             let ui = Ui {
@@ -2206,8 +2223,12 @@ fn worker(
                 history.push(rec);
             }
             handle_msg(m, &mut wr, &ui);
-            // finish 的 final = 这一句彻底定稿；尾巴期间的 endpoint 也已经定稿
+            // finish 的 final = 这一句彻底定稿;尾巴期间的 endpoint 也已经定稿
             if is_final_finish || (is_final_endpoint && stage != Stage::Recording) {
+                if is_final_finish {
+                    // 定稿之后这一句的 streaming 一律不认(见 `finalized` 的注释)
+                    finalized = true;
+                }
                 stage = Stage::Idle;
                 if defer_reset {
                     // 上一句的 final 终于到了：现在才轮到新一句重新起算

@@ -84,6 +84,9 @@ extern "system" {
     fn DefWindowProcW(h: isize, m: u32, w: usize, l: isize) -> isize;
     fn ShowWindow(h: isize, cmd: i32) -> i32;
     fn SetFocus(h: isize) -> isize;
+    /// 在私有桌面上把自己顶到前台:引擎按"它的桌面上的前台窗口"决定往哪儿打字,
+    /// 这张桌面上只有我们,所以这里失败也没关系,记进日志就行。
+    fn SetForegroundWindow(h: isize) -> i32;
     fn GetFocus() -> isize;
     fn GetModuleHandleW(name: *const u16) -> isize;
     fn PeekMessageW(msg: *mut Msg, h: isize, min: u32, max: u32, remove: u32) -> i32;
@@ -335,11 +338,12 @@ fn main() {
         }
         EDIT_HANDLE.store(edit, Ordering::SeqCst);
         ShowWindow(hwnd, SW_SHOW);
+        let fg = SetForegroundWindow(hwnd);
         SetFocus(edit);
         pump(trace_ref, !a.no_translate);
 
         log.line(&format!(
-            "window=0x{hwnd:x} edit=0x{edit:x} focused={}",
+            "window=0x{hwnd:x} edit=0x{edit:x} focused={} foreground={fg}",
             GetFocus() == edit
         ));
 
